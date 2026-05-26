@@ -1,0 +1,15 @@
+[package]
+name = "linprov-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[features]
+default = []
+# Enable bytemuck Pod/Zeroable impls for zero-copy parsing in the userspace
+# daemon. The eBPF crate must build without this feature (no_std + no extra
+# crates linked into the program object).
+user = ["dep:bytemuck"]
+
+[dependencies]
+bytemuck = { workspace = true, optional = true }

@@ -1,0 +1,13 @@
+[package]
+name = "linprov-ebpf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+aya-ebpf = { workspace = true }
+linprov-common = { workspace = true }
+
+[[bin]]
+name = "linprov-ebpf"
+path = "src/main.rs"

@@ -1,0 +1,25 @@
+[package]
+name = "linprov"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "linprov"
+path = "src/main.rs"
+
+[dependencies]
+aya = { workspace = true }
+
+anyhow.workspace = true
+bytemuck.workspace = true
+clap.workspace = true
+env_logger.workspace = true
+libc.workspace = true
+log.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+xattr.workspace = true
+
+linprov-common = { workspace = true, features = ["user"] }
