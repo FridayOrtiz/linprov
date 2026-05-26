@@ -1,17 +1,16 @@
 //! Ring-buffer event handler.
 //!
-//! Two responsibilities, depending on event kind:
-//!   1. NetworkFileOpen: a network-flagged process just opened a file for
-//!      writing. The eBPF program carries the filename inline in the event,
-//!      read out of user memory while the openat syscall was mid-flight. We
-//!      resolve relative paths against `/proc/<pid>/cwd` and apply the
-//!      provenance xattr. The xattr lives on the inode and survives whatever
-//!      data writes follow.
-//!   2. Execve: read the xattr off the target binary and log if it carries
-//!      the mark.
+//! The eBPF side fills `filename` via bpf_d_path() for every event we get
+//! here, so paths are already absolute and pinned to the file the kernel
+//! was acting on. No /proc/<pid>/cwd resolution needed.
+//!
+//! Two event kinds:
+//!   1. NetworkFileOpen: a network-flagged process opened a file for writing.
+//!      Apply the provenance xattr.
+//!   2. Execve: bprm_check_security fired. Read the xattr off the target
+//!      binary and log it if the mark is present.
 
 use std::{
-    fs,
     path::{Path, PathBuf},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -70,20 +69,8 @@ fn on_network_file_open(cfg: &Config, event: &Event) {
             return;
         }
     };
+    let target = PathBuf::from(&filename);
 
-    let target = match resolve_relative(event.pid, &filename) {
-        Some(p) => p,
-        None => {
-            debug!("could not resolve openat target `{filename}` (pid={})", event.pid);
-            return;
-        }
-    };
-
-    // Skip the obvious not-a-regular-file targets. openat can succeed for
-    // /dev nodes, /proc/self/fd/* shenanigans, etc. We rely on path-prefix
-    // checks rather than stat-ing because the file may not exist yet (this
-    // tracepoint fires on a successful openat, but a new O_CREAT|O_TRUNC
-    // file may have zero size and we still want to mark it).
     if !is_regular_target(&target) {
         debug!("skipping non-regular target: {}", target.display());
         return;
@@ -123,9 +110,6 @@ fn on_network_file_open(cfg: &Config, event: &Event) {
             comm
         ),
         Err(e) => {
-            // setxattr can fail for a number of legitimate reasons: the
-            // filesystem doesn't support user xattrs (tmpfs without
-            // user_xattr, vfat, etc.), EACCES, EROFS. Log and move on.
             debug!(
                 "setxattr({}, {XATTR_NAME}) failed: {e}",
                 target.display()
@@ -139,14 +123,7 @@ fn on_execve(event: &Event) {
         Some(s) if !s.is_empty() => s,
         _ => return,
     };
-
-    let path = match resolve_execve_target(event.pid, &filename) {
-        Some(p) => p,
-        None => {
-            debug!("could not resolve execve target `{filename}` for pid={}", event.pid);
-            return;
-        }
-    };
+    let path = PathBuf::from(&filename);
 
     match xattr::get(&path, XATTR_NAME) {
         Ok(Some(value)) => {
@@ -169,35 +146,6 @@ fn on_execve(event: &Event) {
             debug!("getxattr({}) failed: {e}", path.display());
         }
     }
-}
-
-fn resolve_execve_target(pid: u32, filename: &str) -> Option<PathBuf> {
-    let p = Path::new(filename);
-    if p.is_absolute() {
-        return p.exists().then(|| p.to_path_buf());
-    }
-
-    if let Some(resolved) = resolve_relative(pid, filename) {
-        if resolved.exists() {
-            return Some(resolved);
-        }
-    }
-
-    // Fallback: if the exec already succeeded by the time we're processing
-    // the event, /proc/<pid>/exe points at the new binary.
-    fs::read_link(format!("/proc/{pid}/exe")).ok()
-}
-
-/// Resolve a (possibly relative) filename against the process's cwd. The
-/// process is still alive at this point — we read /proc/<pid>/cwd via the
-/// symlink it keeps even mid-syscall.
-fn resolve_relative(pid: u32, filename: &str) -> Option<PathBuf> {
-    let p = Path::new(filename);
-    if p.is_absolute() {
-        return Some(p.to_path_buf());
-    }
-    let cwd = fs::read_link(format!("/proc/{pid}/cwd")).ok()?;
-    Some(cwd.join(filename))
 }
 
 fn is_regular_target(target: &Path) -> bool {
