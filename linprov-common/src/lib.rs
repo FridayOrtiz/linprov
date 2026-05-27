@@ -7,7 +7,7 @@
 pub const COMM_LEN: usize = 16;
 pub const PATH_LEN: usize = 256;
 
-pub const XATTR_NAME: &str = "user.linprov.origin";
+pub const XATTR_NAME: &str = "security.bpf.linprov.origin";
 
 pub const EVENT_KIND_NETWORK_FILE_OPEN: u32 = 1;
 pub const EVENT_KIND_EXECVE: u32 = 2;

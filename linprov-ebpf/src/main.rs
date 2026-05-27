@@ -88,7 +88,7 @@ unsafe fn bpf_d_path(p: *mut bpf_path, buf: *mut c_char, sz: u32) -> i64 {
     fun(p, buf, sz)
 }
 
-const XATTR_NAME_C: &[u8] = b"user.linprov.origin\0";
+const XATTR_NAME_C: &[u8] = b"security.bpf.linprov.origin\0";
 
 const AF_INET: i32 = 2;
 const AF_INET6: i32 = 10;
