@@ -12,6 +12,11 @@ pub const XATTR_NAME: &str = "security.bpf.linprov.origin";
 pub const EVENT_KIND_NETWORK_FILE_OPEN: u32 = 1;
 pub const EVENT_KIND_EXECVE: u32 = 2;
 
+/// Runtime mode communicated to the eBPF program via the CONFIG map.
+pub const MODE_OBSERVE: u32 = 0;
+pub const MODE_SOAK: u32 = 1; // eBPF behaves like OBSERVE; userspace records paths
+pub const MODE_ENFORCE: u32 = 2;
+
 /// In-xattr provenance record. Written by the eBPF `file_open` hook via
 /// `bpf_set_dentry_xattr`; read back by `bprm_check_security` via
 /// `bpf_get_file_xattr`. Binary, fixed-size; userspace formats it for logs.

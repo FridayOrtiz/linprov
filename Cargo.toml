@@ -14,14 +14,13 @@ license = "MIT OR Apache-2.0"
 repository = "https://github.com/FridayOrtiz/linprov"
 
 [workspace.dependencies]
-# Point at the local fork — we extend aya-obj with kfunc relocation
-# resolution (see ~/Documents/repos/aya). Once those changes ride
-# upstream we can switch back to crates.io.
-aya = { path = "../aya/aya" }
-aya-build = { path = "../aya/aya-build" }
-aya-ebpf = { path = "../aya/ebpf/aya-ebpf" }
-aya-log = { path = "../aya/aya-log" }
-aya-log-ebpf = { path = "../aya/ebpf/aya-log-ebpf" }
+# Aya fork — adds kfunc relocation resolution to aya-obj. Switch back to a
+# crates.io release once the change lands upstream.
+aya = { git = "https://github.com/FridayOrtiz/aya", branch = "main" }
+aya-build = { git = "https://github.com/FridayOrtiz/aya", branch = "main" }
+aya-ebpf = { git = "https://github.com/FridayOrtiz/aya", branch = "main" }
+aya-log = { git = "https://github.com/FridayOrtiz/aya", branch = "main" }
+aya-log-ebpf = { git = "https://github.com/FridayOrtiz/aya", branch = "main" }
 
 anyhow = "1"
 bytemuck = { version = "1", features = ["derive"] }

@@ -1,19 +1,33 @@
 //! Ring-buffer event handler.
 //!
-//! Phase B: the eBPF programs do both the xattr write (via
-//! `bpf_set_dentry_xattr`) and the xattr check (via `bpf_get_file_xattr`)
-//! in-kernel. Userspace just logs what the kernel reports.
+//! In all modes the eBPF program does the xattr READ in-kernel via
+//! `bpf_get_file_xattr`; userspace handles the xattr WRITE side and, in
+//! soak/enforce modes, the allowlist plumbing.
 
-use std::path::PathBuf;
+use std::{
+    collections::HashSet,
+    fs::File,
+    path::PathBuf,
+    sync::Mutex,
+};
 
 use linprov_common::{
     Event, OriginRecord, EVENT_KIND_EXECVE, EVENT_KIND_NETWORK_FILE_OPEN, PATH_LEN, XATTR_NAME,
 };
 use log::{debug, info, warn};
 
-pub struct Config;
+use crate::{append_allowlist, ModeArg};
 
-pub fn handle_event(_cfg: &Config, raw: &[u8]) {
+pub struct Config {
+    pub mode: ModeArg,
+    /// Paths we've already seen this session (also reflects what was loaded
+    /// from the allowlist file at startup). Used to dedupe soak-mode writes.
+    pub seen: Mutex<HashSet<String>>,
+    /// Append handle for the allowlist file, only Some in soak mode.
+    pub allowlist_writer: Option<Mutex<File>>,
+}
+
+pub fn handle_event(cfg: &Config, raw: &[u8]) {
     if raw.len() < std::mem::size_of::<Event>() {
         warn!(
             "short ring-buf record: got {} bytes, expected {}",
@@ -33,7 +47,7 @@ pub fn handle_event(_cfg: &Config, raw: &[u8]) {
 
     match event.kind {
         EVENT_KIND_NETWORK_FILE_OPEN => on_file_marked(event),
-        EVENT_KIND_EXECVE => on_execve_marked(event),
+        EVENT_KIND_EXECVE => on_execve_marked(cfg, event),
         other => warn!("unknown event kind: {other}"),
     }
 }
@@ -43,15 +57,13 @@ fn on_file_marked(event: &Event) {
     let comm = comm_to_string(&event.comm);
     let target = PathBuf::from(&path);
 
-    // Filter out non-regular targets — bpf_d_path can resolve pseudo-fs
-    // entries that we don't want to mark.
     if is_pseudo_fs(&target) {
         debug!("skipping non-regular target: {}", target.display());
         return;
     }
 
-    // Mirror the eBPF record bytes verbatim. Userspace still does the write
-    // until we resolve the trusted-dentry issue for bpf_set_dentry_xattr.
+    // Mirror the eBPF record bytes verbatim. The eBPF side already serialized
+    // the OriginRecord; we just write it as the xattr value.
     let value = bytemuck::bytes_of(&event.origin).to_vec();
 
     match xattr::set(&target, XATTR_NAME, &value) {
@@ -77,9 +89,22 @@ fn is_pseudo_fs(target: &std::path::Path) -> bool {
         || s.starts_with("/run/")
 }
 
-fn on_execve_marked(event: &Event) {
+fn on_execve_marked(cfg: &Config, event: &Event) {
     let path = c_str_to_string(&event.filename);
     let comm = comm_to_string(&event.comm);
+
+    if event.status != 0 {
+        warn!(
+            "BLOCKED-EXEC path={} pid={} comm={} origin={} (LSM verdict {})",
+            path,
+            event.pid,
+            comm,
+            format_origin(&event.origin),
+            event.status,
+        );
+        return;
+    }
+
     info!(
         "PROVENANCE-EXEC path={} pid={} comm={} origin={}",
         path,
@@ -87,6 +112,23 @@ fn on_execve_marked(event: &Event) {
         comm,
         format_origin(&event.origin),
     );
+
+    if cfg.mode == ModeArg::Soak {
+        soak_record(cfg, &path);
+    }
+}
+
+fn soak_record(cfg: &Config, path: &str) {
+    let mut seen = cfg.seen.lock().expect("seen mutex poisoned");
+    if !seen.insert(path.to_string()) {
+        return;
+    }
+    let Some(writer) = cfg.allowlist_writer.as_ref() else { return };
+    if let Err(e) = append_allowlist(writer, path) {
+        warn!("failed to append `{path}` to allowlist: {e}");
+    } else {
+        info!("soak: added `{path}` to allowlist");
+    }
 }
 
 fn format_origin(o: &OriginRecord) -> String {

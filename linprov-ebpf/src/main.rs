@@ -25,11 +25,11 @@ use aya_ebpf::{
         bpf_ktime_get_boot_ns,
     },
     macros::{lsm, map, tracepoint},
-    maps::{LruHashMap, PerCpuArray, RingBuf},
+    maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
     programs::{LsmContext, TracePointContext},
 };
 use linprov_common::{
-    Event, OriginRecord, EVENT_KIND_EXECVE, EVENT_KIND_NETWORK_FILE_OPEN, PATH_LEN,
+    Event, OriginRecord, EVENT_KIND_EXECVE, EVENT_KIND_NETWORK_FILE_OPEN, MODE_ENFORCE, PATH_LEN,
 };
 
 // Kernel kfuncs. Resolved at load time by the patched aya: the unresolved
@@ -130,6 +130,18 @@ static EVENTS: RingBuf = RingBuf::with_byte_size(1 << 20, 0);
 #[map]
 static SCRATCH: PerCpuArray<OriginRecord> = PerCpuArray::with_max_entries(1, 0);
 
+/// Runtime mode set by userspace before attach. Index 0 holds a value from
+/// the `MODE_*` constants in `linprov_common`.
+#[map]
+static CONFIG: Array<u32> = Array::with_max_entries(1, 0);
+
+/// Allowlist of absolute paths (PATH_LEN-byte keys, NUL-padded) that
+/// `bprm_check_security` will permit when running in `MODE_ENFORCE`. Paths
+/// not present are blocked with -EPERM. Populated by userspace at startup
+/// and incrementally extended in soak mode.
+#[map]
+static ALLOWLIST: HashMap<[u8; PATH_LEN], u8> = HashMap::with_max_entries(4096, 0);
+
 #[inline(always)]
 fn current_pid() -> u32 {
     (bpf_get_current_pid_tgid() >> 32) as u32
@@ -185,9 +197,18 @@ pub fn file_open(ctx: LsmContext) -> i32 {
     0
 }
 
-/// security_bprm_check(struct linux_binprm *bprm).
+/// security_bprm_check(struct linux_binprm *bprm, int retval).
+///
+/// LSM hooks see the previous LSM's verdict in `retval` (last BTF arg). If
+/// somebody already said no, we preserve that — never silently re-enable an
+/// exec that landlock/apparmor blocked.
 #[lsm(hook = "bprm_check_security", sleepable)]
 pub fn bprm_check_security(ctx: LsmContext) -> i32 {
+    let retval: i32 = unsafe { ctx.arg(1) };
+    if retval != 0 {
+        return retval;
+    }
+
     let bprm_ptr: *const KernelLinuxBinprm = unsafe { ctx.arg(0) };
     if bprm_ptr.is_null() {
         return 0;
@@ -198,7 +219,6 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
         return 0;
     }
 
-    // Per-CPU scratch buffer for the kfunc to write the xattr value into.
     let buf = match SCRATCH.get_ptr_mut(0) {
         Some(p) => p,
         None => return 0,
@@ -228,15 +248,42 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
         )
     };
     if get_ret < 0 {
-        // No xattr (or unreadable namespace) — every exec hits this path so
-        // we don't bother emitting an event for it.
+        // Unmarked — every exec hits this path; no event, no enforcement.
         return 0;
     }
 
+    // Marked. Resolve the path into a freshly-reserved ringbuf entry, then
+    // use that buffer as the allowlist key. The same memory carries the
+    // event to userspace once we submit.
     let rec = unsafe { *buf };
     let path_ptr = unsafe { &(*file_ptr).f_path } as *const KernelPath as *mut bpf_path;
-    emit_event(EVENT_KIND_EXECVE, path_ptr, current_pid(), &rec, get_ret);
-    0
+    let mut entry = match EVENTS.reserve::<Event>(0) {
+        Some(e) => e,
+        None => return 0,
+    };
+    let p = entry.as_mut_ptr();
+    unsafe {
+        core::ptr::write_bytes(p as *mut u8, 0, core::mem::size_of::<Event>());
+        (*p).kind = EVENT_KIND_EXECVE;
+        (*p).pid = current_pid();
+        (*p).tgid = bpf_get_current_pid_tgid() as u32;
+        (*p).comm = current_comm();
+        (*p).origin = rec;
+        let _ = bpf_d_path(
+            path_ptr,
+            (*p).filename.as_mut_ptr() as *mut c_char,
+            PATH_LEN as u32,
+        );
+    }
+
+    let mode = CONFIG.get(0).copied().unwrap_or(0);
+    let on_list = unsafe { ALLOWLIST.get(&(*p).filename) }.is_some();
+    let decision: i32 = if mode == MODE_ENFORCE && !on_list { -1 } else { 0 };
+    unsafe {
+        (*p).status = decision;
+    }
+    entry.submit(0);
+    decision
 }
 
 /// Reserve an `Event` on the ring buffer and have bpf_d_path() fill in the
