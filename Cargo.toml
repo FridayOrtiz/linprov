@@ -67,3 +67,12 @@ panic = "abort"
 incremental = false
 codegen-units = 1
 rpath = false
+
+# BPF objects need debuginfo so the LLVM-BPF backend emits a .BTF section,
+# which the loader requires for any map type that needs btf_value_type_id
+# (BPF_MAP_TYPE_INODE_STORAGE / SK_STORAGE / TASK_STORAGE / etc).
+[profile.dev.package.linprov-ebpf]
+debug = 2
+
+[profile.release.package.linprov-ebpf]
+debug = 2

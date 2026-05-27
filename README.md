@@ -12,14 +12,27 @@ Three sleepable BPF LSM hooks plus one cleanup tracepoint:
 | Hook | What it does |
 |---|---|
 | `socket_post_create` | First time a PID creates an `AF_INET`/`AF_INET6` socket, mark the PID as network-touched in an LRU hash map. |
-| `file_open` | If the opener is network-touched and the file is opened for write, resolve the path via `bpf_d_path()` and ship it to userspace, which writes `security.bpf.linprov.origin` (binary record: version, pid, ns-since-boot, comm). |
-| `bprm_check_security` | On every exec, call the `bpf_get_file_xattr` kfunc in-kernel. If the file carries the mark, emit a ringbuf event — and in enforce mode, return `-EPERM` for paths not on the allowlist. |
+| `file_open` | If the opener is network-touched and the file is opened for write, write the OriginRecord into a `BPF_MAP_TYPE_INODE_STORAGE` map keyed on the file's inode, and emit a ringbuf event with the path. |
+| `bprm_check_security` | On every exec, look the inode up in INODE_MARKS first; if absent, fall back to the `bpf_get_file_xattr` kfunc. If either source has the mark, emit a ringbuf event — and in enforce mode, return `-EPERM` for paths not on the allowlist. |
 | `sched_process_exit` (tracepoint) | Reap the network-touched PID entry on task teardown. |
 
-Userspace consumes the ringbuf, applies the xattr (the kernel intentionally
-restricts the `bpf_set_dentry_xattr` kfunc to LSM hooks that natively take a
-trusted dentry, which `file_open` isn't one of), and — in enforce mode —
-seeds an in-kernel hash map of permitted paths.
+Userspace consumes the ringbuf, applies the `security.bpf.linprov.origin`
+xattr (the kernel restricts `bpf_set_dentry_xattr` to LSM hooks that
+natively take a trusted dentry, which `file_open` isn't), and — in
+enforce mode — seeds an in-kernel hash map of permitted paths.
+
+The two mark sources play different roles:
+
+- **INODE_MARKS** is the same-boot fast path. Synchronous in `file_open`,
+  so by the time the very next `execve` runs, the mark is already
+  visible to `bprm_check_security`. Closes the race window where a freshly
+  downloaded binary could exec before userspace landed the xattr.
+- **The xattr** is the durability layer. Survives daemon restart,
+  reboots, and inode cache eviction. Written off-band by userspace; read
+  in-kernel as fallback.
+
+Either source produces the same OriginRecord — enforcement / logging
+doesn't care which fired.
 
 ## Requirements
 
@@ -142,7 +155,9 @@ the repo knows where it's going.
   safe-trusted list, so we can't call it from `file_open`. Either get a
   kernel patch into `BTF_TYPE_SAFE_TRUSTED(struct file)`, or use a
   per-write dentry-bearing LSM hook (none currently fire on byte-level
-  writes). Until then, the userspace setxattr round-trip stays.
+  writes). Until then, the userspace setxattr round-trip stays. The
+  same-boot race is already closed by the inode_storage path; this is
+  just about lowering the persistence cost.
 - **Publishable crate UX.** When this is ready to ship as a crate:
   - Startup feature detection (vmlinux BTF present, BPF LSM in the
     active list, kernel version ≥ 6.5) with clear failure messages.

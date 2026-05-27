@@ -1,12 +1,26 @@
-//! linprov eBPF programs (BPF LSM + kfunc edition).
+//! linprov eBPF programs (BPF LSM + kfunc + inode_storage edition).
 //!
-//! Same model as the LSM-only version, but now both the xattr write and the
-//! xattr read happen in-kernel via kfuncs (`bpf_set_dentry_xattr`,
-//! `bpf_get_file_xattr`). Userspace only sees ringbuf events for logging.
+//! Two mark sources, both maintained in-kernel:
+//!
+//!   * INODE_MARKS — a BPF_MAP_TYPE_INODE_STORAGE map keyed on
+//!     `struct inode *`. Written synchronously in `file_open` the instant
+//!     a network-touched PID opens a file for write. No race window
+//!     between the LSM hook returning and the next execve hitting the
+//!     same inode. Lifetime is until the inode is evicted from cache.
+//!   * security.bpf.linprov.origin xattr — persistent across reboots
+//!     and inode eviction. Written by userspace (off the ringbuf event)
+//!     because `bpf_set_dentry_xattr` carries `KF_TRUSTED_ARGS` and
+//!     `file->f_path.dentry` isn't on the verifier's safe-trusted list,
+//!     so we can't issue the write from `file_open` in-kernel. Read
+//!     in-kernel via `bpf_get_file_xattr` as the fallback source.
+//!
+//! `bprm_check_security` consults INODE_MARKS first, then falls back to
+//! the xattr. Either source produces an OriginRecord; downstream
+//! enforce/log handling doesn't care which.
 //!
 //! Kfunc resolution is handled by our aya fork — see the `relocate_kfuncs`
-//! step in aya-obj. The `extern "C"` declarations below compile to
-//! `call -1` placeholders that aya patches to `BPF_PSEUDO_KFUNC_CALL`
+//! step in aya-obj. The `extern "C"` declaration below compiles to a
+//! `call -1` placeholder that aya patches to `BPF_PSEUDO_KFUNC_CALL`
 //! against the kernel's BTF at load time.
 //!
 //! Struct layouts are pinned to kernel 6.18 / x86_64.
@@ -19,12 +33,13 @@ use core::mem::MaybeUninit;
 
 use aya_ebpf::{
     bindings::{bpf_dynptr, path as bpf_path},
+    btf_maps::InodeStorage,
     cty::{c_char, c_void},
     helpers::{
         bpf_dynptr_from_mem, bpf_get_current_comm, bpf_get_current_pid_tgid,
         bpf_ktime_get_boot_ns,
     },
-    macros::{lsm, map, tracepoint},
+    macros::{btf_map, lsm, map, tracepoint},
     maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
     programs::{LsmContext, TracePointContext},
 };
@@ -32,20 +47,10 @@ use linprov_common::{
     Event, OriginRecord, EVENT_KIND_EXECVE, EVENT_KIND_NETWORK_FILE_OPEN, MODE_ENFORCE, PATH_LEN,
 };
 
-// Kernel kfuncs. Resolved at load time by the patched aya: the unresolved
-// symbols below produce R_BPF_64_32 relocations against `call -1`
-// placeholders, which `Object::relocate_kfuncs` rewrites into
+// Kernel kfunc. Resolved at load time by the patched aya: the unresolved
+// symbol below produces an R_BPF_64_32 relocation against a `call -1`
+// placeholder, which `Object::relocate_kfuncs` rewrites into
 // `BPF_PSEUDO_KFUNC_CALL` with the kernel BTF id.
-//
-// The `link_section = ".ksyms"` annotation mirrors libbpf's `__ksym` macro —
-// without it the LLVM BPF backend treats the extern call as a generic subprog
-// and skips emitting the helper-style arg setup (r1..r5).
-//
-// NB: `bpf_set_dentry_xattr` carries `KF_TRUSTED_ARGS`, and the dentry we get
-// via `file->f_path.dentry` lands in the verifier as `untrusted_ptr_dentry`
-// (struct path's `dentry` field isn't in the BTF safe-trusted list). Until we
-// find a way to materialize a trusted dentry, the xattr WRITE stays on the
-// userspace side and we only do the in-kernel READ here.
 extern "C" {
     fn bpf_get_file_xattr(
         file: *mut c_void,
@@ -103,10 +108,12 @@ struct KernelPath {
 
 #[repr(C)]
 struct KernelFile {
-    _f_lock: [u8; 4],
-    f_mode: u32,
-    _pad: [u8; 56],
-    f_path: KernelPath,
+    _f_lock: [u8; 4],            // 0..4    spinlock_t f_lock
+    f_mode: u32,                 // 4..8    fmode_t f_mode
+    _pad_pre_inode: [u8; 24],    // 8..32   f_op, f_mapping, private_data
+    f_inode: *mut c_void,        // 32..40  struct inode *f_inode
+    _pad_post_inode: [u8; 24],   // 40..64  f_flags, f_iocb_flags, f_cred, f_owner
+    f_path: KernelPath,          // 64..80  const struct path f_path
 }
 
 #[repr(C)]
@@ -117,6 +124,18 @@ struct KernelLinuxBinprm {
 
 #[map]
 static NET_PIDS: LruHashMap<u32, u8> = LruHashMap::with_max_entries(8192, 0);
+
+/// Per-inode provenance mark. Written in `file_open` the moment a
+/// network-touched PID opens a file for write; read first in
+/// `bprm_check_security` before falling back to the on-disk xattr.
+///
+/// The inode-storage path closes the race window between the file_open hook
+/// returning and userspace getting around to writing the xattr — we can
+/// enforce on the freshly-downloaded inode the very next instant. The xattr
+/// is the durability layer: it survives reboots and inode eviction; this
+/// map handles the same boot.
+#[btf_map]
+static INODE_MARKS: InodeStorage<OriginRecord> = InodeStorage::new();
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(1 << 20, 0);
@@ -166,9 +185,9 @@ pub fn socket_post_create(ctx: LsmContext) -> i32 {
 
 /// security_file_open(struct file *file).
 ///
-/// We can't yet do the xattr write in-kernel (see the comment on the kfunc
-/// extern block), so this still emits a ringbuf event with the path and lets
-/// userspace setxattr.
+/// Writes the OriginRecord into INODE_MARKS for the in-kernel fast path,
+/// and emits a ringbuf event so userspace can persist the same record as
+/// an xattr (durability layer).
 #[lsm(hook = "file_open", sleepable)]
 pub fn file_open(ctx: LsmContext) -> i32 {
     let pid = current_pid();
@@ -186,12 +205,22 @@ pub fn file_open(ctx: LsmContext) -> i32 {
         return 0;
     }
 
-    let rec = OriginRecord {
+    let mut rec = OriginRecord {
         version: 1,
         pid,
         ts_boot_ns: unsafe { bpf_ktime_get_boot_ns() },
         comm: current_comm(),
     };
+
+    // In-kernel mark: write the OriginRecord into inode storage right now.
+    // bprm_check_security can then enforce on this inode without waiting on
+    // userspace to land the xattr. Best-effort; if storage allocation fails
+    // we still emit the ringbuf event and fall through to the xattr path.
+    let inode_ptr = unsafe { (*file_ptr).f_inode };
+    if !inode_ptr.is_null() {
+        let _ = unsafe { INODE_MARKS.get_or_insert_ptr(inode_ptr, &mut rec as *mut _) };
+    }
+
     let path_ptr = unsafe { &(*file_ptr).f_path } as *const KernelPath as *mut bpf_path;
     emit_event(EVENT_KIND_NETWORK_FILE_OPEN, path_ptr, pid, &rec, 0);
     0
@@ -227,29 +256,54 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
         core::ptr::write_bytes(buf as *mut u8, 0, core::mem::size_of::<OriginRecord>());
     }
 
-    let mut dynptr = MaybeUninit::<bpf_dynptr>::uninit();
-    let r = unsafe {
-        bpf_dynptr_from_mem(
-            buf as *mut c_void,
-            core::mem::size_of::<OriginRecord>() as u32,
-            0,
-            dynptr.as_mut_ptr(),
-        )
-    };
-    if r != 0 {
-        return 0;
+    // Two mark sources, checked in order:
+    //
+    //   1. INODE_MARKS — populated synchronously by file_open in the same
+    //      boot. Fast (one map lookup) and race-free for freshly-marked
+    //      files: the userspace xattr round-trip hasn't necessarily landed
+    //      yet by the time the exec hook fires.
+    //   2. security.bpf.linprov.origin xattr — durable across reboots and
+    //      inode eviction. Costlier (dynptr + kfunc into the FS layer) but
+    //      the only source that survives if the inode got dropped from
+    //      cache or the file was carried over from a previous boot.
+    //
+    // Either source produces an OriginRecord; the rest of the handler doesn't
+    // care which.
+    let inode_ptr = unsafe { (*file_ptr).f_inode };
+    let mut marked = false;
+    if !inode_ptr.is_null() {
+        if let Some(stored) = unsafe { INODE_MARKS.get_ptr(inode_ptr) } {
+            unsafe { core::ptr::copy_nonoverlapping(stored, buf, 1) };
+            marked = true;
+        }
     }
 
-    let get_ret = unsafe {
-        call_get_file_xattr(
-            file_ptr as *mut c_void,
-            XATTR_NAME_C.as_ptr() as *const c_char,
-            dynptr.as_mut_ptr(),
-        )
-    };
-    if get_ret < 0 {
-        // Unmarked — every exec hits this path; no event, no enforcement.
-        return 0;
+    if !marked {
+        let mut dynptr = MaybeUninit::<bpf_dynptr>::uninit();
+        let r = unsafe {
+            bpf_dynptr_from_mem(
+                buf as *mut c_void,
+                core::mem::size_of::<OriginRecord>() as u32,
+                0,
+                dynptr.as_mut_ptr(),
+            )
+        };
+        if r != 0 {
+            return 0;
+        }
+
+        let get_ret = unsafe {
+            call_get_file_xattr(
+                file_ptr as *mut c_void,
+                XATTR_NAME_C.as_ptr() as *const c_char,
+                dynptr.as_mut_ptr(),
+            )
+        };
+        if get_ret < 0 {
+            // Unmarked from both sources — every exec hits this path; no
+            // event, no enforcement.
+            return 0;
+        }
     }
 
     // Marked. Resolve the path into a freshly-reserved ringbuf entry, then
