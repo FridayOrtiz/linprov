@@ -57,9 +57,30 @@ doesn't care which fired.
 cargo build --release
 ```
 
-This depends on a [forked aya](https://github.com/FridayOrtiz/aya) that
-adds kfunc relocation resolution. The dependency is resolved by git
-automatically; no local checkout required.
+Requires `bpf-linker` (`cargo install bpf-linker`). Depends on a
+[forked aya](https://github.com/FridayOrtiz/aya) that adds kfunc
+relocation resolution; the dependency is resolved by git
+automatically — no local checkout required.
+
+Until [#53](https://github.com/FridayOrtiz/linprov/issues) is
+addressed, `cargo install linprov` doesn't work — the build.rs
+expects a sibling `linprov-ebpf` crate at the workspace path. For
+now install from a git checkout:
+
+```
+cargo install --git https://github.com/FridayOrtiz/linprov linprov
+```
+
+## Tests
+
+```
+# Unit tests + doctests (no kernel needed):
+cargo test --workspace --exclude linprov-ebpf
+
+# Smoke suite (needs root + BPF LSM kernel; see tests/README.md):
+cargo build
+sudo ./tests/smoke/run-all.sh
+```
 
 ## Run
 
@@ -235,4 +256,18 @@ the repo knows where it's going.
 linprov/         userspace daemon (clap, tokio, aya)
 linprov-ebpf/    BPF programs (no_std, aya-ebpf, inline asm for kfuncs)
 linprov-common/  types shared between the two
+tests/smoke/     end-to-end tests against a real kernel
+.github/         CI workflows
 ```
+
+## License
+
+Userspace crates: dual-licensed under MIT or Apache-2.0 at your option.
+See `LICENSE-MIT` and `LICENSE-APACHE` at the repo root.
+
+The BPF program (`linprov-ebpf`) declares `Dual MIT/GPL` in its
+`license` ELF section so the kernel verifier accepts it as
+GPL-compatible — required for the `bpf_d_path` and `bpf_get_file_xattr`
+helpers, which are `gpl_only`. The source itself is the same
+MIT-OR-Apache-2.0 as the rest of the workspace; the GPL token is a
+license-compatibility statement to the kernel, not a relicense.

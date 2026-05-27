@@ -44,9 +44,9 @@ use aya_ebpf::{
     programs::{LsmContext, TracePointContext},
 };
 use linprov_common::{
-    dim, AllowRule, Event, OriginRecord, COMM_LEN, EVENT_KIND_EXECVE,
-    EVENT_KIND_NETWORK_FILE_OPEN, FNV_OFFSET, FNV_PRIME, MAX_FOLDER_HASHES, MAX_RULES,
-    MODE_ENFORCE, ORIGIN_VERSION, PATH_HASH_SCAN_LEN, PATH_LEN,
+    dim, AllowRule, Event, OriginRecord, COMM_LEN, EVENT_KIND_EXECVE, EVENT_KIND_NETWORK_FILE_OPEN,
+    FNV_OFFSET, FNV_PRIME, MAX_FOLDER_HASHES, MAX_RULES, MODE_ENFORCE, ORIGIN_VERSION,
+    PATH_HASH_SCAN_LEN, PATH_LEN,
 };
 
 // Kernel kfunc. Resolved at load time by the patched aya: the unresolved
@@ -54,11 +54,7 @@ use linprov_common::{
 // placeholder, which `Object::relocate_kfuncs` rewrites into
 // `BPF_PSEUDO_KFUNC_CALL` with the kernel BTF id.
 extern "C" {
-    fn bpf_get_file_xattr(
-        file: *mut c_void,
-        name: *const c_char,
-        value: *mut bpf_dynptr,
-    ) -> i32;
+    fn bpf_get_file_xattr(file: *mut c_void, name: *const c_char, value: *mut bpf_dynptr) -> i32;
 }
 
 /// Wrap the kfunc call in inline assembly that explicitly materializes the
@@ -97,6 +93,16 @@ unsafe fn bpf_d_path(p: *mut bpf_path, buf: *mut c_char, sz: u32) -> i64 {
 
 const XATTR_NAME_C: &[u8] = b"security.bpf.linprov.origin\0";
 
+/// BPF program license. The kernel inspects the `license` ELF section
+/// when loading; programs that don't claim a GPL-compatible license
+/// can't call `gpl_only` helpers (we rely on `bpf_d_path`, which is one
+/// of them). Dual-licensing matches the userspace crate's
+/// `MIT OR Apache-2.0` while still presenting a GPL token to the
+/// kernel verifier.
+#[link_section = "license"]
+#[no_mangle]
+pub static LICENSE: [u8; 13] = *b"Dual MIT/GPL\0";
+
 const AF_INET: i32 = 2;
 const AF_INET6: i32 = 10;
 
@@ -110,12 +116,12 @@ struct KernelPath {
 
 #[repr(C)]
 struct KernelFile {
-    _f_lock: [u8; 4],            // 0..4    spinlock_t f_lock
-    f_mode: u32,                 // 4..8    fmode_t f_mode
-    _pad_pre_inode: [u8; 24],    // 8..32   f_op, f_mapping, private_data
-    f_inode: *mut c_void,        // 32..40  struct inode *f_inode
-    _pad_post_inode: [u8; 24],   // 40..64  f_flags, f_iocb_flags, f_cred, f_owner
-    f_path: KernelPath,          // 64..80  const struct path f_path
+    _f_lock: [u8; 4],          // 0..4    spinlock_t f_lock
+    f_mode: u32,               // 4..8    fmode_t f_mode
+    _pad_pre_inode: [u8; 24],  // 8..32   f_op, f_mapping, private_data
+    f_inode: *mut c_void,      // 32..40  struct inode *f_inode
+    _pad_post_inode: [u8; 24], // 40..64  f_flags, f_iocb_flags, f_cred, f_owner
+    f_path: KernelPath,        // 64..80  const struct path f_path
 }
 
 #[repr(C)]
@@ -156,7 +162,6 @@ static SCRATCH: PerCpuArray<OriginRecord> = PerCpuArray::with_max_entries(2, 0);
 
 const SCRATCH_FILE_OPEN: u32 = 0;
 const SCRATCH_BPRM: u32 = 1;
-
 
 /// Runtime mode set by userspace before attach. Index 0 holds a value from
 /// the `MODE_*` constants in `linprov_common`.
@@ -453,7 +458,11 @@ unsafe fn check_allowlist(filename: &[u8; PATH_LEN], origin: &OriginRecord) -> b
     }
     let exec_uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
 
-    let n = if count as usize > MAX_RULES { MAX_RULES as u32 } else { count };
+    let n = if count as usize > MAX_RULES {
+        MAX_RULES as u32
+    } else {
+        count
+    };
     for i in 0..MAX_RULES {
         if (i as u32) >= n {
             break;

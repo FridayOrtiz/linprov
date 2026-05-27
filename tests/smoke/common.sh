@@ -1,0 +1,135 @@
+# Shared bash helpers for the smoke suite. Source from each script.
+#
+# Conventions:
+#   - LINPROV_BIN points to the daemon binary (default: target/debug/linprov).
+#   - All scripts run from the repo root so relative paths work.
+#   - We pre-flight that BPF LSM is active before starting the daemon.
+
+set -u
+
+: "${LINPROV_BIN:=./target/debug/linprov}"
+: "${LINPROV_HTTP_PORT:=8000}"
+
+require_root() {
+    if [ "$(id -u)" -ne 0 ] && ! sudo -n true 2>/dev/null; then
+        echo "These tests need root (or passwordless sudo)." >&2
+        exit 2
+    fi
+}
+
+require_bpf_lsm() {
+    if [ ! -f /sys/kernel/security/lsm ]; then
+        echo "BPF LSM not available — /sys/kernel/security/lsm missing." >&2
+        exit 2
+    fi
+    if ! grep -q '\bbpf\b' /sys/kernel/security/lsm; then
+        echo "BPF LSM not in active lsm list ($(cat /sys/kernel/security/lsm))." >&2
+        echo "Add 'bpf' to the lsm= boot param and reboot." >&2
+        exit 2
+    fi
+}
+
+require_binary() {
+    if [ ! -x "$LINPROV_BIN" ]; then
+        echo "linprov binary not found at $LINPROV_BIN. Run 'cargo build' first." >&2
+        exit 2
+    fi
+}
+
+# Kill just the running linprov daemon. start_daemon calls this to make
+# room for the new daemon; it intentionally does NOT touch the python
+# http server we spawned at the start of each script.
+#
+# We resolve PIDs via /proc/*/comm rather than `pkill -f` because the
+# latter has historically had self-match issues here (the pkill command
+# line contains its own pattern argument).
+cleanup_daemons() {
+    local pids
+    pids=$(pgrep -x linprov || true)
+    if [ -n "$pids" ]; then
+        # shellcheck disable=SC2086
+        sudo kill -9 $pids 2>/dev/null || true
+    fi
+    sleep 1
+}
+
+# Kill everything (daemon + http server). Tests call this at start and
+# end as a hygiene measure.
+cleanup_all() {
+    cleanup_daemons
+    local pids
+    pids=$(pgrep -f "python3 -m http.server $LINPROV_HTTP_PORT" || true)
+    if [ -n "$pids" ]; then
+        # shellcheck disable=SC2086
+        kill $pids 2>/dev/null || true
+    fi
+    sleep 1
+}
+
+# Start a python http.server serving from $1 on $LINPROV_HTTP_PORT.
+start_http_server() {
+    local serve_dir=$1
+    (cd "$serve_dir" && setsid python3 -m http.server "$LINPROV_HTTP_PORT" \
+        > /tmp/linprov-test-server.log 2>&1 < /dev/null &)
+    sleep 1
+}
+
+# Start the daemon in the given mode with the given allowlist path; log
+# goes to $logfile. Echoes "ok" or "fail" and the log tail on failure.
+#   start_daemon <mode> <allowlist|-> <logfile> [extra args...]
+start_daemon() {
+    local mode=$1 allowlist=$2 logfile=$3
+    shift 3
+    cleanup_daemons
+    rm -f "$logfile"
+
+    local args=(--mode "$mode" --log-level info)
+    if [ "$allowlist" != "-" ]; then
+        args+=(--allowlist "$allowlist")
+    fi
+    args+=("$@")
+
+    setsid sudo "$LINPROV_BIN" "${args[@]}" > "$logfile" 2>&1 < /dev/null &
+    sleep 3
+    if ! grep -q 'linprov running' "$logfile"; then
+        echo "daemon failed to start"
+        tail -20 "$logfile" >&2
+        return 1
+    fi
+}
+
+# Download $1 from the http.server to /tmp/<basename>. Sets the
+# executable bit so an immediate exec works.
+fetch() {
+    local name=$1
+    rm -f "/tmp/$name"
+    curl -fsS -o "/tmp/$name" "http://127.0.0.1:$LINPROV_HTTP_PORT/$name"
+    chmod +x "/tmp/$name"
+}
+
+# Like `fetch`, but downloads multiple names with the same server.
+fetch_all() {
+    for n in "$@"; do
+        fetch "$n"
+    done
+}
+
+# Run a binary and echo PASS/BLOCK. Returns the binary's exit status.
+exec_check() {
+    local label=$1 binary=$2
+    if "$binary" 2>/dev/null; then
+        echo "  PASS $label"
+        return 0
+    else
+        local rc=$?
+        echo "  BLOCK $label exit=$rc"
+        return "$rc"
+    fi
+}
+
+# Pre-flight before any test.
+smoke_preflight() {
+    require_root
+    require_bpf_lsm
+    require_binary
+}

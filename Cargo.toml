@@ -10,8 +10,15 @@ default-members = ["linprov"]
 [workspace.package]
 version = "0.1.0"
 edition = "2021"
+authors = ["Friday Ortiz <friday@ortiz.sh>"]
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/FridayOrtiz/linprov"
+homepage = "https://github.com/FridayOrtiz/linprov"
+readme = "README.md"
+description = "eBPF mark-of-the-web for Linux: tag network-touched files and enforce who can exec them."
+keywords = ["ebpf", "lsm", "security", "bpf", "provenance"]
+categories = ["os::linux-apis", "command-line-utilities"]
+rust-version = "1.85"
 
 [workspace.dependencies]
 # Aya fork — adds kfunc relocation resolution to aya-obj. Switch back to a

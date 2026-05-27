@@ -2,7 +2,15 @@
 name = "linprov-ebpf"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "BPF LSM programs powering the linprov daemon (Dual MIT/GPL kernel-side; MIT OR Apache-2.0 source)."
+rust-version.workspace = true
+# Built for the `bpfel-unknown-none` target via the linprov crate's
+# build.rs; never installed as a userspace binary.
+publish = false
 
 [dependencies]
 aya-ebpf = { workspace = true }

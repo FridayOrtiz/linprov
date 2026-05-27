@@ -18,12 +18,18 @@ fn main() {
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", ebpf_dir.join("src").display());
-    println!("cargo:rerun-if-changed={}", ebpf_dir.join("Cargo.toml").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        ebpf_dir.join("Cargo.toml").display()
+    );
     println!(
         "cargo:rerun-if-changed={}",
         ebpf_dir.join(".cargo/config.toml").display()
     );
-    println!("cargo:rerun-if-changed={}", common_dir.join("src").display());
+    println!(
+        "cargo:rerun-if-changed={}",
+        common_dir.join("src").display()
+    );
     println!(
         "cargo:rerun-if-changed={}",
         common_dir.join("Cargo.toml").display()
@@ -59,13 +65,21 @@ fn main() {
         cmd.arg("--release");
     }
 
-    let status = cmd.status().expect("failed to invoke nested cargo for eBPF build");
+    let status = cmd
+        .status()
+        .expect("failed to invoke nested cargo for eBPF build");
     if !status.success() {
-        panic!("eBPF build of linprov-ebpf failed (status: {:?})", status.code());
+        panic!(
+            "eBPF build of linprov-ebpf failed (status: {:?})",
+            status.code()
+        );
     }
 
     let profile_dir = if release { "release" } else { "debug" };
-    let src = target_dir.join(target).join(profile_dir).join("linprov-ebpf");
+    let src = target_dir
+        .join(target)
+        .join(profile_dir)
+        .join("linprov-ebpf");
     let dst = out_dir.join("linprov-ebpf");
     std::fs::copy(&src, &dst).unwrap_or_else(|e| {
         panic!(

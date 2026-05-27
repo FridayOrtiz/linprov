@@ -19,9 +19,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use clap::ValueEnum;
-use linprov_common::{
-    dim, fnv_hash, AllowRule, COMM_LEN, MAX_RULES, PATH_HASH_SCAN_LEN,
-};
+use linprov_common::{dim, fnv_hash, AllowRule, COMM_LEN, MAX_RULES, PATH_HASH_SCAN_LEN};
 
 /// Allowlist dimensions. Used both for `--soak=<csv>` and for the
 /// `<dim>=<value>` entries in the allowlist file.
@@ -422,4 +420,140 @@ pub struct OriginContext<'a> {
     pub creator_comm: &'a str,
     pub creator_uid: u32,
     pub execution_uid: u32,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_single_dim() {
+        let r = RuleSpec::parse("creator_comm=curl").unwrap();
+        assert_eq!(r.flags, dim::CREATOR_COMM);
+        assert_eq!(r.creator_comm.as_deref(), Some("curl"));
+    }
+
+    #[test]
+    fn parse_multi_dim_anded() {
+        let r = RuleSpec::parse("creator_uid=1000;creator_comm=curl").unwrap();
+        assert_eq!(r.flags, dim::CREATOR_UID | dim::CREATOR_COMM);
+        assert_eq!(r.creator_uid, Some(1000));
+        assert_eq!(r.creator_comm.as_deref(), Some("curl"));
+    }
+
+    #[test]
+    fn parse_trailing_semicolons_and_whitespace_ok() {
+        let r = RuleSpec::parse("  creator_uid = 1000 ;; creator_comm = curl ; ").unwrap();
+        assert_eq!(r.flags, dim::CREATOR_UID | dim::CREATOR_COMM);
+    }
+
+    #[test]
+    fn parse_rejects_unknown_dim() {
+        let err = RuleSpec::parse("nope=1").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("unknown dimension"), "{msg}");
+    }
+
+    #[test]
+    fn parse_rejects_empty_rule() {
+        let err = RuleSpec::parse(";;").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("no conditions"), "{msg}");
+    }
+
+    #[test]
+    fn parse_rejects_missing_equals() {
+        let err = RuleSpec::parse("creator_comm").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("missing `=`"), "{msg}");
+    }
+
+    #[test]
+    fn parse_rejects_duplicate_dim() {
+        let err = RuleSpec::parse("creator_uid=1;creator_uid=2").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("specified twice"), "{msg}");
+    }
+
+    #[test]
+    fn parse_rejects_bad_uid() {
+        let err = RuleSpec::parse("creator_uid=notanumber").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("not a u32"), "{msg}");
+    }
+
+    #[test]
+    fn target_folder_normalizes_trailing_slash() {
+        let r = RuleSpec::parse("target_folder=/opt/installed").unwrap();
+        assert_eq!(r.target_folder.as_deref(), Some("/opt/installed/"));
+
+        let r = RuleSpec::parse("target_folder=/opt/installed/").unwrap();
+        assert_eq!(r.target_folder.as_deref(), Some("/opt/installed/"));
+    }
+
+    #[test]
+    fn round_trip_canonical_line() {
+        // Conditions are emitted in DIM_ORDER, which doesn't necessarily
+        // match input order — round-tripping through to_line() yields
+        // the canonical form.
+        let r = RuleSpec::parse("creator_comm=curl;target_filename=/x").unwrap();
+        let line = r.to_line();
+        assert_eq!(line, "target_filename=/x;creator_comm=curl");
+
+        // The canonical form re-parses identically.
+        let r2 = RuleSpec::parse(&line).unwrap();
+        assert_eq!(r2.to_line(), line);
+    }
+
+    #[test]
+    fn pack_sets_only_required_hashes() {
+        let r = RuleSpec::parse("creator_uid=1000").unwrap();
+        let packed = r.pack();
+        assert_eq!(packed.flags, dim::CREATOR_UID);
+        assert_eq!(packed.creator_uid, 1000);
+        // Cleared dims still have a default-valued field — the BPF side
+        // ignores them because the flag bit is off.
+        assert_eq!(packed.target_filename_hash, 0);
+        assert_eq!(packed.creator_process_hash, 0);
+    }
+
+    #[test]
+    fn pack_creator_process_hashes_match_fnv() {
+        let r = RuleSpec::parse("creator_process=/usr/bin/curl").unwrap();
+        let packed = r.pack();
+        assert_eq!(packed.flags, dim::CREATOR_PROCESS);
+        assert_eq!(packed.creator_process_hash, fnv_hash("/usr/bin/curl"));
+    }
+
+    #[test]
+    fn rules_dedup_on_canonical_line() {
+        let mut rules = Rules::default();
+        assert!(rules.insert(RuleSpec::parse("creator_uid=1000").unwrap()));
+        assert!(!rules.insert(RuleSpec::parse("creator_uid=1000").unwrap()));
+        assert_eq!(rules.len(), 1);
+    }
+
+    #[test]
+    fn rules_load_skips_comments_and_blanks() {
+        use std::io::Write;
+        let mut tmp = tempfile::NamedTempFile::new().unwrap();
+        writeln!(tmp, "# top comment").unwrap();
+        writeln!(tmp).unwrap();
+        writeln!(tmp, "creator_comm=curl  # inline comment").unwrap();
+        writeln!(tmp, "creator_uid=1000;creator_comm=curl").unwrap();
+        tmp.flush().unwrap();
+        let rules = Rules::load(tmp.path()).unwrap();
+        assert_eq!(rules.len(), 2);
+    }
+
+    #[test]
+    fn capacity_check_fires_above_max_rules() {
+        let mut rules = Rules::default();
+        for i in 0..(MAX_RULES + 1) {
+            // Use unique creator_uid values so dedup doesn't collapse them.
+            let spec = RuleSpec::parse(&format!("creator_uid={i}")).unwrap();
+            rules.insert(spec);
+        }
+        assert!(rules.check_capacity().is_err());
+    }
 }

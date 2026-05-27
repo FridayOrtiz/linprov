@@ -111,7 +111,12 @@ async fn main() -> Result<()> {
     attach_lsm(&mut bpf, &btf, "socket_post_create")?;
     attach_lsm(&mut bpf, &btf, "file_open")?;
     attach_lsm(&mut bpf, &btf, "bprm_check_security")?;
-    attach_tracepoint(&mut bpf, "sched_process_exit", "sched", "sched_process_exit")?;
+    attach_tracepoint(
+        &mut bpf,
+        "sched_process_exit",
+        "sched",
+        "sched_process_exit",
+    )?;
 
     let rules = if let Some(path) = &args.allowlist {
         Rules::load(path)?
@@ -145,14 +150,20 @@ async fn main() -> Result<()> {
         _ => None,
     };
 
-    let cfg = handler::Config { mode: args.mode, soak };
+    let cfg = handler::Config {
+        mode: args.mode,
+        soak,
+    };
 
     info!(
         "linprov running ({:?}). press Ctrl-C to exit.{}",
         args.mode,
         if args.mode == Mode::Soak {
             let names: Vec<_> = args.soak.iter().map(|d| d.as_key()).collect();
-            format!(" soak dims (AND-joined per emitted rule): {}", names.join(","))
+            format!(
+                " soak dims (AND-joined per emitted rule): {}",
+                names.join(",")
+            )
         } else {
             String::new()
         }
@@ -182,18 +193,21 @@ async fn main() -> Result<()> {
 }
 
 fn seed_allowlist_rules(bpf: &mut Ebpf, rules: &Rules) -> Result<()> {
-    let mut rule_map: Array<_, AllowRuleWire> = Array::try_from(
-        bpf.map_mut("ALLOW_RULES")
-            .context("ALLOW_RULES map missing")?,
-    )
-    .context("opening ALLOW_RULES")?;
-    for (i, spec) in rules.rules.iter().enumerate() {
-        let packed = AllowRuleWire(spec.pack());
-        rule_map
-            .set(i as u32, packed, 0)
-            .with_context(|| format!("seeding rule[{i}] `{}`", spec.to_line()))?;
+    // Two scoped borrows because `bpf.map_mut` re-borrows the Ebpf and
+    // we need it for both maps.
+    {
+        let mut rule_map: Array<_, AllowRuleWire> = Array::try_from(
+            bpf.map_mut("ALLOW_RULES")
+                .context("ALLOW_RULES map missing")?,
+        )
+        .context("opening ALLOW_RULES")?;
+        for (i, spec) in rules.rules.iter().enumerate() {
+            let packed = AllowRuleWire(spec.pack());
+            rule_map
+                .set(i as u32, packed, 0)
+                .with_context(|| format!("seeding rule[{i}] `{}`", spec.to_line()))?;
+        }
     }
-    drop(rule_map);
 
     let mut count_map: Array<_, u32> = Array::try_from(
         bpf.map_mut("ALLOW_RULE_COUNT")
@@ -234,12 +248,7 @@ fn attach_lsm(bpf: &mut Ebpf, btf: &Btf, prog_name: &str) -> Result<()> {
     Ok(())
 }
 
-fn attach_tracepoint(
-    bpf: &mut Ebpf,
-    prog_name: &str,
-    category: &str,
-    name: &str,
-) -> Result<()> {
+fn attach_tracepoint(bpf: &mut Ebpf, prog_name: &str, category: &str, name: &str) -> Result<()> {
     let program: &mut TracePoint = bpf
         .program_mut(prog_name)
         .ok_or_else(|| anyhow!("eBPF program `{prog_name}` not present in object"))?

@@ -1,6 +1,32 @@
 //! Types shared between the eBPF program (`linprov-ebpf`) and the userspace
-//! daemon (`linprov`). Everything here must be `repr(C)` and Pod-friendly so
-//! it survives a round-trip through a ring buffer and a kernel xattr.
+//! daemon (`linprov`). Everything here is `repr(C)` and Pod-friendly so it
+//! survives a round-trip through a ring buffer and a kernel xattr.
+//!
+//! The crate compiles `no_std` by default (for the BPF target). Enable the
+//! `user` feature in userspace to pull in `bytemuck::Pod` / `Zeroable`
+//! derives on the wire types.
+//!
+//! Wire shapes at a glance:
+//!
+//! - [`OriginRecord`] is what the daemon stores in the xattr and in the BPF
+//!   `INODE_MARKS` map. BPF writes most of it in `file_open`; userspace
+//!   augments `creator_path` from `/proc/$pid/exe`.
+//! - [`Event`] is the ringbuf record streamed from BPF to userspace.
+//! - [`AllowRule`] is one allowlist rule, packed into the BPF
+//!   `ALLOW_RULES` array. String dims are stored as [`fnv_hash`] values
+//!   so the BPF side can compare without carrying full byte arrays.
+//!
+//! ```
+//! use linprov_common::{fnv_hash, dim};
+//!
+//! // Both sides hash strings the same way; same input → same u64.
+//! assert_eq!(fnv_hash("/usr/bin/curl"), fnv_hash("/usr/bin/curl"));
+//! assert_ne!(fnv_hash("/usr/bin/curl"), fnv_hash("/usr/bin/wget"));
+//!
+//! // Dimension bits are independent flags on AllowRule::flags.
+//! let two_dim = dim::CREATOR_UID | dim::CREATOR_COMM;
+//! assert_eq!(two_dim.count_ones(), 2);
+//! ```
 
 #![cfg_attr(not(feature = "user"), no_std)]
 
@@ -25,10 +51,24 @@ pub const FNV_PRIME: u64 = 0x100_0000_01b3;
 
 /// Hash a string with FNV-1a-64. Byte-by-byte, no trailing NUL, no
 /// padding — identical on the BPF and userspace sides.
+///
+/// Both sides MUST compute the same hash for the same input; the FNV
+/// constants ([`FNV_OFFSET`], [`FNV_PRIME`]) are fixed for that reason.
+///
+/// ```
+/// use linprov_common::fnv_hash;
+/// // FNV-1a of the empty string is the offset basis.
+/// assert_eq!(fnv_hash(""), 0xcbf2_9ce4_8422_2325);
+/// // Distinct inputs hash distinctly.
+/// assert_ne!(fnv_hash("/tmp/"), fnv_hash("/etc/"));
+/// ```
 pub fn fnv_hash(s: &str) -> u64 {
     fnv_hash_bytes(s.as_bytes())
 }
 
+/// Same as [`fnv_hash`], but takes a byte slice. Useful when the source
+/// isn't UTF-8 (e.g., a `[u8; PATH_LEN]` filename buffer read out of a
+/// ringbuf event).
 pub fn fnv_hash_bytes(bytes: &[u8]) -> u64 {
     let mut h = FNV_OFFSET;
     for &b in bytes {
@@ -144,4 +184,63 @@ pub struct Event {
 
 impl Event {
     pub const SIZE: usize = core::mem::size_of::<Self>();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fnv_known_vectors() {
+        // FNV-1a-64 offset basis for the empty string.
+        assert_eq!(fnv_hash(""), 0xcbf2_9ce4_8422_2325);
+        // Pre-computed reference values from a separate FNV implementation.
+        assert_eq!(fnv_hash("a"), 0xaf63_dc4c_8601_ec8c);
+        assert_eq!(fnv_hash("foobar"), 0x85944171_f73967e8);
+    }
+
+    #[test]
+    fn fnv_string_and_bytes_agree() {
+        let s = "/usr/bin/curl";
+        assert_eq!(fnv_hash(s), fnv_hash_bytes(s.as_bytes()));
+    }
+
+    #[test]
+    fn dim_flags_are_unique() {
+        let all = [
+            dim::TARGET_FILENAME,
+            dim::TARGET_FOLDER,
+            dim::LANDING_FILENAME,
+            dim::LANDING_FOLDER,
+            dim::CREATOR_PROCESS,
+            dim::CREATOR_COMM,
+            dim::CREATOR_UID,
+            dim::EXECUTION_UID,
+        ];
+        let mut acc = 0u32;
+        for d in all {
+            assert_eq!(d.count_ones(), 1, "each dim is one bit");
+            assert_eq!(acc & d, 0, "dim {d:#b} overlaps with prior {acc:#b}");
+            acc |= d;
+        }
+    }
+
+    #[test]
+    fn origin_record_size_is_v3_expected() {
+        // 4 + 4 + 8 + 16 + 4 + 4 + 256 + 256 = 552
+        assert_eq!(core::mem::size_of::<OriginRecord>(), 552);
+    }
+
+    #[test]
+    fn allow_rule_size_has_no_padding() {
+        // 4 + 4 + 4 + 4 + 16 + 8*5 = 72
+        assert_eq!(core::mem::size_of::<AllowRule>(), 72);
+    }
+
+    #[test]
+    fn fnv_constants_match_reference() {
+        // FNV-1a-64 parameters per http://www.isthe.com/chongo/tech/comp/fnv/
+        assert_eq!(FNV_OFFSET, 0xcbf2_9ce4_8422_2325);
+        assert_eq!(FNV_PRIME, 0x100_0000_01b3);
+    }
 }

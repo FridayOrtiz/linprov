@@ -17,7 +17,10 @@ use linprov_common::{
 };
 use log::{debug, info, warn};
 
-use crate::{allowlist::{OriginContext, Soak}, ModeArg};
+use crate::{
+    allowlist::{OriginContext, Soak},
+    ModeArg,
+};
 
 pub struct Config {
     pub mode: ModeArg,
@@ -104,7 +107,9 @@ fn write_path_field(buf: &mut [u8; CREATOR_PATH_LEN], s: &str) {
 }
 
 fn is_pseudo_fs(target: &std::path::Path) -> bool {
-    let Some(s) = target.to_str() else { return true };
+    let Some(s) = target.to_str() else {
+        return true;
+    };
     s.starts_with("/dev/")
         || s.starts_with("/proc/")
         || s.starts_with("/sys/")

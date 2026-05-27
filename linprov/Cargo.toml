@@ -2,7 +2,21 @@
 name = "linprov"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description.workspace = true
+keywords.workspace = true
+categories.workspace = true
+readme = "../README.md"
+rust-version.workspace = true
+# NOTE: `cargo install linprov` doesn't work yet — build.rs invokes a
+# nested `cargo build` against `../linprov-ebpf` at the workspace path,
+# which isn't present in a published tarball. Tracked as a follow-up;
+# install via `cargo install --git https://github.com/FridayOrtiz/linprov`
+# for now.
+publish = false
 
 [[bin]]
 name = "linprov"
@@ -21,3 +35,6 @@ tokio.workspace = true
 xattr.workspace = true
 
 linprov-common = { workspace = true, features = ["user"] }
+
+[dev-dependencies]
+tempfile = "3"

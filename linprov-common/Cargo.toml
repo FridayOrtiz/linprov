@@ -2,7 +2,15 @@
 name = "linprov-common"
 version.workspace = true
 edition.workspace = true
+authors.workspace = true
 license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+readme = "../README.md"
+description = "Shared types and constants for the linprov daemon and its BPF program (OriginRecord, AllowRule, FNV hashing)."
+keywords = ["ebpf", "bpf", "linprov", "provenance"]
+categories = ["os::linux-apis", "data-structures"]
+rust-version.workspace = true
 
 [features]
 default = []
