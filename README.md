@@ -63,13 +63,12 @@ automatically; no local checkout required.
 
 ## Run
 
-Three modes. The `--allowlist` file is one absolute path per line, `#`
-starts a comment, blank lines ignored.
+Three modes. The `--allowlist` file format is described
+[below](#allowlist-format).
 
 ### Observe (default)
 
-Marks files and logs marked execs. Never blocks. Use this for understanding
-what your system does over time.
+Marks files and logs marked execs. Never blocks.
 
 ```
 sudo ./target/release/linprov
@@ -79,26 +78,33 @@ Sample log line for an exec of a marked binary:
 
 ```
 PROVENANCE-EXEC path=/tmp/curl-download pid=12345 comm=zsh \
-  origin={v:1,ts_boot_ns:42…,pid:6789,comm:curl}
+  origin={v:2,ts_boot_ns:42…,pid:6789,uid:1000,comm:curl,path:/usr/bin/curl}
 ```
 
 ### Soak
 
-Same observation as above, but every distinct PROVENANCE-EXEC path is
-appended to the allowlist file. Use to generate the allowlist you'll later
-feed to enforce.
+Like observe, but every PROVENANCE-EXEC produces allowlist rules for the
+dimensions selected by `--soak`. Defaults to `creator_process`.
 
 ```
+# Default: one rule per distinct creator binary
 sudo ./target/release/linprov --mode soak --allowlist /etc/linprov.allow
+
+# Capture multiple dimensions per event
+sudo ./target/release/linprov --mode soak --allowlist /etc/linprov.allow \
+    --soak creator_process,creator_uid,target_folder
 ```
 
-Tail the file as you go to watch the policy build up.
+Tail the allowlist file as soak runs to watch the policy build up. Rules
+are deduplicated on the literal text, so re-execing the same files just
+no-ops.
 
 ### Enforce
 
-Loads the allowlist into a BPF hash map at startup. Marked execs whose path
-is on the list are permitted as normal; everything else is blocked with
-`-EPERM` from `security_bprm_check`. Unmarked binaries are never touched.
+Loads the allowlist into BPF maps at startup. A marked execve is permitted
+iff *any* rule in the allowlist matches the file's `OriginRecord` (creator
+identity / UID / etc.) or the target path. Unmarked binaries are never
+touched.
 
 ```
 sudo ./target/release/linprov --mode enforce --allowlist /etc/linprov.allow
@@ -108,21 +114,53 @@ Blocked exec log:
 
 ```
 BLOCKED-EXEC path=/tmp/sketchy pid=12346 comm=zsh \
-  origin={v:1,…,comm:curl} (LSM verdict -1)
+  origin={v:2,…,comm:curl,path:/usr/bin/curl} (LSM verdict -1)
 ```
 
 The originating shell sees `Operation not permitted` and `$?` is 126.
+
+## Allowlist format
+
+One rule per line. `#` starts a comment; blank lines are ignored. Each
+rule is either `<dim>=<value>` or a bare absolute path (interpreted as
+`target_filename` for back-compat).
+
+| dim | example | matches if … |
+|---|---|---|
+| `target_filename` | `/usr/bin/foo` | the marked file's path equals this |
+| `target_folder` | `/opt/installed/` | the marked file lives under this prefix (any depth) |
+| `creator_process` | `/usr/bin/curl` | the full `exe` path of the writer matches |
+| `creator_comm` | `curl` | the 16-byte `comm` of the writer matches |
+| `creator_uid` | `1000` | the writer's UID matches |
+| `execution_uid` | `0` | the UID running the `execve` matches |
+
+A marked execve is permitted if **any** rule matches.
+
+`target_folder` rules must end in `/` and stay under ~96 bytes (the BPF
+folder walk hashes a bounded prefix of the path).
+
+`creator_process` is populated by userspace via `readlink /proc/$pid/exe`
+when handling the file-open event. If the creator process exits before
+userspace lands the augmented xattr, `creator_process` rules for that
+file won't match until something else re-marks the same path —
+`creator_comm` (always populated by BPF) is the fallback in that window.
 
 ## Inspecting the xattr by hand
 
 ```
 getfattr -d -m '.*' /path/to/file
-# security.bpf.linprov.origin=0sAQAAAA...
+# security.bpf.linprov.origin=0sAgAAAA...
 ```
 
-The value is 32 bytes of binary `OriginRecord`: `version (4) | pid (4) |
-ts_boot_ns (8) | comm[16]`. Use `od -An -tx1` if you want to decode it
-manually; the daemon's log lines already format it.
+The value is the binary `OriginRecord` (v2 layout):
+
+```
+version u32 | pid u32 | ts_boot_ns u64 | comm[16] |
+creator_uid u32 | _pad u32 | creator_path[256]
+```
+
+The daemon's log lines already format it. v1 xattrs from prior linprov
+builds are ignored (treated as unmarked).
 
 ## Roadmap
 
@@ -140,16 +178,17 @@ the repo knows where it's going.
   it's Python that the exec hook sees — not the script. Want to read the
   script's xattr in `inode_permission` (or a userspace shebang-aware
   wrapper) so script execution honors the same enforce policy.
-- **Richer allowlist matching.** Right now an entry is a full path. Add
-  rules keyed by:
-  - `origin.comm` (creator process name — allow anything written by
-    `apt-get`)
-  - `origin.uid` (write-time UID)
-  - executing UID (only allow `root` to run marked things)
-  - path globs / prefixes (allow `/opt/installed/**`)
-  
-  The OriginRecord schema is versioned; bumping it to add UIDs is the
-  easy part.
+- **Richer allowlist matching.** Six dimensions exist today
+  (`target_filename`, `target_folder`, `creator_process`, `creator_comm`,
+  `creator_uid`, `execution_uid`). Still on deck:
+  - Path globs (`/opt/installed/*.so`) — currently we only have exact
+    paths and recursive folder prefixes.
+  - LPM-trie folder match. We use an FNV hash walk because LPM trie
+    isn't allowed in sleepable programs; if we ever split the exec path
+    into a non-sleepable allowlist check and a sleepable xattr fetch, an
+    LPM trie becomes viable and lets us drop the rule-length cap.
+  - AND-combinators (rule "creator_process=X AND execution_uid=Y").
+    Today the dimensions are OR-ed; each rule is a single dimension.
 - **In-kernel xattr WRITE.** The `bpf_set_dentry_xattr` kfunc carries
   `KF_TRUSTED_ARGS` and `file->f_path.dentry` isn't on the verifier's
   safe-trusted list, so we can't call it from `file_open`. Either get a

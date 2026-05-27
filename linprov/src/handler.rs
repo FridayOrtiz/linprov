@@ -1,30 +1,30 @@
 //! Ring-buffer event handler.
 //!
-//! In all modes the eBPF program does the xattr READ in-kernel via
-//! `bpf_get_file_xattr`; userspace handles the xattr WRITE side and, in
-//! soak/enforce modes, the allowlist plumbing.
+//! `NetworkFileOpen` events: read `/proc/$pid/exe` to fill the creator's
+//! full exe path, then write the augmented `OriginRecord` to the
+//! `security.bpf.linprov.origin` xattr.
+//!
+//! `Execve` events (only emitted when the file was marked): log; in
+//! enforce mode the LSM verdict in `event.status` tells us whether the
+//! exec was blocked; in soak mode we emit one allowlist rule per
+//! configured dimension.
 
-use std::{
-    collections::HashSet,
-    fs::File,
-    path::PathBuf,
-    sync::Mutex,
-};
+use std::{fs, path::PathBuf};
 
 use linprov_common::{
-    Event, OriginRecord, EVENT_KIND_EXECVE, EVENT_KIND_NETWORK_FILE_OPEN, PATH_LEN, XATTR_NAME,
+    Event, OriginRecord, COMM_LEN, CREATOR_PATH_LEN, EVENT_KIND_EXECVE,
+    EVENT_KIND_NETWORK_FILE_OPEN, ORIGIN_VERSION, PATH_LEN, XATTR_NAME,
 };
 use log::{debug, info, warn};
 
-use crate::{append_allowlist, ModeArg};
+use crate::{
+    allowlist::{OriginContext, Soak},
+    ModeArg,
+};
 
 pub struct Config {
     pub mode: ModeArg,
-    /// Paths we've already seen this session (also reflects what was loaded
-    /// from the allowlist file at startup). Used to dedupe soak-mode writes.
-    pub seen: Mutex<HashSet<String>>,
-    /// Append handle for the allowlist file, only Some in soak mode.
-    pub allowlist_writer: Option<Mutex<File>>,
+    pub soak: Option<Soak>,
 }
 
 pub fn handle_event(cfg: &Config, raw: &[u8]) {
@@ -62,23 +62,48 @@ fn on_file_marked(event: &Event) {
         return;
     }
 
-    // Mirror the eBPF record bytes verbatim. The eBPF side already serialized
-    // the OriginRecord; we just write it as the xattr value.
-    let value = bytemuck::bytes_of(&event.origin).to_vec();
+    // Augment the OriginRecord with the creator's full exe path. /proc/$pid/exe
+    // is a symlink to the binary the process was exec'd from. Best-effort:
+    // if the creator already exited we keep creator_path empty, and rules
+    // keyed on it just won't match.
+    let mut augmented: OriginRecord = event.origin;
+    augmented.version = ORIGIN_VERSION;
+    let creator_path = read_creator_exe(event.pid);
+    if let Some(p) = creator_path.as_deref() {
+        write_path_field(&mut augmented.creator_path, p);
+    }
+
+    let value = bytemuck::bytes_of(&augmented).to_vec();
 
     match xattr::set(&target, XATTR_NAME, &value) {
         Ok(()) => info!(
-            "marked {} (pid={} comm={} ts_boot_ns={})",
+            "marked {} (pid={} comm={} uid={} creator_path={} ts_boot_ns={})",
             target.display(),
             event.pid,
             comm,
+            augmented.creator_uid,
+            creator_path.as_deref().unwrap_or("<unknown>"),
             event.origin.ts_boot_ns
         ),
-        Err(e) => debug!(
-            "setxattr({}, {XATTR_NAME}) failed: {e}",
-            target.display()
-        ),
+        Err(e) => debug!("setxattr({}, {XATTR_NAME}) failed: {e}", target.display()),
     }
+}
+
+fn read_creator_exe(pid: u32) -> Option<String> {
+    let link = format!("/proc/{pid}/exe");
+    match fs::read_link(&link) {
+        Ok(p) => Some(p.to_string_lossy().into_owned()),
+        Err(e) => {
+            debug!("read_link({link}) failed: {e}");
+            None
+        }
+    }
+}
+
+fn write_path_field(buf: &mut [u8; CREATOR_PATH_LEN], s: &str) {
+    let bytes = s.as_bytes();
+    let n = bytes.len().min(CREATOR_PATH_LEN - 1);
+    buf[..n].copy_from_slice(&bytes[..n]);
 }
 
 fn is_pseudo_fs(target: &std::path::Path) -> bool {
@@ -91,15 +116,17 @@ fn is_pseudo_fs(target: &std::path::Path) -> bool {
 
 fn on_execve_marked(cfg: &Config, event: &Event) {
     let path = c_str_to_string(&event.filename);
-    let comm = comm_to_string(&event.comm);
+    let exec_comm = comm_to_string(&event.comm);
+    let creator_comm = comm_to_string(&event.origin.comm);
+    let creator_path = c_str_to_string_full(&event.origin.creator_path);
 
     if event.status != 0 {
         warn!(
             "BLOCKED-EXEC path={} pid={} comm={} origin={} (LSM verdict {})",
             path,
             event.pid,
-            comm,
-            format_origin(&event.origin),
+            exec_comm,
+            format_origin(&event.origin, &creator_comm, &creator_path),
             event.status,
         );
         return;
@@ -109,42 +136,70 @@ fn on_execve_marked(cfg: &Config, event: &Event) {
         "PROVENANCE-EXEC path={} pid={} comm={} origin={}",
         path,
         event.pid,
-        comm,
-        format_origin(&event.origin),
+        exec_comm,
+        format_origin(&event.origin, &creator_comm, &creator_path),
     );
 
     if cfg.mode == ModeArg::Soak {
-        soak_record(cfg, &path);
+        if let Some(soak) = cfg.soak.as_ref() {
+            let exec_uid = get_uid_for_pid(event.pid).unwrap_or(0);
+            let ctx = OriginContext {
+                creator_path: &creator_path,
+                creator_comm: &creator_comm,
+                creator_uid: event.origin.creator_uid,
+                execution_uid: exec_uid,
+            };
+            match soak.record(&path, &ctx) {
+                Ok(written) => {
+                    for line in &written {
+                        info!("soak: added `{line}`");
+                    }
+                }
+                Err(e) => warn!("soak append failed: {e}"),
+            }
+        }
     }
 }
 
-fn soak_record(cfg: &Config, path: &str) {
-    let mut seen = cfg.seen.lock().expect("seen mutex poisoned");
-    if !seen.insert(path.to_string()) {
-        return;
+fn get_uid_for_pid(pid: u32) -> Option<u32> {
+    let s = fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    for line in s.lines() {
+        if let Some(rest) = line.strip_prefix("Uid:") {
+            // Uid: <real> <effective> <saved> <fs>
+            let real = rest.split_whitespace().next()?;
+            return real.parse().ok();
+        }
     }
-    let Some(writer) = cfg.allowlist_writer.as_ref() else { return };
-    if let Err(e) = append_allowlist(writer, path) {
-        warn!("failed to append `{path}` to allowlist: {e}");
-    } else {
-        info!("soak: added `{path}` to allowlist");
-    }
+    None
 }
 
-fn format_origin(o: &OriginRecord) -> String {
-    let comm = comm_to_string(&o.comm);
+fn format_origin(o: &OriginRecord, creator_comm: &str, creator_path: &str) -> String {
     format!(
-        "{{v:{},ts_boot_ns:{},pid:{},comm:{}}}",
-        o.version, o.ts_boot_ns, o.pid, comm
+        "{{v:{},ts_boot_ns:{},pid:{},uid:{},comm:{},path:{}}}",
+        o.version,
+        o.ts_boot_ns,
+        o.pid,
+        o.creator_uid,
+        creator_comm,
+        if creator_path.is_empty() {
+            "<unknown>"
+        } else {
+            creator_path
+        }
     )
 }
 
-fn comm_to_string(comm: &[u8; linprov_common::COMM_LEN]) -> String {
+fn comm_to_string(comm: &[u8; COMM_LEN]) -> String {
     let end = comm.iter().position(|&b| b == 0).unwrap_or(comm.len());
     String::from_utf8_lossy(&comm[..end]).into_owned()
 }
 
 fn c_str_to_string(buf: &[u8; PATH_LEN]) -> String {
+    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
+    String::from_utf8_lossy(&buf[..end]).into_owned()
+}
+
+fn c_str_to_string_full(buf: &[u8; CREATOR_PATH_LEN]) -> String {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).into_owned()
 }

@@ -37,14 +37,16 @@ use aya_ebpf::{
     cty::{c_char, c_void},
     helpers::{
         bpf_dynptr_from_mem, bpf_get_current_comm, bpf_get_current_pid_tgid,
-        bpf_ktime_get_boot_ns,
+        bpf_get_current_uid_gid, bpf_ktime_get_boot_ns,
     },
     macros::{btf_map, lsm, map, tracepoint},
     maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
     programs::{LsmContext, TracePointContext},
 };
 use linprov_common::{
-    Event, OriginRecord, EVENT_KIND_EXECVE, EVENT_KIND_NETWORK_FILE_OPEN, MODE_ENFORCE, PATH_LEN,
+    Event, OriginRecord, COMM_LEN, CREATOR_PATH_LEN, EVENT_KIND_EXECVE,
+    EVENT_KIND_NETWORK_FILE_OPEN, FNV_OFFSET, FNV_PRIME, FOLDER_HASH_SCAN_LEN, MODE_ENFORCE,
+    ORIGIN_VERSION, PATH_LEN,
 };
 
 // Kernel kfunc. Resolved at load time by the patched aya: the unresolved
@@ -140,26 +142,59 @@ static INODE_MARKS: InodeStorage<OriginRecord> = InodeStorage::new();
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(1 << 20, 0);
 
-/// Per-CPU scratch buffer for the OriginRecord we pass to / receive from the
-/// xattr kfuncs. The verifier rejects stack memory as `bpf_dynptr_from_mem`'s
-/// data arg — it requires a map value or ringbuf reservation. Per-CPU keeps
-/// it concurrency-safe: BPF runtime guarantees no recursive invocation of
-/// the same program on a single CPU, so even with sleepable kfunc calls in
-/// the middle, this slot belongs to us until we return.
+/// Per-CPU scratch buffers for the OriginRecord. Slot 0 is owned by
+/// `file_open` (the producing program); slot 1 by `bprm_check_security`.
+/// Two slots because both hooks can be running on the same CPU during a
+/// sleepable kfunc yield — separate slots avoid corruption.
+///
+/// Map value-ptrs are required by `bpf_dynptr_from_mem` (it rejects stack
+/// memory), and the kernel guarantees no recursive invocation of the same
+/// program on a single CPU, so within one program the slot is stable
+/// across sleepable calls.
 #[map]
-static SCRATCH: PerCpuArray<OriginRecord> = PerCpuArray::with_max_entries(1, 0);
+static SCRATCH: PerCpuArray<OriginRecord> = PerCpuArray::with_max_entries(2, 0);
+
+const SCRATCH_FILE_OPEN: u32 = 0;
+const SCRATCH_BPRM: u32 = 1;
+
 
 /// Runtime mode set by userspace before attach. Index 0 holds a value from
 /// the `MODE_*` constants in `linprov_common`.
 #[map]
 static CONFIG: Array<u32> = Array::with_max_entries(1, 0);
 
-/// Allowlist of absolute paths (PATH_LEN-byte keys, NUL-padded) that
-/// `bprm_check_security` will permit when running in `MODE_ENFORCE`. Paths
-/// not present are blocked with -EPERM. Populated by userspace at startup
-/// and incrementally extended in soak mode.
+// ------ Allowlist maps. Each rule type lives in its own map; a marked exec
+// is permitted if ANY map has a hit for the appropriate record field.
+// Populated by userspace at startup; incrementally extended in soak mode.
+
 #[map]
-static ALLOWLIST: HashMap<[u8; PATH_LEN], u8> = HashMap::with_max_entries(4096, 0);
+static ALLOW_TARGET_FILENAMES: HashMap<[u8; PATH_LEN], u8> = HashMap::with_max_entries(4096, 0);
+
+/// Parent-directory prefixes, matched at every `/`-terminated prefix of
+/// the executed path. The key is an FNV-1a 64-bit hash of the rule
+/// string (e.g. `"/opt/installed/"`) — using a hash sidesteps the
+/// verifier-instruction blowup we get from byte-keyed maps inside a
+/// bounded scan loop. Userspace seeds with the same hash function.
+///
+/// LPM trie would be the natural shape here, but the kernel verifier
+/// disallows LPM tries in sleepable programs ("Sleepable programs can
+/// only use array, hash, ringbuf and local storage maps") and we need
+/// sleepable for `bpf_get_file_xattr`.
+#[map]
+static ALLOW_TARGET_FOLDERS: HashMap<u64, u8> = HashMap::with_max_entries(1024, 0);
+
+#[map]
+static ALLOW_CREATOR_PROCESSES: HashMap<[u8; CREATOR_PATH_LEN], u8> =
+    HashMap::with_max_entries(4096, 0);
+
+#[map]
+static ALLOW_CREATOR_COMMS: HashMap<[u8; COMM_LEN], u8> = HashMap::with_max_entries(1024, 0);
+
+#[map]
+static ALLOW_CREATOR_UIDS: HashMap<u32, u8> = HashMap::with_max_entries(1024, 0);
+
+#[map]
+static ALLOW_EXECUTION_UIDS: HashMap<u32, u8> = HashMap::with_max_entries(1024, 0);
 
 #[inline(always)]
 fn current_pid() -> u32 {
@@ -187,7 +222,8 @@ pub fn socket_post_create(ctx: LsmContext) -> i32 {
 ///
 /// Writes the OriginRecord into INODE_MARKS for the in-kernel fast path,
 /// and emits a ringbuf event so userspace can persist the same record as
-/// an xattr (durability layer).
+/// an xattr (durability layer) — including the creator's full exe path,
+/// which BPF can't easily resolve here.
 #[lsm(hook = "file_open", sleepable)]
 pub fn file_open(ctx: LsmContext) -> i32 {
     let pid = current_pid();
@@ -205,24 +241,34 @@ pub fn file_open(ctx: LsmContext) -> i32 {
         return 0;
     }
 
-    let mut rec = OriginRecord {
-        version: 1,
-        pid,
-        ts_boot_ns: unsafe { bpf_ktime_get_boot_ns() },
-        comm: current_comm(),
+    let rec_ptr = match SCRATCH.get_ptr_mut(SCRATCH_FILE_OPEN) {
+        Some(p) => p,
+        None => return 0,
     };
+    unsafe {
+        // Zero everything first so creator_path (filled by userspace later)
+        // starts clean — bprm_check_security uses `creator_path[0] == 0` as
+        // the "not yet augmented" signal.
+        core::ptr::write_bytes(rec_ptr as *mut u8, 0, core::mem::size_of::<OriginRecord>());
+        (*rec_ptr).version = ORIGIN_VERSION;
+        (*rec_ptr).pid = pid;
+        (*rec_ptr).ts_boot_ns = bpf_ktime_get_boot_ns();
+        (*rec_ptr).comm = current_comm();
+        (*rec_ptr).creator_uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
+        // creator_path stays all-zero. Userspace reads /proc/$pid/exe and
+        // writes the augmented record into the xattr.
+    }
 
     // In-kernel mark: write the OriginRecord into inode storage right now.
     // bprm_check_security can then enforce on this inode without waiting on
-    // userspace to land the xattr. Best-effort; if storage allocation fails
-    // we still emit the ringbuf event and fall through to the xattr path.
+    // userspace to land the xattr.
     let inode_ptr = unsafe { (*file_ptr).f_inode };
     if !inode_ptr.is_null() {
-        let _ = unsafe { INODE_MARKS.get_or_insert_ptr(inode_ptr, &mut rec as *mut _) };
+        let _ = unsafe { INODE_MARKS.get_or_insert_ptr(inode_ptr, rec_ptr) };
     }
 
     let path_ptr = unsafe { &(*file_ptr).f_path } as *const KernelPath as *mut bpf_path;
-    emit_event(EVENT_KIND_NETWORK_FILE_OPEN, path_ptr, pid, &rec, 0);
+    emit_event(EVENT_KIND_NETWORK_FILE_OPEN, path_ptr, pid, rec_ptr, 0);
     0
 }
 
@@ -248,7 +294,7 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
         return 0;
     }
 
-    let buf = match SCRATCH.get_ptr_mut(0) {
+    let buf = match SCRATCH.get_ptr_mut(SCRATCH_BPRM) {
         Some(p) => p,
         None => return 0,
     };
@@ -256,29 +302,29 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
         core::ptr::write_bytes(buf as *mut u8, 0, core::mem::size_of::<OriginRecord>());
     }
 
-    // Two mark sources, checked in order:
+    // Two mark sources:
     //
-    //   1. INODE_MARKS — populated synchronously by file_open in the same
-    //      boot. Fast (one map lookup) and race-free for freshly-marked
-    //      files: the userspace xattr round-trip hasn't necessarily landed
-    //      yet by the time the exec hook fires.
+    //   1. INODE_MARKS — populated synchronously by file_open. Fast and
+    //      race-free for same-boot freshly-marked files. May hold a partial
+    //      record (creator_path empty) if userspace hasn't yet read
+    //      /proc/$pid/exe; we fall through to the xattr in that case to
+    //      try for a more complete record.
     //   2. security.bpf.linprov.origin xattr — durable across reboots and
-    //      inode eviction. Costlier (dynptr + kfunc into the FS layer) but
-    //      the only source that survives if the inode got dropped from
-    //      cache or the file was carried over from a previous boot.
-    //
-    // Either source produces an OriginRecord; the rest of the handler doesn't
-    // care which.
+    //      inode eviction. Always written with the augmented record
+    //      (creator_path filled) by userspace.
     let inode_ptr = unsafe { (*file_ptr).f_inode };
-    let mut marked = false;
+    let mut have_storage = false;
     if !inode_ptr.is_null() {
         if let Some(stored) = unsafe { INODE_MARKS.get_ptr(inode_ptr) } {
             unsafe { core::ptr::copy_nonoverlapping(stored, buf, 1) };
-            marked = true;
+            have_storage = true;
         }
     }
 
-    if !marked {
+    // Try xattr if there's no storage record, or storage was partial.
+    let need_xattr = !have_storage || unsafe { (*buf).creator_path[0] == 0 };
+    let mut have_xattr = false;
+    if need_xattr {
         let mut dynptr = MaybeUninit::<bpf_dynptr>::uninit();
         let r = unsafe {
             bpf_dynptr_from_mem(
@@ -288,28 +334,37 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
                 dynptr.as_mut_ptr(),
             )
         };
-        if r != 0 {
-            return 0;
-        }
-
-        let get_ret = unsafe {
-            call_get_file_xattr(
-                file_ptr as *mut c_void,
-                XATTR_NAME_C.as_ptr() as *const c_char,
-                dynptr.as_mut_ptr(),
-            )
-        };
-        if get_ret < 0 {
-            // Unmarked from both sources — every exec hits this path; no
-            // event, no enforcement.
-            return 0;
+        if r == 0 {
+            let get_ret = unsafe {
+                call_get_file_xattr(
+                    file_ptr as *mut c_void,
+                    XATTR_NAME_C.as_ptr() as *const c_char,
+                    dynptr.as_mut_ptr(),
+                )
+            };
+            have_xattr = get_ret >= 0;
         }
     }
 
-    // Marked. Resolve the path into a freshly-reserved ringbuf entry, then
-    // use that buffer as the allowlist key. The same memory carries the
-    // event to userspace once we submit.
-    let rec = unsafe { *buf };
+    // If xattr was missing and storage was empty, the file isn't marked.
+    // If xattr was missing but storage gave us a partial record, the
+    // `bpf_get_file_xattr` failure leaves buf untouched (kfunc only writes
+    // on success), so we still have the storage copy.
+    if !have_xattr && !have_storage {
+        return 0;
+    }
+
+    // Schema version gate. We deliberately ignore v1 records — old daemons
+    // wrote a smaller layout; without the gate we'd interpret comm bytes
+    // as creator_uid, etc.
+    if unsafe { (*buf).version } != ORIGIN_VERSION {
+        return 0;
+    }
+
+    // Resolve the path into a freshly-reserved ringbuf entry. We avoid any
+    // local-by-value copy of the OriginRecord — at 296 bytes it blows the
+    // BPF stack — by always going via map pointers (`buf`) or the ringbuf
+    // entry pointer (`p`).
     let path_ptr = unsafe { &(*file_ptr).f_path } as *const KernelPath as *mut bpf_path;
     let mut entry = match EVENTS.reserve::<Event>(0) {
         Some(e) => e,
@@ -322,7 +377,8 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
         (*p).pid = current_pid();
         (*p).tgid = bpf_get_current_pid_tgid() as u32;
         (*p).comm = current_comm();
-        (*p).origin = rec;
+        // map → ringbuf copy, no stack temporary
+        core::ptr::copy_nonoverlapping(buf, &mut (*p).origin as *mut OriginRecord, 1);
         let _ = bpf_d_path(
             path_ptr,
             (*p).filename.as_mut_ptr() as *mut c_char,
@@ -331,13 +387,88 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     }
 
     let mode = CONFIG.get(0).copied().unwrap_or(0);
-    let on_list = unsafe { ALLOWLIST.get(&(*p).filename) }.is_some();
-    let decision: i32 = if mode == MODE_ENFORCE && !on_list { -1 } else { 0 };
+    let permit = if mode == MODE_ENFORCE {
+        unsafe { check_allowlist(&(*p).filename, &(*p).origin) }
+    } else {
+        true
+    };
+    let decision: i32 = if !permit { -1 } else { 0 };
     unsafe {
         (*p).status = decision;
     }
     entry.submit(0);
     decision
+}
+
+/// Returns true if any allowlist rule matches the marked exec.
+///
+/// Each dimension is an independent map; matching is OR-ed across them.
+/// Short-circuits on first hit to keep the verifier complexity bounded.
+#[inline(always)]
+unsafe fn check_allowlist(filename: &[u8; PATH_LEN], origin: &OriginRecord) -> bool {
+    if unsafe { ALLOW_TARGET_FILENAMES.get(filename) }.is_some() {
+        return true;
+    }
+
+    // target_folder: ancestor walk. For each `/`-separated prefix of the
+    // executed path (deepest first), do an exact-match hash lookup with
+    // the prefix-plus-trailing-`/` as the key.
+    if folder_walk_match(filename) {
+        return true;
+    }
+
+    if origin.creator_path[0] != 0
+        && unsafe { ALLOW_CREATOR_PROCESSES.get(&origin.creator_path) }.is_some()
+    {
+        return true;
+    }
+
+    if origin.comm[0] != 0 && unsafe { ALLOW_CREATOR_COMMS.get(&origin.comm) }.is_some() {
+        return true;
+    }
+
+    if unsafe { ALLOW_CREATOR_UIDS.get(&origin.creator_uid) }.is_some() {
+        return true;
+    }
+
+    let exec_uid = (unsafe { bpf_get_current_uid_gid() } & 0xFFFF_FFFF) as u32;
+    if unsafe { ALLOW_EXECUTION_UIDS.get(&exec_uid) }.is_some() {
+        return true;
+    }
+
+    false
+}
+
+/// Single-pass FNV-1a hash walk over the executed path. We hash byte
+/// by byte; every time we cross a `/`, the running hash is exactly the
+/// hash of one ancestor prefix (e.g. after consuming `"/opt/"`, the
+/// hash matches the FNV-1a of `"/opt/"`). Query the folder map at each
+/// such point and short-circuit on hit. No buffer copies, no nested
+/// scan loops — verifier-cheap.
+#[inline(always)]
+fn folder_walk_match(filename: &[u8; PATH_LEN]) -> bool {
+    let mut hash: u64 = FNV_OFFSET;
+    let mut matched = false;
+    let mut hit_terminator = false;
+    for i in 0..FOLDER_HASH_SCAN_LEN {
+        let b = filename[i];
+        if b == 0 {
+            hit_terminator = true;
+            break;
+        }
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+        if b == b'/' {
+            if unsafe { ALLOW_TARGET_FOLDERS.get(&hash) }.is_some() {
+                matched = true;
+                break;
+            }
+        }
+    }
+    // If we didn't hit a NUL within the scan window, the path is longer
+    // than any folder rule could be — bail.
+    let _ = hit_terminator;
+    matched
 }
 
 /// Reserve an `Event` on the ring buffer and have bpf_d_path() fill in the
@@ -348,7 +479,7 @@ fn emit_event(
     kind: u32,
     path_ptr: *mut bpf_path,
     pid: u32,
-    origin: &OriginRecord,
+    origin: *const OriginRecord,
     status: i32,
 ) {
     let mut entry = match EVENTS.reserve::<Event>(0) {

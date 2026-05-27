@@ -2,15 +2,12 @@
 //!
 //! Loads the eBPF object (LSM programs + one cleanup tracepoint), attaches
 //! everything, consumes the provenance event ring buffer, and (depending on
-//! mode) maintains an allowlist of marked binaries permitted to execute.
+//! mode) maintains a multi-dimensional allowlist of marked binaries
+//! permitted to execute.
 
 use std::{
-    collections::HashSet,
-    fs::{File, OpenOptions},
-    io::{BufRead, BufReader, Write},
     os::fd::AsRawFd,
-    path::{Path, PathBuf},
-    sync::Mutex,
+    path::PathBuf,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -21,11 +18,16 @@ use aya::{
     Btf, Ebpf,
 };
 use clap::{Parser, ValueEnum};
-use linprov_common::{MODE_ENFORCE, MODE_OBSERVE, MODE_SOAK, PATH_LEN};
+use linprov_common::{
+    folder_hash, COMM_LEN, CREATOR_PATH_LEN, MODE_ENFORCE, MODE_OBSERVE, MODE_SOAK, PATH_LEN,
+};
 use log::{info, warn};
 use tokio::{io::unix::AsyncFd, signal};
 
+mod allowlist;
 mod handler;
+
+use allowlist::{comm_key, creator_path_key, path_key, Dim, Rules, Soak};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -37,10 +39,19 @@ struct Args {
     #[arg(long, value_enum, default_value_t = Mode::Observe)]
     mode: Mode,
 
-    /// Allowlist file: one absolute path per line, `#` for comments. Required
-    /// for soak and enforce modes; ignored in observe.
+    /// Allowlist file. New format: one rule per line, either
+    /// `<dim>=<value>` for any of {target_filename, target_folder,
+    /// creator_process, creator_comm, creator_uid, execution_uid}, or a
+    /// bare absolute path (interpreted as `target_filename`). Required
+    /// in soak and enforce modes.
     #[arg(long)]
     allowlist: Option<PathBuf>,
+
+    /// Dimensions to record during soak. Comma-separated.
+    /// Default: `creator_process` (recommended starting point — one rule
+    /// per distinct creator binary like `creator_process=/usr/bin/curl`).
+    #[arg(long, value_delimiter = ',', default_value = "creator_process")]
+    soak: Vec<Dim>,
 
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info")]
@@ -51,11 +62,11 @@ struct Args {
 enum Mode {
     /// Log only; nothing enforced or recorded persistently.
     Observe,
-    /// Log and append every PROVENANCE-EXEC path to the allowlist file.
-    /// Lets you generate the allowlist by running the system normally.
+    /// Log and append one rule per `--soak` dimension to the allowlist
+    /// file for each PROVENANCE-EXEC.
     Soak,
-    /// Block execve of marked files not on the allowlist (-EPERM from
-    /// security_bprm_check).
+    /// Block execve of marked files whose origin doesn't match any
+    /// allowlist rule. `-EPERM` from `security_bprm_check`.
     Enforce,
 }
 
@@ -97,24 +108,13 @@ async fn main() -> Result<()> {
     attach_lsm(&mut bpf, &btf, "bprm_check_security")?;
     attach_tracepoint(&mut bpf, "sched_process_exit", "sched", "sched_process_exit")?;
 
-    let allowlist = if let Some(path) = &args.allowlist {
-        read_allowlist_file(path)?
+    let rules = if let Some(path) = &args.allowlist {
+        Rules::load(path)?
     } else {
-        HashSet::new()
+        Rules::default()
     };
 
-    {
-        let mut allow_map: AyaHashMap<_, [u8; PATH_LEN], u8> =
-            AyaHashMap::try_from(bpf.map_mut("ALLOWLIST").context("ALLOWLIST map missing")?)
-                .context("opening ALLOWLIST map")?;
-        for path in &allowlist {
-            let key = path_key(path);
-            allow_map
-                .insert(&key, 1u8, 0)
-                .with_context(|| format!("seeding allowlist with `{path}`"))?;
-        }
-        info!("loaded {} allowlist entries", allowlist.len());
-    }
+    seed_allowlist_maps(&mut bpf, &rules)?;
 
     {
         let mut config_map: Array<_, u32> = Array::try_from(
@@ -133,27 +133,29 @@ async fn main() -> Result<()> {
     let mut poll =
         AsyncFd::with_interest(RingBufFd(ring_buf), tokio::io::Interest::READABLE)?;
 
-    let allowlist_writer = match args.mode {
+    let soak = match args.mode {
         Mode::Soak => {
-            let f = OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(args.allowlist.as_ref().unwrap())
-                .with_context(|| {
-                    format!("opening allowlist `{}` for soak append", args.allowlist.as_ref().unwrap().display())
-                })?;
-            Some(Mutex::new(f))
+            let path = args.allowlist.as_ref().unwrap();
+            Some(Soak::open(path, args.soak.clone(), &rules)?)
         }
         _ => None,
     };
 
     let cfg = handler::Config {
         mode: args.mode,
-        seen: Mutex::new(allowlist),
-        allowlist_writer,
+        soak,
     };
 
-    info!("linprov running ({:?}). press Ctrl-C to exit.", args.mode);
+    info!(
+        "linprov running ({:?}). press Ctrl-C to exit.{}",
+        args.mode,
+        if args.mode == Mode::Soak {
+            let names: Vec<_> = args.soak.iter().map(|d| d.as_key()).collect();
+            format!(" soak dimensions: {}", names.join(","))
+        } else {
+            String::new()
+        }
+    );
 
     loop {
         tokio::select! {
@@ -178,60 +180,92 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// Encode a path the way the eBPF program leaves it in the filename buffer
-/// after `bpf_d_path`. The kernel helper:
-///   1. Calls `d_path` which writes "<path>\0" right-aligned into the buffer.
-///   2. memmoves the resulting string (path + NUL, length `n+1`) to the
-///      front of the buffer, leaving the original right-aligned copy intact.
-/// So the buffer ends up with the path at byte 0..=n (NUL terminator at n)
-/// *and* a second copy of path-plus-NUL right-aligned at the tail. We have
-/// to mirror that exactly or the hash-map key won't match.
-pub(crate) fn path_key(p: &str) -> [u8; PATH_LEN] {
-    let mut key = [0u8; PATH_LEN];
-    let bytes = p.as_bytes();
-    let n = bytes.len().min(PATH_LEN - 1); // leave room for the NUL
-    if n == 0 {
-        return key;
-    }
-    key[..n].copy_from_slice(&bytes[..n]);
-    // `n+1` bytes of "<path>\0" right-aligned at the tail. The NUL byte is
-    // already zero from the array init; we just need the path bytes.
-    let tail_path_start = PATH_LEN - 1 - n;
-    key[tail_path_start..tail_path_start + n].copy_from_slice(&bytes[..n]);
-    key
-}
-
-fn read_allowlist_file(path: &Path) -> Result<HashSet<String>> {
-    let mut set = HashSet::new();
-    let f = match File::open(path) {
-        Ok(f) => f,
-        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
-            info!("allowlist `{}` doesn't exist yet — starting empty", path.display());
-            return Ok(set);
+fn seed_allowlist_maps(bpf: &mut Ebpf, rules: &Rules) -> Result<()> {
+    {
+        let mut map: AyaHashMap<_, [u8; PATH_LEN], u8> = AyaHashMap::try_from(
+            bpf.map_mut("ALLOW_TARGET_FILENAMES")
+                .context("ALLOW_TARGET_FILENAMES map missing")?,
+        )
+        .context("opening ALLOW_TARGET_FILENAMES")?;
+        for v in &rules.target_filenames {
+            map.insert(path_key(v), 1u8, 0)
+                .with_context(|| format!("seeding target_filename `{v}`"))?;
         }
-        Err(e) => return Err(anyhow!("opening allowlist `{}`: {e}", path.display())),
-    };
-    for (i, line) in BufReader::new(f).lines().enumerate() {
-        let line = line.with_context(|| format!("reading line {} of allowlist", i + 1))?;
-        let trimmed = line.split('#').next().unwrap_or("").trim();
-        if trimmed.is_empty() {
-            continue;
-        }
-        set.insert(trimmed.to_string());
     }
-    Ok(set)
-}
-
-pub(crate) fn append_allowlist(writer: &Mutex<File>, path: &str) -> std::io::Result<()> {
-    let mut f = writer.lock().expect("allowlist file mutex poisoned");
-    writeln!(f, "{path}")?;
-    f.sync_data()?;
+    {
+        let mut map: AyaHashMap<_, u64, u8> = AyaHashMap::try_from(
+            bpf.map_mut("ALLOW_TARGET_FOLDERS")
+                .context("ALLOW_TARGET_FOLDERS map missing")?,
+        )
+        .context("opening ALLOW_TARGET_FOLDERS")?;
+        for v in &rules.target_folders {
+            // FNV-1a hash of the rule, computed identically on both
+            // sides. The BPF folder walk does the same hash as it scans
+            // the executed path; equal prefix → equal hash → map hit.
+            let h = folder_hash(v);
+            map.insert(&h, 1u8, 0)
+                .with_context(|| format!("seeding target_folder `{v}` (hash={h:#x})"))?;
+        }
+    }
+    {
+        let mut map: AyaHashMap<_, [u8; CREATOR_PATH_LEN], u8> = AyaHashMap::try_from(
+            bpf.map_mut("ALLOW_CREATOR_PROCESSES")
+                .context("ALLOW_CREATOR_PROCESSES map missing")?,
+        )
+        .context("opening ALLOW_CREATOR_PROCESSES")?;
+        for v in &rules.creator_processes {
+            map.insert(creator_path_key(v), 1u8, 0)
+                .with_context(|| format!("seeding creator_process `{v}`"))?;
+        }
+    }
+    {
+        let mut map: AyaHashMap<_, [u8; COMM_LEN], u8> = AyaHashMap::try_from(
+            bpf.map_mut("ALLOW_CREATOR_COMMS")
+                .context("ALLOW_CREATOR_COMMS map missing")?,
+        )
+        .context("opening ALLOW_CREATOR_COMMS")?;
+        for v in &rules.creator_comms {
+            map.insert(comm_key(v), 1u8, 0)
+                .with_context(|| format!("seeding creator_comm `{v}`"))?;
+        }
+    }
+    {
+        let mut map: AyaHashMap<_, u32, u8> = AyaHashMap::try_from(
+            bpf.map_mut("ALLOW_CREATOR_UIDS")
+                .context("ALLOW_CREATOR_UIDS map missing")?,
+        )
+        .context("opening ALLOW_CREATOR_UIDS")?;
+        for v in &rules.creator_uids {
+            map.insert(v, 1u8, 0)
+                .with_context(|| format!("seeding creator_uid `{v}`"))?;
+        }
+    }
+    {
+        let mut map: AyaHashMap<_, u32, u8> = AyaHashMap::try_from(
+            bpf.map_mut("ALLOW_EXECUTION_UIDS")
+                .context("ALLOW_EXECUTION_UIDS map missing")?,
+        )
+        .context("opening ALLOW_EXECUTION_UIDS")?;
+        for v in &rules.execution_uids {
+            map.insert(v, 1u8, 0)
+                .with_context(|| format!("seeding execution_uid `{v}`"))?;
+        }
+    }
+    info!(
+        "loaded {} allowlist rules (target_filename={} target_folder={} \
+         creator_process={} creator_comm={} creator_uid={} execution_uid={})",
+        rules.total_len(),
+        rules.target_filenames.len(),
+        rules.target_folders.len(),
+        rules.creator_processes.len(),
+        rules.creator_comms.len(),
+        rules.creator_uids.len(),
+        rules.execution_uids.len(),
+    );
     Ok(())
 }
 
-/// Newtype so we can implement `AsRawFd` for the `AsyncFd` wrapper. The Aya
-/// `RingBuf` already implements `AsRawFd`, but `AsyncFd::with_interest` wants
-/// ownership and we want to keep mut-access to the inner ring buffer.
+/// Newtype so we can implement `AsRawFd` for the `AsyncFd` wrapper.
 struct RingBufFd(RingBuf<aya::maps::MapData>);
 
 impl AsRawFd for RingBufFd {
