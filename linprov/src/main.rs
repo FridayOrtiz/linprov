@@ -27,11 +27,6 @@ struct Args {
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info")]
     log_level: String,
-
-    /// Don't actually set xattrs; just log what would be marked. Useful for
-    /// dry-running on hosts where the daemon hasn't been authorized yet.
-    #[arg(long)]
-    dry_run: bool,
 }
 
 const EBPF_OBJECT: &[u8] = include_bytes_aligned!(concat!(env!("OUT_DIR"), "/linprov-ebpf"));
@@ -62,14 +57,9 @@ async fn main() -> Result<()> {
     let mut poll =
         AsyncFd::with_interest(RingBufFd(ring_buf), tokio::io::Interest::READABLE)?;
 
-    let cfg = handler::Config {
-        dry_run: args.dry_run,
-    };
+    let cfg = handler::Config;
 
-    info!(
-        "linprov running (dry_run={}). press Ctrl-C to exit.",
-        args.dry_run
-    );
+    info!("linprov running. press Ctrl-C to exit.");
 
     loop {
         tokio::select! {
