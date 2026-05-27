@@ -62,10 +62,9 @@ Requires `bpf-linker` (`cargo install bpf-linker`). Depends on a
 relocation resolution; the dependency is resolved by git
 automatically — no local checkout required.
 
-Until [#53](https://github.com/FridayOrtiz/linprov/issues) is
-addressed, `cargo install linprov` doesn't work — the build.rs
-expects a sibling `linprov-ebpf` crate at the workspace path. For
-now install from a git checkout:
+`cargo install linprov` doesn't work yet — the build.rs expects a
+sibling `linprov-ebpf` crate at the workspace path, which isn't shipped
+in a crates.io tarball. For now, install from git:
 
 ```
 cargo install --git https://github.com/FridayOrtiz/linprov linprov
