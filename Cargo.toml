@@ -22,11 +22,13 @@ categories = ["os::linux-apis", "command-line-utilities"]
 rust-version = "1.85"
 
 [workspace.dependencies]
-# Aya fork — adds kfunc relocation resolution to aya-obj. Switch back to
-# a crates.io release once the change lands upstream.
-aya = { git = "https://github.com/FridayOrtiz/aya", branch = "main" }
-aya-build = { git = "https://github.com/FridayOrtiz/aya", branch = "main" }
-aya-log = { git = "https://github.com/FridayOrtiz/aya", branch = "main" }
+# Aya fork — adds kfunc relocation resolution, BPF_MAP_TYPE_INODE_STORAGE
+# support, and BPF func_info pruning. Renamed `aya-friday` so we can
+# publish to crates.io (upstream `aya` is owned by alessandrod). The
+# rename lives on the `linprov-fork-rename` branch in the fork; once
+# both fork-renamed crates are published, `cargo install linprov` will
+# work end-to-end and we can drop the `git` line entirely.
+aya = { git = "https://github.com/FridayOrtiz/aya", branch = "linprov-fork-rename", package = "aya-friday", version = "0.13.2" }
 
 anyhow = "1"
 bytemuck = { version = "1", features = ["derive"] }

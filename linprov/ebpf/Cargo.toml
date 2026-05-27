@@ -21,7 +21,7 @@ publish = false
 # what cargo uses once linprov is published to crates.io. Both must
 # stay in sync.
 linprov-common = { path = "../../linprov-common", version = "0.1.0" }
-aya-ebpf = { git = "https://github.com/FridayOrtiz/aya", branch = "main" }
+aya-ebpf = { git = "https://github.com/FridayOrtiz/aya", branch = "linprov-fork-rename", package = "aya-friday-ebpf", version = "0.1.2" }
 
 [[bin]]
 name = "linprov-ebpf"

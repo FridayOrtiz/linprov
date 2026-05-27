@@ -74,12 +74,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9b34d609dfbaf33d6889b2b7106d3ca345eacad44200913df5ba02bfd31d2ba9"
 
 [[package]]
-name = "aya"
+name = "aya-friday"
 version = "0.13.2"
-source = "git+https://github.com/FridayOrtiz/aya?branch=main#a3a446cc36330a1c7e3de7739babb3bf78537363"
+source = "git+https://github.com/FridayOrtiz/aya?branch=linprov-fork-rename#9d82e0b11f9874bde786c93ad940b200d0d144bb"
 dependencies = [
  "assert_matches",
- "aya-obj",
+ "aya-friday-obj",
  "bitflags",
  "hashbrown 0.17.1",
  "libc",
@@ -91,9 +91,9 @@ dependencies = [
 ]
 
 [[package]]
-name = "aya-obj"
+name = "aya-friday-obj"
 version = "0.2.2"
-source = "git+https://github.com/FridayOrtiz/aya?branch=main#a3a446cc36330a1c7e3de7739babb3bf78537363"
+source = "git+https://github.com/FridayOrtiz/aya?branch=linprov-fork-rename#9d82e0b11f9874bde786c93ad940b200d0d144bb"
 dependencies = [
  "bytes",
  "log",
@@ -360,7 +360,7 @@ name = "linprov"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "aya",
+ "aya-friday",
  "bytemuck",
  "clap",
  "env_logger",

@@ -62,13 +62,17 @@ Requires `bpf-linker` (`cargo install bpf-linker`). Depends on a
 relocation resolution; the dependency is resolved by git
 automatically — no local checkout required.
 
-`cargo install linprov` doesn't work yet — the build.rs expects a
-sibling `linprov-ebpf` crate at the workspace path, which isn't shipped
-in a crates.io tarball. For now, install from git:
+Install from a git checkout works today:
 
 ```
 cargo install --git https://github.com/FridayOrtiz/linprov linprov
 ```
+
+`cargo install linprov` (from crates.io) needs one more step:
+publishing the renamed aya fork. See `PUBLISHING.md` for the
+checklist; once that's done, plain `cargo install linprov` is
+self-contained (the linprov tarball ships the BPF source, the
+`rust-toolchain.toml`, and everything else build.rs needs).
 
 ## Tests
 
