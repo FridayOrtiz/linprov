@@ -44,9 +44,9 @@ use aya_ebpf::{
     programs::{LsmContext, TracePointContext},
 };
 use linprov_common::{
-    Event, OriginRecord, COMM_LEN, CREATOR_PATH_LEN, EVENT_KIND_EXECVE,
-    EVENT_KIND_NETWORK_FILE_OPEN, FNV_OFFSET, FNV_PRIME, FOLDER_HASH_SCAN_LEN, MODE_ENFORCE,
-    ORIGIN_VERSION, PATH_LEN,
+    dim, AllowRule, Event, OriginRecord, COMM_LEN, EVENT_KIND_EXECVE,
+    EVENT_KIND_NETWORK_FILE_OPEN, FNV_OFFSET, FNV_PRIME, MAX_FOLDER_HASHES, MAX_RULES,
+    MODE_ENFORCE, ORIGIN_VERSION, PATH_HASH_SCAN_LEN, PATH_LEN,
 };
 
 // Kernel kfunc. Resolved at load time by the patched aya: the unresolved
@@ -163,38 +163,17 @@ const SCRATCH_BPRM: u32 = 1;
 #[map]
 static CONFIG: Array<u32> = Array::with_max_entries(1, 0);
 
-// ------ Allowlist maps. Each rule type lives in its own map; a marked exec
-// is permitted if ANY map has a hit for the appropriate record field.
-// Populated by userspace at startup; incrementally extended in soak mode.
+// ------ Allowlist rules. One slot per rule; each rule is an AND of
+// (dim, value) conditions. Rules OR together (first fully-matching rule
+// permits). Populated by userspace at startup; incrementally extended
+// in soak mode.
 
 #[map]
-static ALLOW_TARGET_FILENAMES: HashMap<[u8; PATH_LEN], u8> = HashMap::with_max_entries(4096, 0);
+static ALLOW_RULES: Array<AllowRule> = Array::with_max_entries(MAX_RULES as u32, 0);
 
-/// Parent-directory prefixes, matched at every `/`-terminated prefix of
-/// the executed path. The key is an FNV-1a 64-bit hash of the rule
-/// string (e.g. `"/opt/installed/"`) — using a hash sidesteps the
-/// verifier-instruction blowup we get from byte-keyed maps inside a
-/// bounded scan loop. Userspace seeds with the same hash function.
-///
-/// LPM trie would be the natural shape here, but the kernel verifier
-/// disallows LPM tries in sleepable programs ("Sleepable programs can
-/// only use array, hash, ringbuf and local storage maps") and we need
-/// sleepable for `bpf_get_file_xattr`.
+/// Number of valid entries at the front of `ALLOW_RULES`. Index 0.
 #[map]
-static ALLOW_TARGET_FOLDERS: HashMap<u64, u8> = HashMap::with_max_entries(1024, 0);
-
-#[map]
-static ALLOW_CREATOR_PROCESSES: HashMap<[u8; CREATOR_PATH_LEN], u8> =
-    HashMap::with_max_entries(4096, 0);
-
-#[map]
-static ALLOW_CREATOR_COMMS: HashMap<[u8; COMM_LEN], u8> = HashMap::with_max_entries(1024, 0);
-
-#[map]
-static ALLOW_CREATOR_UIDS: HashMap<u32, u8> = HashMap::with_max_entries(1024, 0);
-
-#[map]
-static ALLOW_EXECUTION_UIDS: HashMap<u32, u8> = HashMap::with_max_entries(1024, 0);
+static ALLOW_RULE_COUNT: Array<u32> = Array::with_max_entries(1, 0);
 
 #[inline(always)]
 fn current_pid() -> u32 {
@@ -245,6 +224,7 @@ pub fn file_open(ctx: LsmContext) -> i32 {
         Some(p) => p,
         None => return 0,
     };
+    let path_ptr = unsafe { &(*file_ptr).f_path } as *const KernelPath as *mut bpf_path;
     unsafe {
         // Zero everything first so creator_path (filled by userspace later)
         // starts clean — bprm_check_security uses `creator_path[0] == 0` as
@@ -255,6 +235,14 @@ pub fn file_open(ctx: LsmContext) -> i32 {
         (*rec_ptr).ts_boot_ns = bpf_ktime_get_boot_ns();
         (*rec_ptr).comm = current_comm();
         (*rec_ptr).creator_uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
+        // landing_filename: where the file is being written right now.
+        // Distinct from the eventual exec-time path (the file may be
+        // renamed before execve); the record carries this through.
+        let _ = bpf_d_path(
+            path_ptr,
+            (*rec_ptr).landing_filename.as_mut_ptr() as *mut c_char,
+            PATH_LEN as u32,
+        );
         // creator_path stays all-zero. Userspace reads /proc/$pid/exe and
         // writes the augmented record into the xattr.
     }
@@ -267,7 +255,6 @@ pub fn file_open(ctx: LsmContext) -> i32 {
         let _ = unsafe { INODE_MARKS.get_or_insert_ptr(inode_ptr, rec_ptr) };
     }
 
-    let path_ptr = unsafe { &(*file_ptr).f_path } as *const KernelPath as *mut bpf_path;
     emit_event(EVENT_KIND_NETWORK_FILE_OPEN, path_ptr, pid, rec_ptr, 0);
     0
 }
@@ -400,76 +387,134 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     decision
 }
 
-/// Returns true if any allowlist rule matches the marked exec.
-///
-/// Each dimension is an independent map; matching is OR-ed across them.
-/// Short-circuits on first hit to keep the verifier complexity bounded.
 #[inline(always)]
-unsafe fn check_allowlist(filename: &[u8; PATH_LEN], origin: &OriginRecord) -> bool {
-    if unsafe { ALLOW_TARGET_FILENAMES.get(filename) }.is_some() {
-        return true;
+fn comm_eq(a: &[u8; COMM_LEN], b: &[u8; COMM_LEN]) -> bool {
+    let mut eq = true;
+    for i in 0..COMM_LEN {
+        if a[i] != b[i] {
+            eq = false;
+        }
     }
-
-    // target_folder: ancestor walk. For each `/`-separated prefix of the
-    // executed path (deepest first), do an exact-match hash lookup with
-    // the prefix-plus-trailing-`/` as the key.
-    if folder_walk_match(filename) {
-        return true;
-    }
-
-    if origin.creator_path[0] != 0
-        && unsafe { ALLOW_CREATOR_PROCESSES.get(&origin.creator_path) }.is_some()
-    {
-        return true;
-    }
-
-    if origin.comm[0] != 0 && unsafe { ALLOW_CREATOR_COMMS.get(&origin.comm) }.is_some() {
-        return true;
-    }
-
-    if unsafe { ALLOW_CREATOR_UIDS.get(&origin.creator_uid) }.is_some() {
-        return true;
-    }
-
-    let exec_uid = (unsafe { bpf_get_current_uid_gid() } & 0xFFFF_FFFF) as u32;
-    if unsafe { ALLOW_EXECUTION_UIDS.get(&exec_uid) }.is_some() {
-        return true;
-    }
-
-    false
+    eq
 }
 
-/// Single-pass FNV-1a hash walk over the executed path. We hash byte
-/// by byte; every time we cross a `/`, the running hash is exactly the
-/// hash of one ancestor prefix (e.g. after consuming `"/opt/"`, the
-/// hash matches the FNV-1a of `"/opt/"`). Query the folder map at each
-/// such point and short-circuit on hit. No buffer copies, no nested
-/// scan loops — verifier-cheap.
+/// FNV-1a-64 of a NUL-terminated path. Scans up to
+/// [`PATH_HASH_SCAN_LEN`] bytes.
 #[inline(always)]
-fn folder_walk_match(filename: &[u8; PATH_LEN]) -> bool {
+fn fnv_full(src: *const u8) -> u64 {
     let mut hash: u64 = FNV_OFFSET;
-    let mut matched = false;
-    let mut hit_terminator = false;
-    for i in 0..FOLDER_HASH_SCAN_LEN {
-        let b = filename[i];
+    for i in 0..PATH_HASH_SCAN_LEN {
+        let b = unsafe { *src.add(i) };
         if b == 0 {
-            hit_terminator = true;
             break;
         }
         hash ^= b as u64;
         hash = hash.wrapping_mul(FNV_PRIME);
-        if b == b'/' {
-            if unsafe { ALLOW_TARGET_FOLDERS.get(&hash) }.is_some() {
-                matched = true;
-                break;
-            }
+    }
+    hash
+}
+
+/// True if `needle` equals the FNV-1a hash of any `/`-terminated prefix
+/// of the NUL-terminated path at `src`. Walks the path once, checking
+/// at each separator; no folder-hash array materialization (which blows
+/// the verifier's per-instruction state budget).
+#[inline(always)]
+fn folder_match(src: *const u8, needle: u64) -> bool {
+    let mut hash: u64 = FNV_OFFSET;
+    let mut found = false;
+    for i in 0..PATH_HASH_SCAN_LEN {
+        let b = unsafe { *src.add(i) };
+        if b == 0 {
+            break;
+        }
+        hash ^= b as u64;
+        hash = hash.wrapping_mul(FNV_PRIME);
+        if b == b'/' && hash == needle {
+            found = true;
         }
     }
-    // If we didn't hit a NUL within the scan window, the path is longer
-    // than any folder rule could be — bail.
-    let _ = hit_terminator;
-    matched
+    found
 }
+
+/// Returns true if any allowlist rule's conditions all match. Rules OR
+/// together; within a rule, dim conditions AND.
+///
+/// Path-shaped dims (`*_filename`, `*_folder`) compute their hashes
+/// **per rule, on demand** rather than pre-computing into a stack array
+/// — pre-computation with conditional stores at `/` positions exploded
+/// the verifier's per-instruction state space. Re-walking per rule is
+/// O(MAX_RULES × PATH_HASH_SCAN_LEN), but with simpler control flow the
+/// verifier can prune state much more aggressively.
+#[inline(always)]
+unsafe fn check_allowlist(filename: &[u8; PATH_LEN], origin: &OriginRecord) -> bool {
+    let count = ALLOW_RULE_COUNT.get(0).copied().unwrap_or(0);
+    if count == 0 {
+        return false;
+    }
+    let exec_uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
+
+    let n = if count as usize > MAX_RULES { MAX_RULES as u32 } else { count };
+    for i in 0..MAX_RULES {
+        if (i as u32) >= n {
+            break;
+        }
+        let rule = match ALLOW_RULES.get(i as u32) {
+            Some(r) => r,
+            None => break,
+        };
+        let f = rule.flags;
+        if f == 0 {
+            continue;
+        }
+
+        // Cheapest dims first; bail out before the path walks if any of
+        // the scalar checks fail.
+        if (f & dim::CREATOR_UID) != 0 && rule.creator_uid != origin.creator_uid {
+            continue;
+        }
+        if (f & dim::EXECUTION_UID) != 0 && rule.execution_uid != exec_uid {
+            continue;
+        }
+        if (f & dim::CREATOR_COMM) != 0 && !comm_eq(&rule.creator_comm, &origin.comm) {
+            continue;
+        }
+        if (f & dim::CREATOR_PROCESS) != 0 {
+            if origin.creator_path[0] == 0
+                || fnv_full(origin.creator_path.as_ptr()) != rule.creator_process_hash
+            {
+                continue;
+            }
+        }
+        if (f & dim::TARGET_FILENAME) != 0
+            && fnv_full(filename.as_ptr()) != rule.target_filename_hash
+        {
+            continue;
+        }
+        if (f & dim::LANDING_FILENAME) != 0
+            && fnv_full(origin.landing_filename.as_ptr()) != rule.landing_filename_hash
+        {
+            continue;
+        }
+        if (f & dim::TARGET_FOLDER) != 0
+            && !folder_match(filename.as_ptr(), rule.target_folder_hash)
+        {
+            continue;
+        }
+        if (f & dim::LANDING_FOLDER) != 0
+            && !folder_match(origin.landing_filename.as_ptr(), rule.landing_folder_hash)
+        {
+            continue;
+        }
+        return true;
+    }
+    false
+}
+
+// MAX_FOLDER_HASHES is no longer used by BPF — the per-rule walk
+// doesn't need a precomputed array — but the constant stays in
+// linprov-common for the userspace check.
+#[allow(dead_code)]
+const _MAX_FOLDER_HASHES_REFERENCE: usize = MAX_FOLDER_HASHES;
 
 /// Reserve an `Event` on the ring buffer and have bpf_d_path() fill in the
 /// filename. Embeds the origin record so userspace doesn't have to retrieve

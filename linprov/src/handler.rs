@@ -17,10 +17,7 @@ use linprov_common::{
 };
 use log::{debug, info, warn};
 
-use crate::{
-    allowlist::{OriginContext, Soak},
-    ModeArg,
-};
+use crate::{allowlist::{OriginContext, Soak}, ModeArg};
 
 pub struct Config {
     pub mode: ModeArg,
@@ -115,15 +112,17 @@ fn is_pseudo_fs(target: &std::path::Path) -> bool {
 }
 
 fn on_execve_marked(cfg: &Config, event: &Event) {
-    let path = c_str_to_string(&event.filename);
+    let target_path = c_str_to_string(&event.filename);
+    let landing_path = c_str_to_string(&event.origin.landing_filename);
     let exec_comm = comm_to_string(&event.comm);
     let creator_comm = comm_to_string(&event.origin.comm);
     let creator_path = c_str_to_string_full(&event.origin.creator_path);
 
     if event.status != 0 {
         warn!(
-            "BLOCKED-EXEC path={} pid={} comm={} origin={} (LSM verdict {})",
-            path,
+            "BLOCKED-EXEC target={} landing={} pid={} comm={} origin={} (LSM verdict {})",
+            target_path,
+            landing_path,
             event.pid,
             exec_comm,
             format_origin(&event.origin, &creator_comm, &creator_path),
@@ -133,8 +132,9 @@ fn on_execve_marked(cfg: &Config, event: &Event) {
     }
 
     info!(
-        "PROVENANCE-EXEC path={} pid={} comm={} origin={}",
-        path,
+        "PROVENANCE-EXEC target={} landing={} pid={} comm={} origin={}",
+        target_path,
+        landing_path,
         event.pid,
         exec_comm,
         format_origin(&event.origin, &creator_comm, &creator_path),
@@ -144,17 +144,16 @@ fn on_execve_marked(cfg: &Config, event: &Event) {
         if let Some(soak) = cfg.soak.as_ref() {
             let exec_uid = get_uid_for_pid(event.pid).unwrap_or(0);
             let ctx = OriginContext {
+                target_filename: &target_path,
+                landing_filename: &landing_path,
                 creator_path: &creator_path,
                 creator_comm: &creator_comm,
                 creator_uid: event.origin.creator_uid,
                 execution_uid: exec_uid,
             };
-            match soak.record(&path, &ctx) {
-                Ok(written) => {
-                    for line in &written {
-                        info!("soak: added `{line}`");
-                    }
-                }
+            match soak.record(&ctx) {
+                Ok(Some(line)) => info!("soak: added `{line}`"),
+                Ok(None) => {}
                 Err(e) => warn!("soak append failed: {e}"),
             }
         }

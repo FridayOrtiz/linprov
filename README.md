@@ -122,28 +122,47 @@ The originating shell sees `Operation not permitted` and `$?` is 126.
 ## Allowlist format
 
 One rule per line. `#` starts a comment; blank lines are ignored. Each
-rule is either `<dim>=<value>` or a bare absolute path (interpreted as
-`target_filename` for back-compat).
+line is one rule whose `<dim>=<value>;<dim>=<value>` conditions **AND**
+together. Multiple lines **OR**: a marked execve is permitted if any
+single rule's conditions all match.
+
+```
+# uid 1000 downloading with curl is fine, anywhere
+creator_uid=1000;creator_comm=curl
+
+# uid 1000 may exec firefox-dropped binaries that ended up in ~/.local/bin
+execution_uid=1000;creator_comm=firefox;target_folder=/home/user/.local/bin
+```
 
 | dim | example | matches if … |
 |---|---|---|
-| `target_filename` | `/usr/bin/foo` | the marked file's path equals this |
-| `target_folder` | `/opt/installed/` | the marked file lives under this prefix (any depth) |
+| `target_filename` | `/usr/bin/foo` | the executed binary's path equals this |
+| `target_folder` | `/opt/installed/` | the executed binary lives under this prefix (any depth) |
+| `landing_filename` | `/tmp/foo` | the file's *download* path (where it was first written) equals this |
+| `landing_folder` | `/tmp/` | the file's *download* directory matches at any depth |
 | `creator_process` | `/usr/bin/curl` | the full `exe` path of the writer matches |
 | `creator_comm` | `curl` | the 16-byte `comm` of the writer matches |
 | `creator_uid` | `1000` | the writer's UID matches |
 | `execution_uid` | `0` | the UID running the `execve` matches |
 
-A marked execve is permitted if **any** rule matches.
+`target_*` reflects the file's location at execve time; `landing_*` is
+where it was first written. They diverge when the file is moved between
+download and execve — e.g. `curl -o /tmp/foo http://…; mv /tmp/foo
+~/.local/bin/foo; ~/.local/bin/foo` has `landing_filename=/tmp/foo` and
+`target_filename=~/.local/bin/foo`.
 
-`target_folder` rules must end in `/` and stay under ~96 bytes (the BPF
-folder walk hashes a bounded prefix of the path).
+Folder rules must end in `/` (userspace normalizes). All path-shaped
+values are bounded to 64 bytes by the BPF FNV walk; longer rules are
+rejected at parse time.
+
+Up to 32 rules per allowlist (BPF verifier budget — bump
+`MAX_RULES` and rebuild for more).
 
 `creator_process` is populated by userspace via `readlink /proc/$pid/exe`
 when handling the file-open event. If the creator process exits before
-userspace lands the augmented xattr, `creator_process` rules for that
-file won't match until something else re-marks the same path —
-`creator_comm` (always populated by BPF) is the fallback in that window.
+userspace lands the augmented xattr, rules requiring `creator_process`
+won't match for that file — use `creator_comm` (always populated by BPF)
+as the fallback dim.
 
 ## Inspecting the xattr by hand
 
@@ -152,15 +171,15 @@ getfattr -d -m '.*' /path/to/file
 # security.bpf.linprov.origin=0sAgAAAA...
 ```
 
-The value is the binary `OriginRecord` (v2 layout):
+The value is the binary `OriginRecord` (v3 layout):
 
 ```
 version u32 | pid u32 | ts_boot_ns u64 | comm[16] |
-creator_uid u32 | _pad u32 | creator_path[256]
+creator_uid u32 | _pad u32 | creator_path[256] | landing_filename[256]
 ```
 
-The daemon's log lines already format it. v1 xattrs from prior linprov
-builds are ignored (treated as unmarked).
+The daemon's log lines already format it. Earlier-version xattrs from
+prior linprov builds are ignored (treated as unmarked).
 
 ## Roadmap
 
@@ -178,17 +197,19 @@ the repo knows where it's going.
   it's Python that the exec hook sees — not the script. Want to read the
   script's xattr in `inode_permission` (or a userspace shebang-aware
   wrapper) so script execution honors the same enforce policy.
-- **Richer allowlist matching.** Six dimensions exist today
-  (`target_filename`, `target_folder`, `creator_process`, `creator_comm`,
-  `creator_uid`, `execution_uid`). Still on deck:
-  - Path globs (`/opt/installed/*.so`) — currently we only have exact
-    paths and recursive folder prefixes.
-  - LPM-trie folder match. We use an FNV hash walk because LPM trie
-    isn't allowed in sleepable programs; if we ever split the exec path
-    into a non-sleepable allowlist check and a sleepable xattr fetch, an
-    LPM trie becomes viable and lets us drop the rule-length cap.
-  - AND-combinators (rule "creator_process=X AND execution_uid=Y").
-    Today the dimensions are OR-ed; each rule is a single dimension.
+- **Bigger rule set.** `MAX_RULES = 32` today because each rule's
+  conditions are walked per execve and the kernel verifier caps the
+  per-program-load instruction count at 1M. The current bottleneck is
+  re-walking path-shaped dims for each rule. Folding into a single
+  pre-pass + bitset lookup would scale beyond 32, but the pre-pass
+  itself exploded the verifier (per-byte conditional stores). A
+  `bpf_loop`-based path scan would sidestep this.
+- **Path globs (`/opt/installed/*.so`)** — currently exact paths and
+  recursive folder prefixes only.
+- **LPM-trie folder match.** FNV hashing works but it's exact-prefix.
+  LPM trie isn't allowed in sleepable programs; if we ever split exec
+  enforcement into non-sleepable allowlist + sleepable xattr fetch, an
+  LPM trie becomes viable.
 - **In-kernel xattr WRITE.** The `bpf_set_dentry_xattr` kfunc carries
   `KF_TRUSTED_ARGS` and `file->f_path.dentry` isn't on the verifier's
   safe-trusted list, so we can't call it from `file_open`. Either get a

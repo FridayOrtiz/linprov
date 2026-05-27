@@ -2,32 +2,36 @@
 //!
 //! Loads the eBPF object (LSM programs + one cleanup tracepoint), attaches
 //! everything, consumes the provenance event ring buffer, and (depending on
-//! mode) maintains a multi-dimensional allowlist of marked binaries
-//! permitted to execute.
+//! mode) maintains an AND-then-OR allowlist of marked binaries permitted
+//! to execute.
 
-use std::{
-    os::fd::AsRawFd,
-    path::PathBuf,
-};
+use std::{os::fd::AsRawFd, path::PathBuf};
 
 use anyhow::{anyhow, Context, Result};
 use aya::{
     include_bytes_aligned,
-    maps::{Array, HashMap as AyaHashMap, RingBuf},
+    maps::{Array, RingBuf},
     programs::{Lsm, TracePoint},
     Btf, Ebpf,
 };
 use clap::{Parser, ValueEnum};
-use linprov_common::{
-    folder_hash, COMM_LEN, CREATOR_PATH_LEN, MODE_ENFORCE, MODE_OBSERVE, MODE_SOAK, PATH_LEN,
-};
+use linprov_common::{AllowRule, MAX_RULES, MODE_ENFORCE, MODE_OBSERVE, MODE_SOAK};
+
+/// Newtype wrapper for `AllowRule` so we can `impl aya::Pod` locally
+/// without falling foul of Rust's orphan rule (`AllowRule` lives in
+/// linprov-common, which can't see aya).
+#[repr(transparent)]
+#[derive(Copy, Clone)]
+struct AllowRuleWire(AllowRule);
+
+unsafe impl aya::Pod for AllowRuleWire {}
 use log::{info, warn};
 use tokio::{io::unix::AsyncFd, signal};
 
 mod allowlist;
 mod handler;
 
-use allowlist::{comm_key, creator_path_key, path_key, Dim, Rules, Soak};
+use allowlist::{Dim, Rules, Soak};
 
 #[derive(Parser, Debug)]
 #[command(
@@ -39,17 +43,18 @@ struct Args {
     #[arg(long, value_enum, default_value_t = Mode::Observe)]
     mode: Mode,
 
-    /// Allowlist file. New format: one rule per line, either
-    /// `<dim>=<value>` for any of {target_filename, target_folder,
-    /// creator_process, creator_comm, creator_uid, execution_uid}, or a
-    /// bare absolute path (interpreted as `target_filename`). Required
-    /// in soak and enforce modes.
+    /// Allowlist file. Each line is one rule whose
+    /// `<dim>=<value>;<dim>=<value>` conditions AND together. Lines OR.
+    /// Required in soak and enforce modes.
     #[arg(long)]
     allowlist: Option<PathBuf>,
 
-    /// Dimensions to record during soak. Comma-separated.
-    /// Default: `creator_process` (recommended starting point — one rule
-    /// per distinct creator binary like `creator_process=/usr/bin/curl`).
+    /// Dimensions to bundle into each soak-emitted rule. Comma-separated.
+    /// Default: `creator_process` (one-dim rule per distinct creator
+    /// binary). Multiple dims here mean each soak event emits a single
+    /// rule that AND-matches all of them, e.g.
+    /// `--soak creator_process,creator_uid` emits
+    /// `creator_process=…;creator_uid=…`.
     #[arg(long, value_delimiter = ',', default_value = "creator_process")]
     soak: Vec<Dim>,
 
@@ -62,8 +67,8 @@ struct Args {
 enum Mode {
     /// Log only; nothing enforced or recorded persistently.
     Observe,
-    /// Log and append one rule per `--soak` dimension to the allowlist
-    /// file for each PROVENANCE-EXEC.
+    /// Log and append one rule per PROVENANCE-EXEC, joining all
+    /// `--soak` dims into a single conjunction.
     Soak,
     /// Block execve of marked files whose origin doesn't match any
     /// allowlist rule. `-EPERM` from `security_bprm_check`.
@@ -113,14 +118,14 @@ async fn main() -> Result<()> {
     } else {
         Rules::default()
     };
+    rules.check_capacity()?;
 
-    seed_allowlist_maps(&mut bpf, &rules)?;
+    seed_allowlist_rules(&mut bpf, &rules)?;
 
     {
-        let mut config_map: Array<_, u32> = Array::try_from(
-            bpf.map_mut("CONFIG").context("CONFIG map missing")?,
-        )
-        .context("opening CONFIG map")?;
+        let mut config_map: Array<_, u32> =
+            Array::try_from(bpf.map_mut("CONFIG").context("CONFIG map missing")?)
+                .context("opening CONFIG map")?;
         config_map
             .set(0, args.mode.as_u32(), 0)
             .context("setting CONFIG[0] = mode")?;
@@ -130,8 +135,7 @@ async fn main() -> Result<()> {
         .take_map("EVENTS")
         .ok_or_else(|| anyhow!("EVENTS map not found in eBPF object"))?;
     let ring_buf = RingBuf::try_from(events_map).context("opening ring buffer")?;
-    let mut poll =
-        AsyncFd::with_interest(RingBufFd(ring_buf), tokio::io::Interest::READABLE)?;
+    let mut poll = AsyncFd::with_interest(RingBufFd(ring_buf), tokio::io::Interest::READABLE)?;
 
     let soak = match args.mode {
         Mode::Soak => {
@@ -141,17 +145,14 @@ async fn main() -> Result<()> {
         _ => None,
     };
 
-    let cfg = handler::Config {
-        mode: args.mode,
-        soak,
-    };
+    let cfg = handler::Config { mode: args.mode, soak };
 
     info!(
         "linprov running ({:?}). press Ctrl-C to exit.{}",
         args.mode,
         if args.mode == Mode::Soak {
             let names: Vec<_> = args.soak.iter().map(|d| d.as_key()).collect();
-            format!(" soak dimensions: {}", names.join(","))
+            format!(" soak dims (AND-joined per emitted rule): {}", names.join(","))
         } else {
             String::new()
         }
@@ -180,88 +181,31 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn seed_allowlist_maps(bpf: &mut Ebpf, rules: &Rules) -> Result<()> {
-    {
-        let mut map: AyaHashMap<_, [u8; PATH_LEN], u8> = AyaHashMap::try_from(
-            bpf.map_mut("ALLOW_TARGET_FILENAMES")
-                .context("ALLOW_TARGET_FILENAMES map missing")?,
-        )
-        .context("opening ALLOW_TARGET_FILENAMES")?;
-        for v in &rules.target_filenames {
-            map.insert(path_key(v), 1u8, 0)
-                .with_context(|| format!("seeding target_filename `{v}`"))?;
-        }
+fn seed_allowlist_rules(bpf: &mut Ebpf, rules: &Rules) -> Result<()> {
+    let mut rule_map: Array<_, AllowRuleWire> = Array::try_from(
+        bpf.map_mut("ALLOW_RULES")
+            .context("ALLOW_RULES map missing")?,
+    )
+    .context("opening ALLOW_RULES")?;
+    for (i, spec) in rules.rules.iter().enumerate() {
+        let packed = AllowRuleWire(spec.pack());
+        rule_map
+            .set(i as u32, packed, 0)
+            .with_context(|| format!("seeding rule[{i}] `{}`", spec.to_line()))?;
     }
-    {
-        let mut map: AyaHashMap<_, u64, u8> = AyaHashMap::try_from(
-            bpf.map_mut("ALLOW_TARGET_FOLDERS")
-                .context("ALLOW_TARGET_FOLDERS map missing")?,
-        )
-        .context("opening ALLOW_TARGET_FOLDERS")?;
-        for v in &rules.target_folders {
-            // FNV-1a hash of the rule, computed identically on both
-            // sides. The BPF folder walk does the same hash as it scans
-            // the executed path; equal prefix → equal hash → map hit.
-            let h = folder_hash(v);
-            map.insert(&h, 1u8, 0)
-                .with_context(|| format!("seeding target_folder `{v}` (hash={h:#x})"))?;
-        }
-    }
-    {
-        let mut map: AyaHashMap<_, [u8; CREATOR_PATH_LEN], u8> = AyaHashMap::try_from(
-            bpf.map_mut("ALLOW_CREATOR_PROCESSES")
-                .context("ALLOW_CREATOR_PROCESSES map missing")?,
-        )
-        .context("opening ALLOW_CREATOR_PROCESSES")?;
-        for v in &rules.creator_processes {
-            map.insert(creator_path_key(v), 1u8, 0)
-                .with_context(|| format!("seeding creator_process `{v}`"))?;
-        }
-    }
-    {
-        let mut map: AyaHashMap<_, [u8; COMM_LEN], u8> = AyaHashMap::try_from(
-            bpf.map_mut("ALLOW_CREATOR_COMMS")
-                .context("ALLOW_CREATOR_COMMS map missing")?,
-        )
-        .context("opening ALLOW_CREATOR_COMMS")?;
-        for v in &rules.creator_comms {
-            map.insert(comm_key(v), 1u8, 0)
-                .with_context(|| format!("seeding creator_comm `{v}`"))?;
-        }
-    }
-    {
-        let mut map: AyaHashMap<_, u32, u8> = AyaHashMap::try_from(
-            bpf.map_mut("ALLOW_CREATOR_UIDS")
-                .context("ALLOW_CREATOR_UIDS map missing")?,
-        )
-        .context("opening ALLOW_CREATOR_UIDS")?;
-        for v in &rules.creator_uids {
-            map.insert(v, 1u8, 0)
-                .with_context(|| format!("seeding creator_uid `{v}`"))?;
-        }
-    }
-    {
-        let mut map: AyaHashMap<_, u32, u8> = AyaHashMap::try_from(
-            bpf.map_mut("ALLOW_EXECUTION_UIDS")
-                .context("ALLOW_EXECUTION_UIDS map missing")?,
-        )
-        .context("opening ALLOW_EXECUTION_UIDS")?;
-        for v in &rules.execution_uids {
-            map.insert(v, 1u8, 0)
-                .with_context(|| format!("seeding execution_uid `{v}`"))?;
-        }
-    }
-    info!(
-        "loaded {} allowlist rules (target_filename={} target_folder={} \
-         creator_process={} creator_comm={} creator_uid={} execution_uid={})",
-        rules.total_len(),
-        rules.target_filenames.len(),
-        rules.target_folders.len(),
-        rules.creator_processes.len(),
-        rules.creator_comms.len(),
-        rules.creator_uids.len(),
-        rules.execution_uids.len(),
-    );
+    drop(rule_map);
+
+    let mut count_map: Array<_, u32> = Array::try_from(
+        bpf.map_mut("ALLOW_RULE_COUNT")
+            .context("ALLOW_RULE_COUNT map missing")?,
+    )
+    .context("opening ALLOW_RULE_COUNT")?;
+    let n = rules.rules.len().min(MAX_RULES) as u32;
+    count_map
+        .set(0, n, 0)
+        .context("setting ALLOW_RULE_COUNT[0]")?;
+
+    info!("loaded {} allowlist rules", rules.len());
     Ok(())
 }
 
