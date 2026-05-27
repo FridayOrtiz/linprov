@@ -3,8 +3,9 @@ resolver = "2"
 members = [
     "linprov",
     "linprov-common",
-    "linprov-ebpf",
 ]
+# linprov/ebpf is a nested standalone package (built by linprov's
+# build.rs); not a workspace member.
 default-members = ["linprov"]
 
 [workspace.package]
@@ -21,23 +22,18 @@ categories = ["os::linux-apis", "command-line-utilities"]
 rust-version = "1.85"
 
 [workspace.dependencies]
-# Aya fork — adds kfunc relocation resolution to aya-obj. Switch back to a
-# crates.io release once the change lands upstream.
+# Aya fork — adds kfunc relocation resolution to aya-obj. Switch back to
+# a crates.io release once the change lands upstream.
 aya = { git = "https://github.com/FridayOrtiz/aya", branch = "main" }
 aya-build = { git = "https://github.com/FridayOrtiz/aya", branch = "main" }
-aya-ebpf = { git = "https://github.com/FridayOrtiz/aya", branch = "main" }
 aya-log = { git = "https://github.com/FridayOrtiz/aya", branch = "main" }
-aya-log-ebpf = { git = "https://github.com/FridayOrtiz/aya", branch = "main" }
 
 anyhow = "1"
 bytemuck = { version = "1", features = ["derive"] }
-cargo_metadata = "0.18"
 clap = { version = "4", features = ["derive"] }
 env_logger = "0.11"
 libc = "0.2"
 log = "0.4"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
 tokio = { version = "1", features = [
     "rt-multi-thread",
     "macros",
@@ -49,37 +45,8 @@ tokio = { version = "1", features = [
 ] }
 xattr = "1"
 
-linprov-common = { path = "linprov-common" }
-
-# eBPF programs need aggressive optimization; the verifier rejects un-inlined
-# code paths and the in-kernel stack is only 512 bytes.
-[profile.dev]
-opt-level = 3
-debug = false
-debug-assertions = false
-overflow-checks = false
-lto = false
-panic = "abort"
-incremental = false
-codegen-units = 256
-rpath = false
-
-[profile.release]
-opt-level = 3
-debug = false
-debug-assertions = false
-overflow-checks = false
-lto = true
-panic = "abort"
-incremental = false
-codegen-units = 1
-rpath = false
-
-# BPF objects need debuginfo so the LLVM-BPF backend emits a .BTF section,
-# which the loader requires for any map type that needs btf_value_type_id
-# (BPF_MAP_TYPE_INODE_STORAGE / SK_STORAGE / TASK_STORAGE / etc).
-[profile.dev.package.linprov-ebpf]
-debug = 2
-
-[profile.release.package.linprov-ebpf]
-debug = 2
+# Both `path` (for dev) and `version` (for publish) — cargo prefers path
+# when present and silently swaps it for the crates.io version on
+# `cargo publish`. The nested linprov/ebpf package declares the same
+# pair independently (it isn't a workspace member).
+linprov-common = { path = "linprov-common", version = "0.1.0" }

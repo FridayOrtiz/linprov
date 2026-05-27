@@ -13,8 +13,8 @@ env:
 
 jobs:
   # Fast path: lint, format, and run the unit tests against the userspace
-  # crates. The BPF crate is excluded because its `r1..r5` inline-asm
-  # registers only resolve under the bpfel target.
+  # crates. The BPF crate is a nested package (linprov/ebpf), not a
+  # workspace member, so `--workspace` here naturally skips it.
   lint-and-test:
     name: fmt / clippy / test
     runs-on: ubuntu-latest
@@ -33,11 +33,11 @@ jobs:
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      - name: cargo clippy (userspace crates only)
-        run: cargo clippy --workspace --exclude linprov-ebpf --all-targets -- -D warnings
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
 
-      - name: cargo test (userspace crates only)
-        run: cargo test --workspace --exclude linprov-ebpf
+      - name: cargo test
+        run: cargo test --workspace
 
   # Build the full daemon (userspace + nested BPF object) to catch
   # regressions on the bpfel target. Slower because bpf-linker has to be

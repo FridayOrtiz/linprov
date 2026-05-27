@@ -1,20 +1,20 @@
-//! Build the eBPF crate before compiling the userspace binary.
+//! Build the nested eBPF crate, then embed the resulting object into
+//! the daemon binary.
 //!
-//! We invoke a nested `cargo build` against `linprov-ebpf` with the BPF target
-//! and `-Z build-std=core`, then copy the resulting ELF object into our
-//! `OUT_DIR` so the main binary can embed it via `include_bytes_aligned!`.
+//! The eBPF source lives at `linprov/ebpf/`, in the daemon crate's own
+//! directory rather than as a sibling workspace member, so the
+//! published `linprov` tarball is self-contained (`cargo install
+//! linprov` works without needing the wider workspace).
 //!
-//! The build is intentionally isolated: a separate `--target-dir`, and a
-//! purge of inherited cargo/rustc env vars so the child cargo invocation
-//! doesn't try to share lockfiles or rustflags with the parent build.
+//! We invoke a nested `cargo build` for the `bpfel-unknown-none` target
+//! with `-Z build-std=core`, then copy the result into `OUT_DIR` so the
+//! daemon's `include_bytes_aligned!` can pick it up.
 
 use std::{env, path::PathBuf, process::Command};
 
 fn main() {
     let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let workspace_dir = manifest_dir.parent().expect("workspace root");
-    let ebpf_dir = workspace_dir.join("linprov-ebpf");
-    let common_dir = workspace_dir.join("linprov-common");
+    let ebpf_dir = manifest_dir.join("ebpf");
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", ebpf_dir.join("src").display());
@@ -25,14 +25,6 @@ fn main() {
     println!(
         "cargo:rerun-if-changed={}",
         ebpf_dir.join(".cargo/config.toml").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        common_dir.join("src").display()
-    );
-    println!(
-        "cargo:rerun-if-changed={}",
-        common_dir.join("Cargo.toml").display()
     );
 
     let out_dir = PathBuf::from(env::var("OUT_DIR").unwrap());
@@ -51,15 +43,19 @@ fn main() {
         .arg(target)
         .arg("--target-dir")
         .arg(&target_dir)
-        // Detach from the parent cargo invocation as much as possible.
+        // Detach inherited build-time state that would confuse the
+        // nested cargo (separate lockfile, separate target dir).
+        // RUSTUP_TOOLCHAIN is intentionally NOT cleared: removing it
+        // makes rustup re-derive a toolchain, which on CI runners ends
+        // up picking stable when the BPF crate needs nightly. Let the
+        // outer toolchain propagate.
         .env_remove("CARGO_ENCODED_RUSTFLAGS")
         .env_remove("CARGO_MAKEFLAGS")
         .env_remove("CARGO_TARGET_DIR")
         .env_remove("RUSTC")
         .env_remove("RUSTC_WORKSPACE_WRAPPER")
         .env_remove("RUSTC_WRAPPER")
-        .env_remove("RUSTFLAGS")
-        .env_remove("RUSTUP_TOOLCHAIN");
+        .env_remove("RUSTFLAGS");
 
     if release {
         cmd.arg("--release");

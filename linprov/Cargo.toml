@@ -11,12 +11,20 @@ keywords.workspace = true
 categories.workspace = true
 readme = "../README.md"
 rust-version.workspace = true
-# NOTE: `cargo install linprov` doesn't work yet — build.rs invokes a
-# nested `cargo build` against `../linprov-ebpf` at the workspace path,
-# which isn't present in a published tarball. Tracked as a follow-up;
-# install via `cargo install --git https://github.com/FridayOrtiz/linprov`
-# for now.
-publish = false
+# Ship the nested ebpf source so `cargo install linprov` is
+# self-contained. `target/` is excluded by default; nothing else needs
+# to be hidden from the published tarball.
+include = [
+    "src/**/*",
+    "build.rs",
+    "ebpf/src/**/*",
+    "ebpf/Cargo.toml",
+    "ebpf/.cargo/config.toml",
+    "rust-toolchain.toml",
+    "Cargo.toml",
+    "README.md",
+    "LICENSE-*",
+]
 
 [[bin]]
 name = "linprov"
