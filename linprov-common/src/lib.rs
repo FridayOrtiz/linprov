@@ -35,13 +35,14 @@ pub const PATH_LEN: usize = 256;
 pub const CREATOR_PATH_LEN: usize = 256;
 
 /// Max path length the BPF FNV walks inspect (one for `target_filename`,
-/// one for `landing_filename`, plus the folder-match walk). Bounded
-/// by the verifier's 1M-insn budget across `MAX_RULES` walks × per-
-/// rule per-dim scans. Linux paths can run to `PATH_MAX` (4096); for
-/// path-shaped rule values that exceed this scan length, soak
-/// truncates to a `/`-aligned ancestor (with a safety floor to keep
-/// rules from collapsing into the filesystem root).
-pub const PATH_HASH_SCAN_LEN: usize = 80;
+/// one for `landing_filename`, plus the folder-match walk). Now equal
+/// to [`PATH_LEN`] — the walks run inside `bpf_loop()`, so the
+/// verifier inspects the loop body once instead of unrolling it
+/// across iterations, and the scan length is bounded only by the
+/// buffer size, not by the verifier's instruction budget. Older
+/// builds capped this at 80; bumped to 256 alongside the
+/// `bpf_loop`-based walk refactor.
+pub const PATH_HASH_SCAN_LEN: usize = PATH_LEN;
 
 /// Max number of `/`-separated ancestor hashes we collect per filename
 /// for folder-rule matching. Each represents one ancestor directory

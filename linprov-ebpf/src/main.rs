@@ -494,42 +494,113 @@ fn comm_eq(a: &[u8; COMM_LEN], b: &[u8; COMM_LEN]) -> bool {
     eq
 }
 
-/// FNV-1a-64 of a NUL-terminated path. Scans up to
-/// [`PATH_HASH_SCAN_LEN`] bytes.
+// `bpf_loop` (helper id 181, kernel >= 5.17): runs `callback_fn` up
+// to `nr_loops` times; the callback returns 0 to continue, 1 to break.
+// We use it for the per-path FNV walks so the verifier inspects the
+// callback once instead of unrolling the loop body across every rule
+// × every dim — which is what bounded `PATH_HASH_SCAN_LEN` to 80 in
+// the static-loop version.
+type LoopCb = unsafe extern "C" fn(u32, *mut c_void) -> i64;
+
 #[inline(always)]
-fn fnv_full(src: *const u8) -> u64 {
-    let mut hash: u64 = FNV_OFFSET;
-    for i in 0..PATH_HASH_SCAN_LEN {
-        let b = unsafe { *src.add(i) };
-        if b == 0 {
-            break;
-        }
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
+unsafe fn bpf_loop(nr_loops: u32, cb: LoopCb, ctx: *mut c_void, flags: u64) -> i64 {
+    let fun: unsafe extern "C" fn(u32, *mut c_void, *mut c_void, u64) -> i64 =
+        core::mem::transmute(181usize);
+    fun(nr_loops, cb as *mut c_void, ctx, flags)
+}
+
+#[repr(C)]
+struct FnvCtx {
+    src: *const u8,
+    hash: u64,
+}
+
+/// `bpf_loop` callback for [`fnv_full`]. Marked `#[inline(never)]`
+/// so the linker emits it as a real subprog — the whole point of
+/// switching to `bpf_loop` is to let the verifier amortize this body
+/// across iterations, which only works if it's a separate function.
+///
+/// The explicit `i >= PATH_HASH_SCAN_LEN` bound check teaches the
+/// verifier the upper bound on the index — without it, `i` is a u32
+/// the verifier treats as `[0, u32::MAX]`, which makes `src + i` an
+/// unbounded memory access regardless of what `bpf_loop` actually
+/// passes in.
+#[inline(never)]
+unsafe extern "C" fn fnv_step(i: u32, ctx: *mut c_void) -> i64 {
+    if i >= PATH_HASH_SCAN_LEN as u32 {
+        return 1;
     }
-    hash
+    let ctx = &mut *(ctx as *mut FnvCtx);
+    let b = *ctx.src.add(i as usize);
+    if b == 0 {
+        return 1; // break
+    }
+    ctx.hash ^= b as u64;
+    ctx.hash = ctx.hash.wrapping_mul(FNV_PRIME);
+    0
+}
+
+/// FNV-1a-64 of a NUL-terminated path. Scans up to
+/// [`PATH_HASH_SCAN_LEN`] bytes via `bpf_loop`.
+#[inline(always)]
+unsafe fn fnv_full(src: *const u8) -> u64 {
+    let mut ctx = FnvCtx {
+        src,
+        hash: FNV_OFFSET,
+    };
+    bpf_loop(
+        PATH_HASH_SCAN_LEN as u32,
+        fnv_step,
+        &mut ctx as *mut _ as *mut c_void,
+        0,
+    );
+    ctx.hash
+}
+
+#[repr(C)]
+struct FolderCtx {
+    src: *const u8,
+    needle: u64,
+    hash: u64,
+    found: u32,
+}
+
+#[inline(never)]
+unsafe extern "C" fn folder_step(i: u32, ctx: *mut c_void) -> i64 {
+    if i >= PATH_HASH_SCAN_LEN as u32 {
+        return 1;
+    }
+    let ctx = &mut *(ctx as *mut FolderCtx);
+    let b = *ctx.src.add(i as usize);
+    if b == 0 {
+        return 1; // break
+    }
+    ctx.hash ^= b as u64;
+    ctx.hash = ctx.hash.wrapping_mul(FNV_PRIME);
+    if b == b'/' && ctx.hash == ctx.needle {
+        ctx.found = 1;
+    }
+    0
 }
 
 /// True if `needle` equals the FNV-1a hash of any `/`-terminated prefix
-/// of the NUL-terminated path at `src`. Walks the path once, checking
-/// at each separator; no folder-hash array materialization (which blows
-/// the verifier's per-instruction state budget).
+/// of the NUL-terminated path at `src`. Walks the path once via
+/// `bpf_loop`, checking at each separator.
 #[inline(always)]
-fn folder_match(src: *const u8, needle: u64) -> bool {
-    let mut hash: u64 = FNV_OFFSET;
-    let mut found = false;
-    for i in 0..PATH_HASH_SCAN_LEN {
-        let b = unsafe { *src.add(i) };
-        if b == 0 {
-            break;
-        }
-        hash ^= b as u64;
-        hash = hash.wrapping_mul(FNV_PRIME);
-        if b == b'/' && hash == needle {
-            found = true;
-        }
-    }
-    found
+unsafe fn folder_match(src: *const u8, needle: u64) -> bool {
+    let mut ctx = FolderCtx {
+        src,
+        needle,
+        hash: FNV_OFFSET,
+        found: 0,
+    };
+    bpf_loop(
+        PATH_HASH_SCAN_LEN as u32,
+        folder_step,
+        &mut ctx as *mut _ as *mut c_void,
+        0,
+    );
+    ctx.found != 0
 }
 
 /// Returns true if any allowlist rule's conditions all match. Rules OR

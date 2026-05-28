@@ -45,21 +45,28 @@ fn main() {
         .arg("bpf-build")
         .arg("--bin")
         .arg("linprov-ebpf")
-        // `--btf` + `--ignore-inline-never` are bpf-linker flags
-        // (`.BTF` section for any storage map; force-inline subprogs
-        // so BTF FUNC entries stay consistent). The `-C` flags
-        // replicate the workspace's `[profile.release.package.linprov-ebpf]`
-        // — cargo ignores per-package profile blocks for workspace
-        // members AND the workspace profile doesn't apply when
-        // linprov-ebpf is built standalone (which is what happens
-        // under `cargo install linprov`), so we set the load-bearing
-        // bits here: `debuginfo=2` is required for the LLVM-BPF
-        // backend to emit `.BTF`, `panic=abort` because BPF has no
-        // unwinder, `overflow-checks=off` because the panic landing
-        // pads from overflow checks would also need an unwinder.
+        // `--btf` is the only bpf-linker flag we need (`.BTF` section
+        // for the storage maps). We deliberately DON'T pass
+        // `--ignore-inline-never` any more — we want subprograms to
+        // stay subprograms so the verifier can amortize per-callsite
+        // state and we can use `bpf_loop()` with subprog callbacks.
+        // The aya fork's `func_info` pruning patch handles the
+        // compiler-emitted memset/memcpy case that originally forced
+        // us to use that flag.
+        //
+        // The `-C` flags replicate the workspace's
+        // `[profile.release.package.linprov-ebpf]` — cargo ignores
+        // per-package profile blocks for workspace members AND the
+        // workspace profile doesn't apply when linprov-ebpf is built
+        // standalone (which is what happens under `cargo install
+        // linprov`), so we set the load-bearing bits here:
+        // `debuginfo=2` is required for the LLVM-BPF backend to emit
+        // `.BTF`, `panic=abort` because BPF has no unwinder,
+        // `overflow-checks=off` because the panic landing pads from
+        // overflow checks would also need an unwinder.
         .env(
             "CARGO_TARGET_BPFEL_UNKNOWN_NONE_RUSTFLAGS",
-            "-C link-arg=--btf -C link-arg=--ignore-inline-never \
+            "-C link-arg=--btf \
              -C debuginfo=2 -C panic=abort -C overflow-checks=off",
         )
         // Detach inherited build-time state that would confuse the
