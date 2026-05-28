@@ -83,7 +83,9 @@ start_daemon() {
     cleanup_daemons
     rm -f "$logfile"
 
-    local args=(--mode "$mode" --log-level info)
+    # `run` subcommand. Empty --config keeps us off /etc/linprov/config.toml
+    # — the smoke suite is purely CLI-driven.
+    local args=(run --config /dev/null --mode "$mode" --log-level info)
     if [ "$allowlist" != "-" ]; then
         args+=(--allowlist "$allowlist")
     fi

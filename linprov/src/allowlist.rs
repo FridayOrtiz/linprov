@@ -20,11 +20,14 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use clap::ValueEnum;
 use linprov_common::{dim, fnv_hash, AllowRule, COMM_LEN, MAX_RULES, PATH_HASH_SCAN_LEN};
+use serde::Deserialize;
 
-/// Allowlist dimensions. Used both for `--soak=<csv>` and for the
-/// `<dim>=<value>` entries in the allowlist file.
-#[derive(Clone, Copy, Debug, ValueEnum, PartialEq, Eq, Hash)]
+/// Allowlist dimensions. Used for `--soak=<csv>`, for the
+/// `<dim>=<value>` entries in the allowlist file, and for the
+/// `soak = [...]` array in the TOML config file.
+#[derive(Clone, Copy, Debug, Deserialize, ValueEnum, PartialEq, Eq, Hash)]
 #[clap(rename_all = "snake_case")]
+#[serde(rename_all = "snake_case")]
 pub enum Dim {
     /// Exact full path of the executed binary (at execve time).
     TargetFilename,

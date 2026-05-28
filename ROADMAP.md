@@ -49,16 +49,13 @@ picking up the repo knows where it's going.
   enforcement into non-sleepable allowlist + sleepable xattr fetch, an
   LPM trie becomes viable.
 
-## Operability / publishable UX
+## Operability
 
-- **`linprov setup`.** Guided one-shot for new users: feature-detect
-  (kernel ≥ 6.5, BPF LSM in active `lsm=`, `vmlinux` BTF present),
-  drop a systemd unit, run a guided soak interval, emit a proposed
-  allowlist for review. Distinct from `cargo install linprov` —
-  that's the binary install; `linprov setup` configures the service.
-- **Default log + allowlist paths.** Default `--log-file
-  /var/log/linprov.log` and `--allowlist /etc/linprov/list.allow`
-  with `LINPROV_*` env overrides and CLI flags.
+- **Guided soak interval inside `linprov setup`.** Today `setup` is
+  the install-time path: feature-check, drop a systemd unit, write
+  defaults. A follow-up: an interactive flow that enables the unit in
+  `soak` mode, watches for N hours / executions, and proposes the
+  resulting allowlist for review before flipping to `enforce`.
 - **Ad-hoc allow at block time.** Every `BLOCKED-EXEC` log line emits
   a short stable token. `linprov allow <token>` appends a rule that
   would have permitted that exec to the allowlist file and signals

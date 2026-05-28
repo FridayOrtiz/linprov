@@ -80,61 +80,61 @@ sudo ./tests/smoke/run-all.sh
 
 ## Run
 
-Three modes. The `--allowlist` file format is described
-[below](#allowlist-format).
+`linprov` is structured as three subcommands.
 
-### Observe (default)
+### `linprov setup`
 
-Marks files and logs marked execs. Never blocks.
-
-```
-sudo ./target/release/linprov
-```
-
-Sample log line for an exec of a marked binary:
+First-time install. Feature-checks the kernel (≥ 6.5, `bpf` in active
+`lsm=`, `vmlinux` BTF), writes a default config + empty allowlist
+under `/etc/linprov/`, and drops a systemd unit. After:
 
 ```
-PROVENANCE-EXEC path=/tmp/curl-download pid=12345 comm=zsh \
-  origin={v:2,ts_boot_ns:42…,pid:6789,uid:1000,comm:curl,path:/usr/bin/curl}
+sudo linprov setup
+sudo systemctl daemon-reload
+sudo systemctl enable --now linprov.service
+journalctl -u linprov.service -f
 ```
 
-### Soak
+### `linprov run`
 
-Like observe, but every PROVENANCE-EXEC produces allowlist rules for the
-dimensions selected by `--soak`. Defaults to `creator_process`.
+The daemon itself. Reads `/etc/linprov/config.toml` by default; CLI
+flags + env vars override. The systemd unit calls
+`linprov run --config /etc/linprov/config.toml`. Three modes:
 
-```
-# Default: one rule per distinct creator binary
-sudo ./target/release/linprov --mode soak --allowlist /etc/linprov.allow
+- **observe** (default): mark files, log marked execs, never block.
+- **soak**: same as observe plus appending one allowlist rule per
+  PROVENANCE-EXEC. `--soak creator_process,creator_uid,…` (also
+  settable as `soak = [...]` in the config) controls which dims each
+  emitted rule AND-joins.
+- **enforce**: block any marked execve whose origin doesn't match a
+  rule. `-EPERM` from `security_bprm_check`; the shell sees
+  `Operation not permitted` and `$?` is 126.
 
-# Capture multiple dimensions per event
-sudo ./target/release/linprov --mode soak --allowlist /etc/linprov.allow \
-    --soak creator_process,creator_uid,target_folder
-```
+Logs land in the file set by `log_file = ...` in the config (default
+`/var/log/linprov.log` once `setup` has run), or `stderr` if no
+`log_file` is configured.
 
-Tail the allowlist file as soak runs to watch the policy build up. Rules
-are deduplicated on the literal text, so re-execing the same files just
-no-ops.
+### `linprov upgrade`
 
-### Enforce
-
-Loads the allowlist into BPF maps at startup. A marked execve is permitted
-iff *any* rule in the allowlist matches the file's `OriginRecord` (creator
-identity / UID / etc.) or the target path. Unmarked binaries are never
-touched.
+After `cargo install --force linprov` lays down a new binary, run:
 
 ```
-sudo ./target/release/linprov --mode enforce --allowlist /etc/linprov.allow
+sudo linprov upgrade
 ```
 
-Blocked exec log:
+That does `systemctl daemon-reload` + `systemctl restart
+linprov.service` and warns if the unit's `ExecStart` doesn't match
+the binary you just installed (re-run `linprov setup --force --binary
+<path>` if so).
+
+Sample log lines for observe / enforce:
 
 ```
-BLOCKED-EXEC path=/tmp/sketchy pid=12346 comm=zsh \
-  origin={v:2,…,comm:curl,path:/usr/bin/curl} (LSM verdict -1)
+PROVENANCE-EXEC target=/usr/local/bin/foo landing=/tmp/foo pid=12345 \
+  comm=zsh origin={v:3,…,comm:curl,path:/usr/bin/curl}
+BLOCKED-EXEC target=/tmp/sketchy landing=/tmp/sketchy pid=12346 comm=zsh \
+  origin={v:3,…,comm:curl,path:/usr/bin/curl} (LSM verdict -1)
 ```
-
-The originating shell sees `Operation not permitted` and `$?` is 126.
 
 ## Allowlist format
 
