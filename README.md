@@ -51,34 +51,27 @@ doesn't care which fired.
 - The userspace daemon runs as **root** (BPF program load + LSM attach +
   `security.bpf.*` xattr writes all need it).
 
-## Build
+## Install
+
+```
+cargo install linprov
+```
+
+Needs `bpf-linker` available on the host (`cargo install bpf-linker`).
+Uses an aya fork published as `aya-friday-*` on crates.io — pulled in
+automatically as a regular dependency.
+
+## Build from source
 
 ```
 cargo build --release
 ```
 
-Requires `bpf-linker` (`cargo install bpf-linker`). Depends on a
-[forked aya](https://github.com/FridayOrtiz/aya) that adds kfunc
-relocation resolution; the dependency is resolved by git
-automatically — no local checkout required.
-
-Install from a git checkout works today:
-
-```
-cargo install --git https://github.com/FridayOrtiz/linprov linprov
-```
-
-`cargo install linprov` from crates.io is blocked on publishing the
-renamed aya fork (`aya-friday-*`). Once those crates land, plain
-`cargo install linprov` is self-contained — the linprov tarball ships
-the BPF source, the `rust-toolchain.toml`, and everything else
-`build.rs` needs.
-
 ## Tests
 
 ```
 # Unit tests + doctests (no kernel needed):
-cargo test --workspace --exclude linprov-ebpf
+cargo test --workspace
 
 # Smoke suite (needs root + BPF LSM kernel; see tests/README.md):
 cargo build
