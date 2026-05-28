@@ -80,52 +80,96 @@ sudo ./tests/smoke/run-all.sh
 
 ## Run
 
-`linprov` is structured as three subcommands.
+`linprov` is structured as three subcommands. The recommended
+end-to-end flow is **setup → soak → review → enforce**.
 
-### `linprov setup`
+### 1. `linprov setup`
 
-First-time install. Feature-checks the kernel (≥ 6.5, `bpf` in active
-`lsm=`, `vmlinux` BTF), writes a default config + empty allowlist
-under `/etc/linprov/`, and drops a systemd unit. After:
+Feature-checks the kernel (≥ 6.5, `bpf` in active `lsm=`, `vmlinux`
+BTF), writes a commented `/etc/linprov/config.toml`, an empty
+allowlist at `/etc/linprov/list.allow`, and a systemd unit (writes
+only — doesn't enable). The config it writes starts in
+`mode = "observe"`; don't enable the unit yet.
 
 ```
 sudo linprov setup
+```
+
+### 2. Soak interactively to build an allowlist
+
+Run the daemon in the foreground while you use your machine
+normally. Every marked `execve` appends one rule to the allowlist
+file. `^C` when you've covered enough — the rules persist on disk.
+
+```
+sudo linprov run --mode soak
+journalctl is not involved here; logs stream to your terminal.
+```
+
+The `--mode soak` flag overrides the config's `mode = "observe"`;
+the rest of the config (allowlist path, soak dims, etc.) is still
+honored. Watch the file grow:
+
+```
+tail -f /etc/linprov/list.allow
+```
+
+### 3. Review the allowlist
+
+Trim anything you didn't actually want permitted:
+
+```
+cat /etc/linprov/list.allow
+$EDITOR /etc/linprov/list.allow
+```
+
+### 4. Flip to enforce and start the unit
+
+Edit `/etc/linprov/config.toml` and change `mode = "observe"` to
+`mode = "enforce"`. Then enable the systemd unit:
+
+```
 sudo systemctl daemon-reload
 sudo systemctl enable --now linprov.service
 journalctl -u linprov.service -f
 ```
 
-### `linprov run`
-
-The daemon itself. Reads `/etc/linprov/config.toml` by default; CLI
-flags + env vars override. The systemd unit calls
-`linprov run --config /etc/linprov/config.toml`. Three modes:
-
-- **observe** (default): mark files, log marked execs, never block.
-- **soak**: same as observe plus appending one allowlist rule per
-  PROVENANCE-EXEC. `--soak creator_process,creator_uid,…` (also
-  settable as `soak = [...]` in the config) controls which dims each
-  emitted rule AND-joins.
-- **enforce**: block any marked execve whose origin doesn't match a
-  rule. `-EPERM` from `security_bprm_check`; the shell sees
-  `Operation not permitted` and `$?` is 126.
-
-Logs land in the file set by `log_file = ...` in the config (default
-`/var/log/linprov.log` once `setup` has run), or `stderr` if no
-`log_file` is configured.
+A marked execve that doesn't match any rule now gets blocked with
+`-EPERM` from `security_bprm_check` — the shell sees
+`Operation not permitted` and `$?` is `126`.
 
 ### `linprov upgrade`
 
-After `cargo install --force linprov` lays down a new binary, run:
+After `cargo install --force linprov` drops a new binary, restart the
+running daemon:
 
 ```
 sudo linprov upgrade
 ```
 
-That does `systemctl daemon-reload` + `systemctl restart
-linprov.service` and warns if the unit's `ExecStart` doesn't match
-the binary you just installed (re-run `linprov setup --force --binary
-<path>` if so).
+Runs `systemctl daemon-reload` + `systemctl restart linprov.service`.
+Warns if the unit's `ExecStart` doesn't match the binary you just
+installed (in which case re-run `linprov setup --force --binary
+<path>` to point it at the new location).
+
+### `linprov run` reference
+
+Reads `/etc/linprov/config.toml` by default; CLI flags + env vars
+override. The systemd unit calls `linprov run --config
+/etc/linprov/config.toml`. Three modes:
+
+- **observe** (default): mark files, log marked execs, never block.
+- **soak**: like observe plus appending one allowlist rule per
+  PROVENANCE-EXEC. `--soak creator_process,creator_uid,…` (also
+  settable as `soak = [...]` in the config) controls which dims each
+  emitted rule AND-joins.
+- **enforce**: block any marked execve whose origin doesn't match a
+  rule.
+
+By default logs go to stderr (journald captures them under
+systemd). Set `log_file = "/path/to/file"` in the config (or
+`--log-file`) to append-log to a file instead — handy for non-systemd
+setups.
 
 Sample log lines for observe / enforce:
 

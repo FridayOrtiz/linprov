@@ -14,8 +14,9 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use log::{info, warn};
 
-use crate::config::{
-    DEFAULT_ALLOWLIST_PATH, DEFAULT_CONFIG_PATH, DEFAULT_LOG_PATH, DEFAULT_SYSTEMD_UNIT_PATH,
+use crate::{
+    config::{DEFAULT_ALLOWLIST_PATH, DEFAULT_CONFIG_PATH, DEFAULT_SYSTEMD_UNIT_PATH},
+    privilege,
 };
 
 #[derive(Parser, Debug)]
@@ -28,11 +29,6 @@ pub struct SetupArgs {
     /// Where to write the empty starting allowlist.
     #[arg(long, default_value = DEFAULT_ALLOWLIST_PATH)]
     allowlist: PathBuf,
-
-    /// Log file path baked into the written config. The daemon will
-    /// append to it; rotate via logrotate / journald-side handling.
-    #[arg(long, default_value = DEFAULT_LOG_PATH)]
-    log_file: PathBuf,
 
     /// Path to the installed linprov binary. Defaults to the current
     /// executable (whatever `cargo install` put on `$PATH`); embedded
@@ -57,6 +53,7 @@ pub struct SetupArgs {
 }
 
 pub fn run(args: SetupArgs) -> Result<()> {
+    privilege::require_root("linprov setup")?;
     preflight();
 
     let binary = match args.binary {
@@ -64,7 +61,7 @@ pub fn run(args: SetupArgs) -> Result<()> {
         None => env::current_exe().context("locating linprov binary")?,
     };
 
-    write_config(&args.config, &args.allowlist, &args.log_file, args.force)?;
+    write_config(&args.config, &args.allowlist, args.force)?;
     write_empty_allowlist(&args.allowlist, args.force)?;
 
     if !args.no_systemd {
@@ -75,17 +72,41 @@ pub fn run(args: SetupArgs) -> Result<()> {
     println!("linprov is set up.");
     println!("  config:    {}", args.config.display());
     println!("  allowlist: {}", args.allowlist.display());
-    println!("  log file:  {}", args.log_file.display());
     if !args.no_systemd {
         println!("  unit:      {}", args.systemd_unit.display());
+    }
+    println!();
+    println!(
+        "Recommended next steps — soak first, then enforce. Don't enable the\n\
+         systemd unit yet; you want to build up an allowlist before anything\n\
+         gets blocked."
+    );
+    println!();
+    println!("  # 1. Run a soak in the foreground. Use your machine normally —");
+    println!(
+        "  #    every marked execve appends a rule to {}.",
+        args.allowlist.display()
+    );
+    println!(
+        "  #    `^C` when you're satisfied; the rules persist in the file.\n\
+         \n  sudo {} run --mode soak\n",
+        binary.display()
+    );
+    println!("  # 2. Review the allowlist.");
+    println!("  cat {}\n", args.allowlist.display());
+    println!(
+        "  # 3. Edit {} and flip `mode` from\n  #    \"observe\" to \"enforce\".",
+        args.config.display()
+    );
+    if !args.no_systemd {
         println!();
-        println!("Next steps:");
+        println!("  # 4. Enable the systemd unit.");
         println!("  sudo systemctl daemon-reload");
         println!("  sudo systemctl enable --now linprov.service");
         println!("  journalctl -u linprov.service -f");
     } else {
         println!();
-        println!("Next steps (no-systemd):");
+        println!("  # 4. Run the daemon (whatever supervises it on your system).");
         println!(
             "  sudo {} run --config {}",
             binary.display(),
@@ -127,46 +148,52 @@ fn preflight() {
     }
 }
 
-fn write_config(path: &Path, allowlist: &Path, log_file: &Path, force: bool) -> Result<()> {
+fn write_config(path: &Path, allowlist: &Path, force: bool) -> Result<()> {
     refuse_clobber(path, force, "config")?;
     ensure_parent(path)?;
 
     let body = format!(
         r#"# linprov config. Loaded by `linprov run --config {0}` and by
 # the systemd unit that `linprov setup` drops. Re-run `linprov setup
-# --force` to regenerate; you can edit by hand any time.
+# --force` to regenerate; edit by hand any time.
 
-# observe = log only (default)
-# soak    = log + append allowlist rules for each PROVENANCE-EXEC
-# enforce = block marked execve whose origin doesn't match a rule
+# observe = log only (safe default — never blocks)
+# soak    = log + append a rule to `allowlist` for each marked execve
+# enforce = block any marked execve whose origin doesn't match a rule
+#
+# Suggested workflow:
+#   1. `sudo linprov run --mode soak` — use your machine normally for
+#      a while; rules accumulate in the allowlist below.
+#   2. Skim the allowlist; trim anything you don't actually want
+#      permitted.
+#   3. Flip the line below to `mode = "enforce"`.
+#   4. Enable the systemd unit (`sudo systemctl enable --now
+#      linprov.service`) — or `linprov upgrade` if it's already
+#      running.
 mode = "observe"
 
-# Path to the allowlist file. Same format the daemon writes in soak
-# mode: one rule per line, AND within a line, OR across lines.
+# One rule per line; conditions within a line AND, lines OR.
 allowlist = "{1}"
-
-# Where the daemon writes its logs. Comment out to send logs to stderr
-# instead (e.g. when journald is already capturing them).
-log_file = "{2}"
 
 # trace | debug | info | warn | error
 log_level = "info"
 
-# By default, connect()s to 127.0.0.0/8 and ::1 don't mark the PID as
-# network-touched. Flip to `true` to include them (e.g. on a system
-# where you treat localhost downloads as real network activity).
+# By default, connect()s to 127.0.0.0/8 and ::1 don't mark the PID
+# as network-touched. Flip to `true` to include them.
 mark_localhost = false
 
-# Dimensions soak mode bundles into each emitted rule. Each
-# PROVENANCE-EXEC writes one allowlist line whose conditions all of
-# these dims AND together. The default keeps things simple — one rule
-# per creator binary — but you can mix `creator_uid`, `target_folder`,
-# `landing_filename`, etc.
+# Dimensions soak mode AND-joins into each emitted rule. Default keeps
+# things simple — one rule per distinct creator binary — but you can
+# mix `creator_uid`, `target_folder`, `landing_filename`, etc.
 soak = ["creator_process"]
+
+# Optional: append logs to a file instead of stderr. Leave commented
+# out under systemd — journald captures stderr automatically. Useful
+# if you run linprov outside of systemd (`runit`, manual, container).
+# log_file = "/var/log/linprov.log"
 "#,
         path.display(),
         allowlist.display(),
-        log_file.display(),
     );
     fs::write(path, body).with_context(|| format!("writing `{}`", path.display()))?;
     info!("wrote config: {}", path.display());

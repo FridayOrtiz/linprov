@@ -12,6 +12,7 @@ mod allowlist;
 mod config;
 mod handler;
 mod mode;
+mod privilege;
 mod run;
 mod setup;
 mod upgrade;

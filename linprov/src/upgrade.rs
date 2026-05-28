@@ -17,7 +17,10 @@ use anyhow::{anyhow, Context, Result};
 use clap::Parser;
 use log::{info, warn};
 
-use crate::config::{DEFAULT_SYSTEMD_UNIT_NAME, DEFAULT_SYSTEMD_UNIT_PATH};
+use crate::{
+    config::{DEFAULT_SYSTEMD_UNIT_NAME, DEFAULT_SYSTEMD_UNIT_PATH},
+    privilege,
+};
 
 #[derive(Parser, Debug)]
 pub struct UpgradeArgs {
@@ -36,6 +39,9 @@ pub struct UpgradeArgs {
 }
 
 pub fn run(args: UpgradeArgs) -> Result<()> {
+    if !args.dry_run {
+        privilege::require_root("linprov upgrade")?;
+    }
     check_exec_start_matches(&args.unit_file)?;
     systemctl(&args.unit, args.dry_run)
 }

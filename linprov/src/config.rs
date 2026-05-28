@@ -28,10 +28,6 @@ pub const DEFAULT_CONFIG_PATH: &str = "/etc/linprov/config.toml";
 /// by `run` if neither the CLI nor the config file specifies one.
 pub const DEFAULT_ALLOWLIST_PATH: &str = "/etc/linprov/list.allow";
 
-/// Default log file path. `setup` writes this into the generated
-/// config; `run` falls back to stderr if the field is absent.
-pub const DEFAULT_LOG_PATH: &str = "/var/log/linprov.log";
-
 /// Default systemd unit path that `setup` writes and `upgrade` acts on.
 pub const DEFAULT_SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/linprov.service";
 
