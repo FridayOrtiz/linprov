@@ -27,11 +27,11 @@ picking up the repo knows where it's going.
   just about lowering the persistence cost.
 - **xattr-stripping resistance.** Out of scope; assumed-cooperative
   filesystem. A motivated user with `setfattr -x` can clear the mark.
-- **Skip localhost as a network signal.** Today *any* `AF_INET`/`AF_INET6`
-  socket flags the PID as network-touched, which means local dev
-  against `127.0.0.1` litters the allowlist. Default to
-  *non-loopback only*; expose `LINPROV_MARK_LOCALHOST=1` / a flag so
-  the smoke tests (which serve over `127.0.0.1`) can opt back in.
+- **Accept side of the network signal.** Today we only mark on
+  outgoing `connect()`. A process that `accept()`s an inbound
+  connection and writes a file based on that data doesn't get its
+  PID marked. Probably want a parallel `socket_accept` LSM hook with
+  the same loopback-skip rule.
 
 ## Allowlist
 

@@ -58,6 +58,21 @@ struct Args {
     #[arg(long, value_delimiter = ',', default_value = "creator_process")]
     soak: Vec<Dim>,
 
+    /// Also mark PIDs whose only network activity was to loopback
+    /// (`127.0.0.0/8` or `::1`). Off by default so local dev /
+    /// package mirrors on 127.0.0.1 don't fill the allowlist.
+    /// Set the env var `LINPROV_MARK_LOCALHOST=1` (or `true`, `yes`,
+    /// `on`) to enable from a systemd unit / test harness.
+    #[arg(
+        long,
+        env = "LINPROV_MARK_LOCALHOST",
+        value_parser = clap::builder::BoolishValueParser::new(),
+        default_value_t = false,
+        num_args = 0..=1,
+        default_missing_value = "true",
+    )]
+    mark_localhost: bool,
+
     /// Log level (trace, debug, info, warn, error).
     #[arg(long, default_value = "info")]
     log_level: String,
@@ -108,7 +123,7 @@ async fn main() -> Result<()> {
 
     let btf = Btf::from_sys_fs().context("loading kernel BTF from /sys/kernel/btf/vmlinux")?;
 
-    attach_lsm(&mut bpf, &btf, "socket_post_create")?;
+    attach_lsm(&mut bpf, &btf, "socket_connect")?;
     attach_lsm(&mut bpf, &btf, "file_open")?;
     attach_lsm(&mut bpf, &btf, "bprm_check_security")?;
     attach_tracepoint(
@@ -134,6 +149,9 @@ async fn main() -> Result<()> {
         config_map
             .set(0, args.mode.as_u32(), 0)
             .context("setting CONFIG[0] = mode")?;
+        config_map
+            .set(1, u32::from(args.mark_localhost), 0)
+            .context("setting CONFIG[1] = mark_localhost")?;
     }
 
     let events_map = bpf

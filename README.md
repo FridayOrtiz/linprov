@@ -11,7 +11,7 @@ Three sleepable BPF LSM hooks plus one cleanup tracepoint:
 
 | Hook | What it does |
 |---|---|
-| `socket_post_create` | First time a PID creates an `AF_INET`/`AF_INET6` socket, mark the PID as network-touched in an LRU hash map. |
+| `socket_connect` | When a PID `connect()`s to a non-loopback `AF_INET`/`AF_INET6` address, mark the PID as network-touched in an LRU hash map. Loopback connects (`127.0.0.0/8`, `::1`) are skipped by default — pass `--mark-localhost` or `LINPROV_MARK_LOCALHOST=1` to include them (e.g. for the smoke tests, which use a local HTTP server). |
 | `file_open` | If the opener is network-touched and the file is opened for write, write the OriginRecord into a `BPF_MAP_TYPE_INODE_STORAGE` map keyed on the file's inode, and emit a ringbuf event with the path. |
 | `bprm_check_security` | On every exec, look the inode up in INODE_MARKS first; if absent, fall back to the `bpf_get_file_xattr` kfunc. If either source has the mark, emit a ringbuf event — and in enforce mode, return `-EPERM` for paths not on the allowlist. |
 | `sched_process_exit` (tracepoint) | Reap the network-touched PID entry on task teardown. |

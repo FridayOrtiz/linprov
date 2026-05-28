@@ -37,7 +37,7 @@ use aya_ebpf::{
     cty::{c_char, c_void},
     helpers::{
         bpf_dynptr_from_mem, bpf_get_current_comm, bpf_get_current_pid_tgid,
-        bpf_get_current_uid_gid, bpf_ktime_get_boot_ns,
+        bpf_get_current_uid_gid, bpf_ktime_get_boot_ns, bpf_probe_read_kernel,
     },
     macros::{btf_map, lsm, map, tracepoint},
     maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
@@ -163,10 +163,16 @@ static SCRATCH: PerCpuArray<OriginRecord> = PerCpuArray::with_max_entries(2, 0);
 const SCRATCH_FILE_OPEN: u32 = 0;
 const SCRATCH_BPRM: u32 = 1;
 
-/// Runtime mode set by userspace before attach. Index 0 holds a value from
-/// the `MODE_*` constants in `linprov_common`.
+/// Runtime config set by userspace before attach.
+///   Index 0: a value from the `MODE_*` constants in `linprov_common`.
+///   Index 1: non-zero to mark PIDs that connect to a loopback address
+///            (default is to skip loopback so local dev / package
+///            mirrors on 127.0.0.1 don't litter the allowlist).
 #[map]
-static CONFIG: Array<u32> = Array::with_max_entries(1, 0);
+static CONFIG: Array<u32> = Array::with_max_entries(2, 0);
+
+const CONFIG_MODE: u32 = 0;
+const CONFIG_MARK_LOCALHOST: u32 = 1;
 
 // ------ Allowlist rules. One slot per rule; each rule is an AND of
 // (dim, value) conditions. Rules OR together (first fully-matching rule
@@ -190,14 +196,99 @@ fn current_comm() -> [u8; 16] {
     bpf_get_current_comm().unwrap_or([0u8; 16])
 }
 
-/// security_socket_post_create(struct socket *sock, int family, int type,
-///                             int protocol, int kern).
-#[lsm(hook = "socket_post_create", sleepable)]
-pub fn socket_post_create(ctx: LsmContext) -> i32 {
-    let family: i32 = unsafe { ctx.arg(1) };
-    if family != AF_INET && family != AF_INET6 {
+// sockaddr layout, family-specific. We only need the address bytes —
+// port / flow / scope are uninteresting.
+
+#[repr(C)]
+struct KernelSockAddr {
+    sa_family: u16,
+    _data: [u8; 14],
+}
+
+#[repr(C)]
+struct KernelSockAddrIn {
+    sin_family: u16,
+    _sin_port: u16,
+    /// Stored network byte order. On little-endian BPF target the low
+    /// byte of the host-loaded u32 is the first BE byte (i.e. the `127`
+    /// in `127.x.y.z`).
+    sin_addr: u32,
+    _sin_zero: [u8; 8],
+}
+
+#[repr(C)]
+struct KernelSockAddrIn6 {
+    sin6_family: u16,
+    _sin6_port: u16,
+    _sin6_flowinfo: u32,
+    sin6_addr: [u8; 16],
+    _sin6_scope_id: u32,
+}
+
+#[inline(always)]
+fn is_v4_loopback(addr: *const KernelSockAddrIn) -> bool {
+    // 127.0.0.0/8 — first BE byte is 127. sin_addr at offset 4 is
+    // within `struct sockaddr`'s 16-byte verifier window, so a
+    // direct read is fine.
+    let v = unsafe { (*addr).sin_addr };
+    (v & 0xff) == 127
+}
+
+#[inline(always)]
+fn is_v6_loopback(addr: *const KernelSockAddrIn6) -> bool {
+    // sin6_addr starts at offset 8 and is 16 bytes long, which puts
+    // the tail at offset 24 — past the verifier-enforced
+    // `struct sockaddr` window. Use bpf_probe_read_kernel to grab
+    // the bytes into an on-stack buffer.
+    let src = unsafe { &(*addr).sin6_addr } as *const [u8; 16];
+    let bytes: [u8; 16] = match unsafe { bpf_probe_read_kernel(src) } {
+        Ok(b) => b,
+        Err(_) => return false,
+    };
+    let mut ok = bytes[15] == 1;
+    for i in 0..15 {
+        if bytes[i] != 0 {
+            ok = false;
+        }
+    }
+    ok
+}
+
+/// security_socket_connect(struct socket *sock, struct sockaddr *address,
+///                         int addrlen).
+///
+/// Marks the PID as network-touched when it connects to a non-loopback
+/// address. Loopback connects (`127.0.0.0/8`, `::1`) are ignored by
+/// default — flip `CONFIG[CONFIG_MARK_LOCALHOST]` to non-zero to
+/// include them (e.g. for the smoke tests that download from a local
+/// python `http.server`).
+#[lsm(hook = "socket_connect", sleepable)]
+pub fn socket_connect(ctx: LsmContext) -> i32 {
+    let retval: i32 = unsafe { ctx.arg(3) };
+    if retval != 0 {
+        return retval;
+    }
+
+    let addr_ptr: *const KernelSockAddr = unsafe { ctx.arg(1) };
+    if addr_ptr.is_null() {
         return 0;
     }
+    let family = unsafe { (*addr_ptr).sa_family } as i32;
+
+    let mark_localhost = CONFIG.get(CONFIG_MARK_LOCALHOST).copied().unwrap_or(0) != 0;
+
+    let is_loopback = if family == AF_INET {
+        is_v4_loopback(addr_ptr as *const KernelSockAddrIn)
+    } else if family == AF_INET6 {
+        is_v6_loopback(addr_ptr as *const KernelSockAddrIn6)
+    } else {
+        return 0; // not an internet family — ignore
+    };
+
+    if is_loopback && !mark_localhost {
+        return 0;
+    }
+
     let _ = NET_PIDS.insert(&current_pid(), &1u8, 0);
     0
 }

@@ -89,7 +89,11 @@ start_daemon() {
     fi
     args+=("$@")
 
-    setsid sudo "$LINPROV_BIN" "${args[@]}" > "$logfile" 2>&1 < /dev/null &
+    # The smoke server runs on 127.0.0.1, which the daemon ignores by
+    # default. Flip mark-localhost on so the test fetches actually
+    # produce marks.
+    setsid sudo LINPROV_MARK_LOCALHOST=1 "$LINPROV_BIN" "${args[@]}" \
+        > "$logfile" 2>&1 < /dev/null &
     sleep 3
     if ! grep -q 'linprov running' "$logfile"; then
         echo "daemon failed to start"
