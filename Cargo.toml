@@ -13,7 +13,8 @@ members = [
 default-members = ["linprov"]
 
 [workspace.package]
-version = "0.1.0"
+# Versions are NOT inherited; each crate owns its own `version` so they
+# can move independently. See CONTRIBUTING.md for bumping policy.
 edition = "2021"
 authors = ["Friday Ortiz <friday@ortiz.sh>"]
 license = "MIT OR Apache-2.0"
