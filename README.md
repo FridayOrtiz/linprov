@@ -68,11 +68,11 @@ Install from a git checkout works today:
 cargo install --git https://github.com/FridayOrtiz/linprov linprov
 ```
 
-`cargo install linprov` (from crates.io) needs one more step:
-publishing the renamed aya fork. See `PUBLISHING.md` for the
-checklist; once that's done, plain `cargo install linprov` is
-self-contained (the linprov tarball ships the BPF source, the
-`rust-toolchain.toml`, and everything else build.rs needs).
+`cargo install linprov` from crates.io is blocked on publishing the
+renamed aya fork (`aya-friday-*`). Once those crates land, plain
+`cargo install linprov` is self-contained — the linprov tarball ships
+the BPF source, the `rust-toolchain.toml`, and everything else
+`build.rs` needs.
 
 ## Tests
 
