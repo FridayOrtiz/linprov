@@ -35,9 +35,13 @@ pub const PATH_LEN: usize = 256;
 pub const CREATOR_PATH_LEN: usize = 256;
 
 /// Max path length the BPF FNV walks inspect (one for `target_filename`,
-/// one for `landing_filename`). Rules whose path-shaped values exceed
-/// this can't possibly match — userspace rejects them at parse time.
-pub const PATH_HASH_SCAN_LEN: usize = 64;
+/// one for `landing_filename`, plus the folder-match walk). Bounded
+/// by the verifier's 1M-insn budget across `MAX_RULES` walks × per-
+/// rule per-dim scans. Linux paths can run to `PATH_MAX` (4096); for
+/// path-shaped rule values that exceed this scan length, soak
+/// truncates to a `/`-aligned ancestor (with a safety floor to keep
+/// rules from collapsing into the filesystem root).
+pub const PATH_HASH_SCAN_LEN: usize = 80;
 
 /// Max number of `/`-separated ancestor hashes we collect per filename
 /// for folder-rule matching. Each represents one ancestor directory

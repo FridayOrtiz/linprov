@@ -365,9 +365,9 @@ impl Soak {
         for d in &self.dims {
             let val: Option<String> = match d {
                 Dim::TargetFilename => non_empty(ctx.target_filename),
-                Dim::TargetFolder => folder_of(ctx.target_filename),
+                Dim::TargetFolder => folder_value_for_soak(ctx.target_filename, "target_folder"),
                 Dim::LandingFilename => non_empty(ctx.landing_filename),
-                Dim::LandingFolder => folder_of(ctx.landing_filename),
+                Dim::LandingFolder => folder_value_for_soak(ctx.landing_filename, "landing_folder"),
                 Dim::CreatorProcess => non_empty(ctx.creator_path),
                 Dim::CreatorComm => non_empty(ctx.creator_comm),
                 Dim::CreatorUid => Some(ctx.creator_uid.to_string()),
@@ -401,6 +401,74 @@ fn non_empty(s: &str) -> Option<String> {
         None
     } else {
         Some(s.to_string())
+    }
+}
+
+/// Compute the soak value for a folder dim from the event's filename.
+///
+/// Returns the immediate parent folder when it fits within
+/// `PATH_HASH_SCAN_LEN`. If the parent is too long for the BPF FNV
+/// budget, walks up to a `/`-aligned ancestor that *does* fit, with a
+/// safety floor of [`SOAK_FOLDER_MIN_COMPONENTS`] non-empty path
+/// components so that no truncation can ever collapse a rule down to
+/// `/`, `/home/`, `/usr/`, `/tmp/`, etc. — broad-strokes paths that'd
+/// punch giant holes in enforce mode.
+///
+/// Logs a warning at each truncation so the user can see in the soak
+/// output that a rule was broadened from its source path, and a
+/// warning when no ancestor satisfies the floor (rule is dropped).
+fn folder_value_for_soak(filename: &str, dim_key: &str) -> Option<String> {
+    let parent = folder_of(filename)?;
+    if parent.len() <= PATH_HASH_SCAN_LEN {
+        return Some(parent);
+    }
+    match truncate_folder_to_fit(&parent, PATH_HASH_SCAN_LEN, SOAK_FOLDER_MIN_COMPONENTS) {
+        Some(t) => {
+            log::warn!(
+                "soak: {dim_key} `{parent}` exceeds BPF scan length ({} > {}); \
+                 truncated to `{t}`",
+                parent.len(),
+                PATH_HASH_SCAN_LEN
+            );
+            Some(t)
+        }
+        None => {
+            log::warn!(
+                "soak: {dim_key} `{parent}` too long ({}> {}) and no `/`-aligned \
+                 ancestor with >= {SOAK_FOLDER_MIN_COMPONENTS} components fits — \
+                 skipping",
+                parent.len(),
+                PATH_HASH_SCAN_LEN
+            );
+            None
+        }
+    }
+}
+
+/// Floor for [`folder_value_for_soak`] truncation. Any truncated
+/// ancestor must have at least this many non-empty path components,
+/// so the broadest rule soak can ever auto-emit is `/a/b/c/`. Tunable
+/// constant rather than a flag because the security argument is the
+/// same on every host.
+const SOAK_FOLDER_MIN_COMPONENTS: usize = 3;
+
+/// Walks up `/`-aligned ancestors of `path` until one fits in
+/// `max_len`. Returns `None` if no ancestor with at least
+/// `min_components` non-empty path segments fits. `path` is expected
+/// to already end in `/`.
+fn truncate_folder_to_fit(path: &str, max_len: usize, min_components: usize) -> Option<String> {
+    let mut p = path.trim_end_matches('/');
+    loop {
+        let idx = p.rfind('/')?;
+        p = &p[..idx];
+        let candidate = format!("{p}/");
+        let n = candidate.split('/').filter(|c| !c.is_empty()).count();
+        if n < min_components {
+            return None;
+        }
+        if candidate.len() <= max_len {
+            return Some(candidate);
+        }
     }
 }
 
@@ -506,6 +574,41 @@ mod tests {
         // The canonical form re-parses identically.
         let r2 = RuleSpec::parse(&line).unwrap();
         assert_eq!(r2.to_line(), line);
+    }
+
+    #[test]
+    fn truncate_fits_immediate_parent() {
+        let p = "/a/b/c/d/";
+        let t = truncate_folder_to_fit(p, 9, 1).unwrap();
+        // p.len() == 9, fits as-is via short-circuit caller, but
+        // `truncate_folder_to_fit` always walks at least one level.
+        assert_eq!(t, "/a/b/c/");
+    }
+
+    #[test]
+    fn truncate_walks_up_until_under_limit() {
+        // 20 bytes; 12 fits at /xx/yy/zz/.
+        let p = "/xx/yy/zz/longest/";
+        let t = truncate_folder_to_fit(p, 12, 3).unwrap();
+        assert_eq!(t, "/xx/yy/zz/");
+    }
+
+    #[test]
+    fn truncate_refuses_below_min_components() {
+        // Floor of 3 components blocks a collapse to `/home/user/`.
+        let p = "/home/user/some/extremely/deep/path/that/wont/fit/";
+        // max_len picks a value where only `/home/user/` would fit.
+        let max = "/home/user/".len();
+        let t = truncate_folder_to_fit(p, max, 3);
+        assert!(t.is_none(), "expected refusal, got {t:?}");
+    }
+
+    #[test]
+    fn truncate_returns_none_for_root_only() {
+        // Can never produce just `/`.
+        let p = "/a/";
+        let t = truncate_folder_to_fit(p, 0, 1);
+        assert!(t.is_none(), "expected None, got {t:?}");
     }
 
     #[test]

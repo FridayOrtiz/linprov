@@ -448,7 +448,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "linprov"
-version = "0.2.4"
+version = "0.2.5"
 dependencies = [
  "anyhow",
  "aya-friday",
@@ -468,14 +468,14 @@ dependencies = [
 
 [[package]]
 name = "linprov-common"
-version = "0.1.0"
+version = "0.1.1"
 dependencies = [
  "bytemuck",
 ]
 
 [[package]]
 name = "linprov-ebpf"
-version = "0.2.0"
+version = "0.2.1"
 dependencies = [
  "aya-friday-ebpf",
  "linprov-common",
