@@ -12,9 +12,9 @@ env:
   RUSTFLAGS: "-D warnings"
 
 jobs:
-  # Fast path: lint, format, and run the unit tests against the userspace
-  # crates. The BPF crate is a nested package (linprov/ebpf), not a
-  # workspace member, so `--workspace` here naturally skips it.
+  # `cargo clippy` / `cargo test` on linprov triggers its build.rs, which
+  # cross-builds linprov-ebpf for the bpfel target via bpf-linker. So
+  # bpf-linker has to be installed even for the lint job.
   lint-and-test:
     name: fmt / clippy / test
     runs-on: ubuntu-latest
@@ -30,18 +30,34 @@ jobs:
         with:
           cache-on-failure: true
 
+      - name: Install bpf-linker
+        run: cargo install --locked bpf-linker
+
       - name: cargo fmt --check
         run: cargo fmt --all -- --check
 
-      - name: cargo clippy
+      - name: cargo clippy (host)
         run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # The workspace clippy only checks linprov-ebpf's lib stub for the
+      # host; `src/main.rs` is gated by `required-features = ["bpf-build"]`.
+      # Run it explicitly against the bpfel target so warnings in the BPF
+      # program fail CI too.
+      - name: cargo clippy (linprov-ebpf, bpfel target)
+        run: >
+          cargo clippy -p linprov-ebpf
+          --target bpfel-unknown-none
+          -Zbuild-std=core
+          --features bpf-build
+          --bin linprov-ebpf
+          -- -D warnings
 
       - name: cargo test
         run: cargo test --workspace
 
-  # Build the full daemon (userspace + nested BPF object) to catch
-  # regressions on the bpfel target. Slower because bpf-linker has to be
-  # installed from source; gated to push/main + PR so it runs less often.
+  # Belt-and-suspenders build job. Same toolchain, separate cache. If
+  # lint-and-test passes but the full build trips something
+  # release-profile-only, this catches it.
   build-daemon:
     name: build daemon (incl. BPF)
     runs-on: ubuntu-latest
@@ -56,8 +72,6 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           cache-on-failure: true
-          # Separate cache key so the userspace job's cache doesn't get
-          # invalidated by bpf-linker compilation.
           key: build-daemon
 
       - name: Install bpf-linker

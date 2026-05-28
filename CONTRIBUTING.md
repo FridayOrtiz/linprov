@@ -37,10 +37,18 @@ You can skip any crate that hasn't moved version since its last publish — crat
 ## Dev workflow
 
 ```sh
-# Format, lint, unit tests on every change:
-cargo fmt --all
+# Format + host-target clippy + unit tests (CI parity, fast):
+cargo fmt --all -- --check
 cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
+
+# Clippy linprov-ebpf for the BPF target — the host clippy only covers
+# the lib stub because src/main.rs is `required-features = ["bpf-build"]`.
+# Run this before pushing too; warnings in the BPF program need to fail
+# CI explicitly:
+cargo clippy -p linprov-ebpf \
+    --target bpfel-unknown-none -Zbuild-std=core \
+    --features bpf-build --bin linprov-ebpf -- -D warnings
 
 # Full daemon attach + behavior — needs root + kernel ≥ 6.5 with BPF LSM
 # active. See tests/README.md.

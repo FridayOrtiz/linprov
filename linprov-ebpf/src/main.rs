@@ -40,7 +40,7 @@ use aya_ebpf::{
         bpf_get_current_uid_gid, bpf_ktime_get_boot_ns, bpf_probe_read_kernel,
     },
     macros::{btf_map, lsm, map, tracepoint},
-    maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
+    maps::{Array, LruHashMap, PerCpuArray, RingBuf},
     programs::{LsmContext, TracePointContext},
 };
 use linprov_common::{
@@ -246,8 +246,8 @@ fn is_v6_loopback(addr: *const KernelSockAddrIn6) -> bool {
         Err(_) => return false,
     };
     let mut ok = bytes[15] == 1;
-    for i in 0..15 {
-        if bytes[i] != 0 {
+    for &b in bytes.iter().take(15) {
+        if b != 0 {
             ok = false;
         }
     }
@@ -264,12 +264,12 @@ fn is_v6_loopback(addr: *const KernelSockAddrIn6) -> bool {
 /// python `http.server`).
 #[lsm(hook = "socket_connect", sleepable)]
 pub fn socket_connect(ctx: LsmContext) -> i32 {
-    let retval: i32 = unsafe { ctx.arg(3) };
+    let retval: i32 = ctx.arg(3);
     if retval != 0 {
         return retval;
     }
 
-    let addr_ptr: *const KernelSockAddr = unsafe { ctx.arg(1) };
+    let addr_ptr: *const KernelSockAddr = ctx.arg(1);
     if addr_ptr.is_null() {
         return 0;
     }
@@ -289,7 +289,7 @@ pub fn socket_connect(ctx: LsmContext) -> i32 {
         return 0;
     }
 
-    let _ = NET_PIDS.insert(&current_pid(), &1u8, 0);
+    let _ = NET_PIDS.insert(current_pid(), 1u8, 0);
     0
 }
 
@@ -302,11 +302,11 @@ pub fn socket_connect(ctx: LsmContext) -> i32 {
 #[lsm(hook = "file_open", sleepable)]
 pub fn file_open(ctx: LsmContext) -> i32 {
     let pid = current_pid();
-    if unsafe { NET_PIDS.get(&pid) }.is_none() {
+    if unsafe { NET_PIDS.get(pid) }.is_none() {
         return 0;
     }
 
-    let file_ptr: *const KernelFile = unsafe { ctx.arg(0) };
+    let file_ptr: *const KernelFile = ctx.arg(0);
     if file_ptr.is_null() {
         return 0;
     }
@@ -362,12 +362,12 @@ pub fn file_open(ctx: LsmContext) -> i32 {
 /// exec that landlock/apparmor blocked.
 #[lsm(hook = "bprm_check_security", sleepable)]
 pub fn bprm_check_security(ctx: LsmContext) -> i32 {
-    let retval: i32 = unsafe { ctx.arg(1) };
+    let retval: i32 = ctx.arg(1);
     if retval != 0 {
         return retval;
     }
 
-    let bprm_ptr: *const KernelLinuxBinprm = unsafe { ctx.arg(0) };
+    let bprm_ptr: *const KernelLinuxBinprm = ctx.arg(0);
     if bprm_ptr.is_null() {
         return 0;
     }
@@ -469,7 +469,7 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
         );
     }
 
-    let mode = CONFIG.get(0).copied().unwrap_or(0);
+    let mode = CONFIG.get(CONFIG_MODE).copied().unwrap_or(0);
     let permit = if mode == MODE_ENFORCE {
         unsafe { check_allowlist(&(*p).filename, &(*p).origin) }
     } else {
@@ -578,12 +578,11 @@ unsafe fn check_allowlist(filename: &[u8; PATH_LEN], origin: &OriginRecord) -> b
         if (f & dim::CREATOR_COMM) != 0 && !comm_eq(&rule.creator_comm, &origin.comm) {
             continue;
         }
-        if (f & dim::CREATOR_PROCESS) != 0 {
-            if origin.creator_path[0] == 0
-                || fnv_full(origin.creator_path.as_ptr()) != rule.creator_process_hash
-            {
-                continue;
-            }
+        if (f & dim::CREATOR_PROCESS) != 0
+            && (origin.creator_path[0] == 0
+                || fnv_full(origin.creator_path.as_ptr()) != rule.creator_process_hash)
+        {
+            continue;
         }
         if (f & dim::TARGET_FILENAME) != 0
             && fnv_full(filename.as_ptr()) != rule.target_filename_hash
@@ -651,7 +650,7 @@ fn emit_event(
 
 #[tracepoint]
 pub fn sched_process_exit(_ctx: TracePointContext) -> u32 {
-    let _ = NET_PIDS.remove(&current_pid());
+    let _ = NET_PIDS.remove(current_pid());
     0
 }
 
