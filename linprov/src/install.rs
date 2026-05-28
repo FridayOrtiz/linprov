@@ -6,6 +6,8 @@
 //! `setup` and `upgrade` both call into here.
 
 use std::{
+    env,
+    ffi::{CStr, CString},
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
@@ -70,6 +72,167 @@ fn dest_matches_running(src: &Path, dest: &Path) -> bool {
 /// with a useful error.
 pub fn current_exe() -> Result<PathBuf> {
     std::env::current_exe().context("locating the running linprov binary")
+}
+
+/// Best-effort: find the freshly `cargo install`-ed binary in
+/// somebody's `~/.cargo/bin/linprov`.
+///
+/// `linprov upgrade` typically runs under elevated privileges
+/// (`sudo`, `doas`, `pkexec`, `su -`, or just logged in as root),
+/// while the binary the user just installed lives in their *user*
+/// home. We try a chain of heuristics to find that home, in order
+/// of decreasing confidence:
+///   1. `$SUDO_USER` / `$DOAS_USER` env vars
+///   2. `$PKEXEC_UID` → username
+///   3. `logname(1)` — reads the controlling terminal's login user
+///      (works for `su` regardless of `-`)
+///   4. The effective UID's own home dir — covers the "root logged
+///      in directly and `cargo install`-ed as root" case
+///   5. Scanning /etc/passwd for human users (UID 1000–65533) with
+///      `~/.cargo/bin/linprov`; only matches if there's *exactly
+///      one*, otherwise we'd guess wrong on multi-user hosts
+///
+/// Returns `None` if every candidate path is missing. Callers should
+/// fall through to a `--source <path>` override or surface a hard
+/// error.
+pub fn cargo_install_source() -> Option<PathBuf> {
+    for user in candidate_users() {
+        if let Some(p) = cargo_bin_for_user(&user) {
+            return Some(p);
+        }
+    }
+    // EUID's own home — typically `/root/.cargo/bin/linprov` for the
+    // "su then cargo install then upgrade" flow.
+    let euid = unsafe { libc::geteuid() };
+    if let Some(home) = home_dir_for_uid(euid) {
+        let p = home.join(".cargo").join("bin").join("linprov");
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    scan_human_homes_for_cargo_bin()
+}
+
+/// Username candidates from env vars + `logname`. Skips "root" since
+/// we want the *invoker*, not the elevated identity.
+fn candidate_users() -> Vec<String> {
+    let mut v = Vec::new();
+    let mut push = |s: String| {
+        if !s.is_empty() && s != "root" && !v.contains(&s) {
+            v.push(s);
+        }
+    };
+    if let Ok(u) = env::var("SUDO_USER") {
+        push(u);
+    }
+    if let Ok(u) = env::var("DOAS_USER") {
+        push(u);
+    }
+    if let Ok(uid_str) = env::var("PKEXEC_UID") {
+        if let Ok(uid) = uid_str.parse::<u32>() {
+            if let Some(u) = username_for_uid(uid) {
+                push(u);
+            }
+        }
+    }
+    if let Some(u) = run_logname() {
+        push(u);
+    }
+    v
+}
+
+fn cargo_bin_for_user(user: &str) -> Option<PathBuf> {
+    let home = home_dir_for(user)?;
+    let p = home.join(".cargo").join("bin").join("linprov");
+    p.exists().then_some(p)
+}
+
+/// `logname(1)` resolves the login user from the controlling
+/// terminal's utmp entry. Survives `su` (with or without `-`), fails
+/// gracefully when there's no controlling tty.
+fn run_logname() -> Option<String> {
+    let out = Command::new("/usr/bin/logname").output().ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let s = String::from_utf8(out.stdout).ok()?;
+    let t = s.trim();
+    if t.is_empty() {
+        None
+    } else {
+        Some(t.to_string())
+    }
+}
+
+/// Last-resort scan: walk /etc/passwd, find human users (UID
+/// 1000–65533) with a `~/.cargo/bin/linprov`, return the path *only
+/// if there's exactly one candidate*. Multiple matches → bail, since
+/// we'd be guessing whose binary the user actually wants.
+fn scan_human_homes_for_cargo_bin() -> Option<PathBuf> {
+    let content = fs::read_to_string("/etc/passwd").ok()?;
+    let candidates: Vec<PathBuf> = content
+        .lines()
+        .filter_map(|line| {
+            let parts: Vec<&str> = line.split(':').collect();
+            if parts.len() < 6 {
+                return None;
+            }
+            let uid: u32 = parts[2].parse().ok()?;
+            if !(1000..65534).contains(&uid) {
+                return None;
+            }
+            let p = PathBuf::from(parts[5]).join(".cargo/bin/linprov");
+            p.exists().then_some(p)
+        })
+        .collect();
+    if candidates.len() == 1 {
+        candidates.into_iter().next()
+    } else {
+        None
+    }
+}
+
+/// `getpwnam`-based home dir lookup. Single-threaded callers only.
+fn home_dir_for(user: &str) -> Option<PathBuf> {
+    let cname = CString::new(user).ok()?;
+    // SAFETY: `getpwnam` returns a pointer to a static buffer; we
+    // copy the home-dir string before returning, and linprov is
+    // single-threaded at this point in `upgrade::run`, so no other
+    // thread can race with us through the static buffer.
+    let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
+    pw_home(pw)
+}
+
+fn home_dir_for_uid(uid: libc::uid_t) -> Option<PathBuf> {
+    // SAFETY: same caveats as `getpwnam` above.
+    let pw = unsafe { libc::getpwuid(uid) };
+    pw_home(pw)
+}
+
+fn username_for_uid(uid: u32) -> Option<String> {
+    // SAFETY: same caveats as `getpwnam` above.
+    let pw = unsafe { libc::getpwuid(uid as libc::uid_t) };
+    if pw.is_null() {
+        return None;
+    }
+    let n = unsafe { (*pw).pw_name };
+    if n.is_null() {
+        return None;
+    }
+    let cstr = unsafe { CStr::from_ptr(n) };
+    cstr.to_str().ok().map(String::from)
+}
+
+fn pw_home(pw: *mut libc::passwd) -> Option<PathBuf> {
+    if pw.is_null() {
+        return None;
+    }
+    let dir = unsafe { (*pw).pw_dir };
+    if dir.is_null() {
+        return None;
+    }
+    let cstr = unsafe { CStr::from_ptr(dir) };
+    Some(PathBuf::from(cstr.to_str().ok()?))
 }
 
 /// Refuse to install over a binary that's owned by the distro package

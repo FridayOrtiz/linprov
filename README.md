@@ -154,14 +154,21 @@ After `cargo install --force linprov` drops a new binary in
 `~/.cargo/bin/`:
 
 ```
-sudo $(which linprov) upgrade
+sudo linprov upgrade
 ```
 
-`$(which linprov)` is the freshly-installed binary in `~/.cargo/bin/`
-— `upgrade` copies its own bytes over `/usr/local/bin/linprov`, then
-runs `systemctl daemon-reload` + `systemctl restart linprov.service`.
-Warns if the unit's `ExecStart` doesn't match the install path (re-run
-`sudo $(which linprov) setup --force` to rewrite it).
+The running binary is `/usr/local/bin/linprov` (an *old* version);
+`upgrade` resolves your `~/.cargo/bin/linprov` automatically — via
+`$SUDO_USER` / `$DOAS_USER` / `$PKEXEC_UID` / `logname` / euid's home,
+falling back to a unique-match scan of `/etc/passwd` — then copies it
+over `/usr/local/bin/linprov` and runs `systemctl daemon-reload` +
+`systemctl restart linprov.service`. If autodetect fails (multi-user
+host, weird shell setup), point it explicitly: `sudo linprov upgrade
+--source /path/to/new/linprov`.
+
+If the source already matches the install path byte-for-byte,
+`upgrade` reports it and skips the restart instead of bouncing the
+daemon for nothing.
 
 ### `linprov run` reference
 
