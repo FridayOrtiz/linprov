@@ -1,0 +1,48 @@
+[package]
+name = "linprov-ebpf"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+description = "BPF LSM programs for the linprov daemon. Source crate consumed by `linprov`'s build.rs to produce the in-kernel object; Dual MIT/GPL kernel-side, MIT OR Apache-2.0 source."
+rust-version.workspace = true
+
+# Trivial host-buildable lib so `linprov` can declare us as a
+# `[build-dependencies]` entry — that's what makes cargo download our
+# source into the registry cache on `cargo install linprov`. The lib
+# exposes `SOURCE_DIR` (= `CARGO_MANIFEST_DIR`) so linprov's build.rs
+# can find the on-disk source dir without needing cargo_metadata.
+[lib]
+name = "linprov_ebpf"
+path = "src/lib.rs"
+
+# The actual BPF program. `required-features` keeps it from being
+# compiled when this crate is built for the host as a build-dep —
+# nested cargo invocations from linprov's build.rs pass the feature
+# (along with `--target bpfel-unknown-none`) so the bin is produced.
+[[bin]]
+name = "linprov-ebpf"
+path = "src/main.rs"
+required-features = ["bpf-build"]
+
+[features]
+# Internal: only set by linprov's build.rs when compiling the BPF
+# object. Don't enable manually.
+bpf-build = []
+
+[dependencies]
+linprov-common = { workspace = true }
+
+# BPF-only deps. The cfg target_arch="bpf" guard means a host build of
+# this crate (as a build-dep of linprov) doesn't try to resolve or
+# compile aya-ebpf, which is bpfel-only.
+[target.'cfg(target_arch = "bpf")'.dependencies]
+aya-ebpf = { workspace = true }
+
+# NOTE: cargo silently ignores `[profile.*]` blocks here when this
+# crate is a workspace member (which it is, in dev). The workspace
+# root's `[profile.*]` controls the BPF build instead — see the
+# panic=abort / overflow-checks / debug knobs there. We don't repeat
+# them locally to avoid drift / "profile ignored" warnings.

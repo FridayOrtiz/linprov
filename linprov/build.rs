@@ -1,20 +1,18 @@
-//! Build the nested eBPF crate, then embed the resulting object into
-//! the daemon binary.
+//! Build the linprov-ebpf BPF object and embed it into the daemon.
 //!
-//! The eBPF source lives at `linprov/ebpf/`, in the daemon crate's own
-//! directory rather than as a sibling workspace member, so the
-//! published `linprov` tarball is self-contained (`cargo install
-//! linprov` works without needing the wider workspace).
-//!
-//! We invoke a nested `cargo build` for the `bpfel-unknown-none` target
-//! with `-Z build-std=core`, then copy the result into `OUT_DIR` so the
-//! daemon's `include_bytes_aligned!` can pick it up.
+//! linprov-ebpf is a normal crates.io dependency (a `[build-dependencies]`
+//! entry on `linprov`). On `cargo install linprov`, cargo downloads
+//! linprov-ebpf into the registry cache; the lib exposes `SOURCE_DIR`
+//! (`= env!("CARGO_MANIFEST_DIR")`) so we can locate its on-disk source
+//! tree, then run a nested `cargo build --target bpfel-unknown-none
+//! -Z build-std=core --features bpf-build` against it. The resulting
+//! ELF object is copied into `OUT_DIR` so `linprov`'s main binary can
+//! embed it via `include_bytes_aligned!`.
 
 use std::{env, path::PathBuf, process::Command};
 
 fn main() {
-    let manifest_dir = PathBuf::from(env::var("CARGO_MANIFEST_DIR").unwrap());
-    let ebpf_dir = manifest_dir.join("ebpf");
+    let ebpf_dir = PathBuf::from(linprov_ebpf::SOURCE_DIR);
 
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed={}", ebpf_dir.join("src").display());
@@ -43,6 +41,19 @@ fn main() {
         .arg(target)
         .arg("--target-dir")
         .arg(&target_dir)
+        .arg("--features")
+        .arg("bpf-build")
+        .arg("--bin")
+        .arg("linprov-ebpf")
+        // bpf-linker flags. `--btf` emits the `.BTF` section that the
+        // kernel verifier wants for any storage map (inode/sk/task).
+        // `--ignore-inline-never` force-inlines anything LLVM would
+        // otherwise emit as a subprog so BTF FUNC entries don't go
+        // missing on us.
+        .env(
+            "CARGO_TARGET_BPFEL_UNKNOWN_NONE_RUSTFLAGS",
+            "-C link-arg=--btf -C link-arg=--ignore-inline-never",
+        )
         // Detach inherited build-time state that would confuse the
         // nested cargo (separate lockfile, separate target dir).
         // RUSTUP_TOOLCHAIN is intentionally NOT cleared: removing it

@@ -3,9 +3,13 @@ resolver = "2"
 members = [
     "linprov",
     "linprov-common",
+    "linprov-ebpf",
 ]
-# linprov/ebpf is a nested standalone package (built by linprov's
-# build.rs); not a workspace member.
+# `cargo build` from root builds linprov for the host. linprov-ebpf is
+# in `members` for tooling visibility (cargo metadata, rust-analyzer)
+# but is excluded from default-members because it only compiles for the
+# `bpfel-unknown-none` target — linprov's build.rs handles the cross
+# build internally.
 default-members = ["linprov"]
 
 [workspace.package]
@@ -28,6 +32,7 @@ rust-version = "1.85"
 # func_info pruning needed for BPF programs with subprogs that the
 # linker didn't emit FUNC entries for.
 aya = { package = "aya-friday", version = "0.13.2" }
+aya-ebpf = { package = "aya-friday-ebpf", version = "0.1.2" }
 
 anyhow = "1"
 bytemuck = { version = "1", features = ["derive"] }
@@ -48,6 +53,43 @@ xattr = "1"
 
 # Both `path` (for dev) and `version` (for publish) — cargo prefers path
 # when present and silently swaps it for the crates.io version on
-# `cargo publish`. The nested linprov/ebpf package declares the same
-# pair independently (it isn't a workspace member).
+# `cargo publish`. linprov-ebpf is the same shape; linprov consumes it
+# as a `[build-dependencies]` so that on `cargo install linprov`
+# cargo downloads its source into the registry cache, where
+# linprov's build.rs picks it up via `linprov_ebpf::SOURCE_DIR`.
 linprov-common = { path = "linprov-common", version = "0.1.0" }
+linprov-ebpf = { path = "linprov-ebpf", version = "0.1.0" }
+
+# BPF objects need: panic="abort" (no unwinding in kernel), no
+# overflow checks / debug-assertions (the compiler emits `loop {}`
+# bodies on hit, which the verifier rejects), and `debug=2` so the
+# LLVM-BPF backend emits a `.BTF` section. Cargo silently ignores
+# per-package `[profile]` blocks when a crate is a workspace member,
+# so we set these at the workspace-profile level. They also apply to
+# linprov / linprov-common — that's fine, neither needs anything else.
+[profile.dev]
+opt-level = 3
+debug = 2
+debug-assertions = false
+overflow-checks = false
+lto = false
+panic = "abort"
+incremental = false
+codegen-units = 256
+rpath = false
+
+[profile.release]
+opt-level = 3
+debug = false
+debug-assertions = false
+overflow-checks = false
+lto = true
+panic = "abort"
+incremental = false
+codegen-units = 1
+rpath = false
+
+# Reinstate debug for linprov-ebpf only in release so the BPF object
+# still gets `.BTF`.
+[profile.release.package.linprov-ebpf]
+debug = 2

@@ -11,20 +11,6 @@ keywords.workspace = true
 categories.workspace = true
 readme = "../README.md"
 rust-version.workspace = true
-# Ship the nested ebpf source so `cargo install linprov` is
-# self-contained. `target/` is excluded by default; nothing else needs
-# to be hidden from the published tarball.
-include = [
-    "src/**/*",
-    "build.rs",
-    "ebpf/src/**/*",
-    "ebpf/Cargo.toml",
-    "ebpf/.cargo/config.toml",
-    "rust-toolchain.toml",
-    "Cargo.toml",
-    "README.md",
-    "LICENSE-*",
-]
 
 [[bin]]
 name = "linprov"
@@ -43,6 +29,12 @@ tokio.workspace = true
 xattr.workspace = true
 
 linprov-common = { workspace = true, features = ["user"] }
+
+[build-dependencies]
+# Used by build.rs to locate linprov-ebpf's source tree
+# (via `linprov_ebpf::SOURCE_DIR`) and drive the nested
+# `cargo build --target bpfel-unknown-none` for the BPF object.
+linprov-ebpf = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"
