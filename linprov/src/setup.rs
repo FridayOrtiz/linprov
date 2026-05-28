@@ -5,7 +5,7 @@
 //! systemd unit, then prints the next-step commands.
 
 use std::{
-    env, fs,
+    fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
@@ -15,8 +15,11 @@ use clap::Parser;
 use log::{info, warn};
 
 use crate::{
-    config::{DEFAULT_ALLOWLIST_PATH, DEFAULT_CONFIG_PATH, DEFAULT_SYSTEMD_UNIT_PATH},
-    privilege,
+    config::{
+        DEFAULT_ALLOWLIST_PATH, DEFAULT_CONFIG_PATH, DEFAULT_INSTALL_PATH,
+        DEFAULT_SYSTEMD_UNIT_PATH,
+    },
+    install, privilege,
 };
 
 #[derive(Parser, Debug)]
@@ -30,11 +33,19 @@ pub struct SetupArgs {
     #[arg(long, default_value = DEFAULT_ALLOWLIST_PATH)]
     allowlist: PathBuf,
 
-    /// Path to the installed linprov binary. Defaults to the current
-    /// executable (whatever `cargo install` put on `$PATH`); embedded
-    /// into the systemd unit's `ExecStart`.
+    /// System-wide install path for the linprov binary. Copied from
+    /// the currently-running executable on every `setup` / `upgrade`.
+    /// `/usr/local/bin/` is on root's `secure_path` so subsequent
+    /// `sudo linprov ...` invocations work without an absolute path.
+    #[arg(long, default_value = DEFAULT_INSTALL_PATH)]
+    install_path: PathBuf,
+
+    /// Don't copy the binary anywhere — use the currently-running
+    /// executable in place. The systemd unit's `ExecStart` will point
+    /// at wherever this binary already lives, which means `sudo
+    /// linprov` won't work unless that path is on root's `secure_path`.
     #[arg(long)]
-    binary: Option<PathBuf>,
+    no_install: bool,
 
     /// Where to write the systemd unit. `linprov setup --no-systemd`
     /// skips writing the unit altogether.
@@ -56,9 +67,26 @@ pub fn run(args: SetupArgs) -> Result<()> {
     privilege::require_root("linprov setup")?;
     preflight();
 
-    let binary = match args.binary {
-        Some(p) => p,
-        None => env::current_exe().context("locating linprov binary")?,
+    let current = install::current_exe()?;
+    let binary = if args.no_install {
+        current.clone()
+    } else {
+        install::refuse_distro_owned(&args.install_path)?;
+        match install::install_to(&current, &args.install_path)? {
+            install::Outcome::Installed => {
+                info!(
+                    "copied running binary into `{}`",
+                    args.install_path.display()
+                );
+            }
+            install::Outcome::AlreadyCurrent => {
+                info!(
+                    "`{}` already matches the running binary",
+                    args.install_path.display()
+                );
+            }
+        }
+        args.install_path.clone()
     };
 
     write_config(&args.config, &args.allowlist, args.force)?;
@@ -70,6 +98,9 @@ pub fn run(args: SetupArgs) -> Result<()> {
 
     println!();
     println!("linprov is set up.");
+    if !args.no_install {
+        println!("  binary:    {}", binary.display());
+    }
     println!("  config:    {}", args.config.display());
     println!("  allowlist: {}", args.allowlist.display());
     if !args.no_systemd {
@@ -82,6 +113,14 @@ pub fn run(args: SetupArgs) -> Result<()> {
          gets blocked."
     );
     println!();
+    // After a self-install the binary lives in `/usr/local/bin/`,
+    // which is on root's `secure_path`, so `sudo linprov` resolves
+    // without an absolute path. Use that in the next-steps output.
+    let invoke = if args.no_install {
+        binary.display().to_string()
+    } else {
+        "linprov".to_string()
+    };
     println!("  # 1. Run a soak in the foreground. Use your machine normally —");
     println!(
         "  #    every marked execve appends a rule to {}.",
@@ -89,8 +128,7 @@ pub fn run(args: SetupArgs) -> Result<()> {
     );
     println!(
         "  #    `^C` when you're satisfied; the rules persist in the file.\n\
-         \n  sudo {} run --mode soak\n",
-        binary.display()
+         \n  sudo {invoke} run --mode soak\n",
     );
     println!("  # 2. Review the allowlist.");
     println!("  cat {}\n", args.allowlist.display());
@@ -107,11 +145,7 @@ pub fn run(args: SetupArgs) -> Result<()> {
     } else {
         println!();
         println!("  # 4. Run the daemon (whatever supervises it on your system).");
-        println!(
-            "  sudo {} run --config {}",
-            binary.display(),
-            args.config.display()
-        );
+        println!("  sudo {invoke} run --config {}", args.config.display());
     }
     Ok(())
 }

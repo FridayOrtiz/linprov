@@ -1,14 +1,13 @@
-//! `linprov upgrade` — restart the systemd unit after `cargo install
-//! --force linprov` lays down a new binary.
+//! `linprov upgrade` — copy the running binary over the system-wide
+//! install path, reload systemd, restart the daemon.
 //!
-//! Doesn't touch your config or allowlist; just `systemctl daemon-reload`
-//! and `systemctl restart <unit>`. If the new binary's path differs
-//! from the unit's `ExecStart`, we surface that as a warning — the user
-//! should re-run `linprov setup --force --binary <new-path>` to update
-//! the unit.
+//! Expected flow: `cargo install --force linprov` drops a fresh
+//! binary in `~/.cargo/bin/`; the user runs
+//! `sudo $(which linprov) upgrade`, which copies that binary over
+//! `/usr/local/bin/linprov` and bounces the unit.
 
 use std::{
-    env, fs,
+    fs,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -18,8 +17,8 @@ use clap::Parser;
 use log::{info, warn};
 
 use crate::{
-    config::{DEFAULT_SYSTEMD_UNIT_NAME, DEFAULT_SYSTEMD_UNIT_PATH},
-    privilege,
+    config::{DEFAULT_INSTALL_PATH, DEFAULT_SYSTEMD_UNIT_NAME, DEFAULT_SYSTEMD_UNIT_PATH},
+    install, privilege,
 };
 
 #[derive(Parser, Debug)]
@@ -29,11 +28,20 @@ pub struct UpgradeArgs {
     unit: String,
 
     /// Path to the unit file on disk. Inspected to confirm the
-    /// `ExecStart` path still matches the running binary.
+    /// `ExecStart` path still matches the install path.
     #[arg(long, default_value = DEFAULT_SYSTEMD_UNIT_PATH)]
     unit_file: PathBuf,
 
-    /// Don't actually run systemctl; print what would happen.
+    /// System-wide install path; copied from the currently-running
+    /// executable, then systemd is restarted to pick up the new bytes.
+    #[arg(long, default_value = DEFAULT_INSTALL_PATH)]
+    install_path: PathBuf,
+
+    /// Don't copy the binary, just `daemon-reload` + `restart`.
+    #[arg(long)]
+    no_install: bool,
+
+    /// Don't actually run systemctl or copy; print what would happen.
     #[arg(long)]
     dry_run: bool,
 }
@@ -42,11 +50,33 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
     if !args.dry_run {
         privilege::require_root("linprov upgrade")?;
     }
-    check_exec_start_matches(&args.unit_file)?;
+    if !args.no_install {
+        let current = install::current_exe()?;
+        if args.dry_run {
+            println!(
+                "would copy {} -> {}",
+                current.display(),
+                args.install_path.display()
+            );
+        } else {
+            install::refuse_distro_owned(&args.install_path)?;
+            match install::install_to(&current, &args.install_path)? {
+                install::Outcome::Installed => info!(
+                    "refreshed `{}` from the running binary",
+                    args.install_path.display()
+                ),
+                install::Outcome::AlreadyCurrent => info!(
+                    "`{}` already matches the running binary",
+                    args.install_path.display()
+                ),
+            }
+        }
+    }
+    check_exec_start_matches(&args.unit_file, &args.install_path)?;
     systemctl(&args.unit, args.dry_run)
 }
 
-fn check_exec_start_matches(unit_file: &Path) -> Result<()> {
+fn check_exec_start_matches(unit_file: &Path, install_path: &Path) -> Result<()> {
     let unit = match fs::read_to_string(unit_file) {
         Ok(s) => s,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
@@ -76,21 +106,17 @@ fn check_exec_start_matches(unit_file: &Path) -> Result<()> {
     };
 
     let unit_binary = exec_line.split_whitespace().next().unwrap_or("");
-    let current = env::current_exe().context("locating linprov binary")?;
-    if Path::new(unit_binary) != current {
+    if Path::new(unit_binary) != install_path {
         warn!(
-            "unit ExecStart points at `{unit_binary}` but the running \
-             `linprov upgrade` binary is `{}`. After cargo installed a \
-             new binary to a different path, the systemd unit is still \
-             pinned to the old one. Re-run `linprov setup --force \
-             --binary {}` to update.",
-            current.display(),
-            current.display()
+            "unit ExecStart points at `{unit_binary}` but the install \
+             path is `{}`. The unit will keep running the old binary \
+             until you re-run `linprov setup --force` to rewrite it.",
+            install_path.display(),
         );
     } else {
         info!(
-            "ExecStart matches the current binary ({})",
-            current.display()
+            "ExecStart matches the install path ({})",
+            install_path.display()
         );
     }
     Ok(())

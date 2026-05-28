@@ -45,14 +45,22 @@ fn main() {
         .arg("bpf-build")
         .arg("--bin")
         .arg("linprov-ebpf")
-        // bpf-linker flags. `--btf` emits the `.BTF` section that the
-        // kernel verifier wants for any storage map (inode/sk/task).
-        // `--ignore-inline-never` force-inlines anything LLVM would
-        // otherwise emit as a subprog so BTF FUNC entries don't go
-        // missing on us.
+        // `--btf` + `--ignore-inline-never` are bpf-linker flags
+        // (`.BTF` section for any storage map; force-inline subprogs
+        // so BTF FUNC entries stay consistent). The `-C` flags
+        // replicate the workspace's `[profile.release.package.linprov-ebpf]`
+        // — cargo ignores per-package profile blocks for workspace
+        // members AND the workspace profile doesn't apply when
+        // linprov-ebpf is built standalone (which is what happens
+        // under `cargo install linprov`), so we set the load-bearing
+        // bits here: `debuginfo=2` is required for the LLVM-BPF
+        // backend to emit `.BTF`, `panic=abort` because BPF has no
+        // unwinder, `overflow-checks=off` because the panic landing
+        // pads from overflow checks would also need an unwinder.
         .env(
             "CARGO_TARGET_BPFEL_UNKNOWN_NONE_RUSTFLAGS",
-            "-C link-arg=--btf -C link-arg=--ignore-inline-never",
+            "-C link-arg=--btf -C link-arg=--ignore-inline-never \
+             -C debuginfo=2 -C panic=abort -C overflow-checks=off",
         )
         // Detach inherited build-time state that would confuse the
         // nested cargo (separate lockfile, separate target dir).

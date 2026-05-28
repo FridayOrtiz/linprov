@@ -34,6 +34,13 @@ pub const DEFAULT_SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/linprov.service
 /// Default name of the systemd unit (without the file extension).
 pub const DEFAULT_SYSTEMD_UNIT_NAME: &str = "linprov.service";
 
+/// Where `setup` and `upgrade` copy the binary so it lands on root's
+/// `secure_path` (and `sudo linprov ...` works without a leading
+/// absolute path). `/usr/local/bin` is the conventional spot for
+/// admin-installed binaries that aren't managed by the distro package
+/// manager.
+pub const DEFAULT_INSTALL_PATH: &str = "/usr/local/bin/linprov";
+
 /// Shape of the on-disk TOML config. All fields are optional so users
 /// can opt into things piecewise.
 #[derive(Debug, Default, Deserialize)]

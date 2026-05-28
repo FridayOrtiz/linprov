@@ -54,12 +54,18 @@ doesn't care which fired.
 ## Install
 
 ```
+cargo install bpf-linker
 cargo install linprov
+sudo $(which linprov) setup
 ```
 
-Needs `bpf-linker` available on the host (`cargo install bpf-linker`).
-Uses an aya fork published as `aya-friday-*` on crates.io — pulled in
-automatically as a regular dependency.
+`cargo install` drops the binary in `~/.cargo/bin/`, which isn't on
+root's `secure_path` — that's why the first invocation needs the
+absolute path. `linprov setup` immediately copies itself to
+`/usr/local/bin/linprov`, so every later `sudo linprov ...` (and
+`linprov upgrade`) resolves without help. Uses an aya fork published
+as `aya-friday-*` on crates.io — pulled in automatically as a regular
+dependency.
 
 ## Build from source
 
@@ -86,14 +92,18 @@ end-to-end flow is **setup → soak → review → enforce**.
 ### 1. `linprov setup`
 
 Feature-checks the kernel (≥ 6.5, `bpf` in active `lsm=`, `vmlinux`
-BTF), writes a commented `/etc/linprov/config.toml`, an empty
-allowlist at `/etc/linprov/list.allow`, and a systemd unit (writes
-only — doesn't enable). The config it writes starts in
-`mode = "observe"`; don't enable the unit yet.
+BTF), copies the running binary to `/usr/local/bin/linprov`, writes a
+commented `/etc/linprov/config.toml`, an empty allowlist at
+`/etc/linprov/list.allow`, and a systemd unit (writes only — doesn't
+enable). The config it writes starts in `mode = "observe"`; don't
+enable the unit yet.
 
 ```
-sudo linprov setup
+sudo $(which linprov) setup    # first time only; sudo can't find ~/.cargo/bin
 ```
+
+After this, the binary's at `/usr/local/bin/linprov` (on root's
+`secure_path`), so `sudo linprov ...` works from anywhere.
 
 ### 2. Soak interactively to build an allowlist
 
@@ -140,17 +150,18 @@ A marked execve that doesn't match any rule now gets blocked with
 
 ### `linprov upgrade`
 
-After `cargo install --force linprov` drops a new binary, restart the
-running daemon:
+After `cargo install --force linprov` drops a new binary in
+`~/.cargo/bin/`:
 
 ```
-sudo linprov upgrade
+sudo $(which linprov) upgrade
 ```
 
-Runs `systemctl daemon-reload` + `systemctl restart linprov.service`.
-Warns if the unit's `ExecStart` doesn't match the binary you just
-installed (in which case re-run `linprov setup --force --binary
-<path>` to point it at the new location).
+`$(which linprov)` is the freshly-installed binary in `~/.cargo/bin/`
+— `upgrade` copies its own bytes over `/usr/local/bin/linprov`, then
+runs `systemctl daemon-reload` + `systemctl restart linprov.service`.
+Warns if the unit's `ExecStart` doesn't match the install path (re-run
+`sudo $(which linprov) setup --force` to rewrite it).
 
 ### `linprov run` reference
 
