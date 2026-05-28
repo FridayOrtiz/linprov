@@ -11,7 +11,8 @@ checksum = "7f202df86484c868dbad7eaa557ef785d5c66295e41b460ef922eca0723b842c"
 [[package]]
 name = "aya-friday-build"
 version = "0.1.3"
-source = "git+https://github.com/FridayOrtiz/aya?branch=linprov-fork-rename#9d82e0b11f9874bde786c93ad940b200d0d144bb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c8146ad0797e1a402727280ce9be8ab7771821e0e4a320152846ecef568b1c0f"
 dependencies = [
  "anyhow",
  "cargo_metadata",
@@ -22,7 +23,8 @@ dependencies = [
 [[package]]
 name = "aya-friday-ebpf"
 version = "0.1.2"
-source = "git+https://github.com/FridayOrtiz/aya?branch=linprov-fork-rename#9d82e0b11f9874bde786c93ad940b200d0d144bb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "aa1b6624dd5d8d48887d9be25dccc2c532eea8b0e991067b7bbdf8da11cff275"
 dependencies = [
  "aya-friday-build",
  "aya-friday-ebpf-bindings",
@@ -34,7 +36,8 @@ dependencies = [
 [[package]]
 name = "aya-friday-ebpf-bindings"
 version = "0.1.2"
-source = "git+https://github.com/FridayOrtiz/aya?branch=linprov-fork-rename#9d82e0b11f9874bde786c93ad940b200d0d144bb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bd45780dcc35a0db9777a62b85ca432d19827448e3f07252f22ce46c92ad48f3"
 dependencies = [
  "aya-friday-build",
  "aya-friday-ebpf-cty",
@@ -43,7 +46,8 @@ dependencies = [
 [[package]]
 name = "aya-friday-ebpf-cty"
 version = "0.2.3"
-source = "git+https://github.com/FridayOrtiz/aya?branch=linprov-fork-rename#9d82e0b11f9874bde786c93ad940b200d0d144bb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "62b9a97721d230c2824e7e2340cdb866de65f75bb2d40f415d2f32121d3e64e9"
 dependencies = [
  "aya-friday-build",
 ]
@@ -51,7 +55,8 @@ dependencies = [
 [[package]]
 name = "aya-friday-ebpf-macros"
 version = "0.1.2"
-source = "git+https://github.com/FridayOrtiz/aya?branch=linprov-fork-rename#9d82e0b11f9874bde786c93ad940b200d0d144bb"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f596984d2983fe6860e2776a7f82b9bb774919229fbfb0249958b6c9b02fa427"
 dependencies = [
  "proc-macro2",
  "proc-macro2-diagnostics",
