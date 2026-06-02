@@ -733,20 +733,63 @@ unsafe fn landing_hashes(src: *const u8, out_ancestors: *mut u64) -> (u64, u64) 
     (ctx.folder_hash, ctx.comp_hash)
 }
 
+#[repr(C)]
+struct ParentCtx {
+    src: *const u8,
+    full_hash: u64,
+    folder_hash: u64,
+}
+
+#[inline(never)]
+unsafe extern "C" fn parent_step(i: u32, ctx: *mut c_void) -> i64 {
+    if i >= PATH_HASH_SCAN_LEN as u32 {
+        return 1;
+    }
+    let ctx = &mut *(ctx as *mut ParentCtx);
+    let b = *ctx.src.add(i as usize);
+    if b == 0 {
+        return 1;
+    }
+    ctx.full_hash ^= b as u64;
+    ctx.full_hash = ctx.full_hash.wrapping_mul(FNV_PRIME);
+    if b == b'/' {
+        ctx.folder_hash = ctx.full_hash;
+    }
+    0
+}
+
+/// FNV of a NUL-terminated path's immediate parent directory (the prefix
+/// up to and including the last `/`). Used for **exact** `target_folder`
+/// matching of the live exec path.
+#[inline(always)]
+unsafe fn parent_folder_hash(src: *const u8) -> u64 {
+    let mut ctx = ParentCtx {
+        src,
+        full_hash: FNV_OFFSET,
+        folder_hash: 0,
+    };
+    bpf_loop(
+        PATH_HASH_SCAN_LEN as u32,
+        parent_step,
+        &mut ctx as *mut _ as *mut c_void,
+        0,
+    );
+    ctx.folder_hash
+}
+
 /// Returns true if any allowlist rule's conditions all match. Rules OR
 /// together; within a rule, dim conditions AND.
 ///
-/// Asymmetry by design:
-///   * **target_* dims** walk the live exec path (`filename`) on demand,
-///     so `target_folder` matches nested prefixes at any depth and
-///     `target_filename` matches the full path — both up to `PATH_MAX`.
-///   * **landing_* and creator_process dims** match against hashes in
-///     the stored record (the path strings were never stored).
-///     `landing_folder` matches the immediate parent or any of the
-///     record's ancestor hashes (nested, up to `MAX_FOLDER_ANCESTORS`
-///     levels); `landing_filename` matches the basename;
-///     `creator_process` matches the exe path. All exact-hash, so any
-///     length.
+/// Folder dims are exact by default and recursive when the rule carries
+/// the matching `*_FOLDER_RECURSIVE` modifier (`/opt/app/` vs
+/// `/opt/app/*`):
+///   * **target_folder** — exact compares the live exec path's immediate
+///     parent; recursive matches any `/`-prefix of it (walk, any depth
+///     to `PATH_MAX`). **target_filename** matches the full live path.
+///   * **landing_folder** — exact compares the stored immediate-parent
+///     hash; recursive matches any stored ancestor hash (up to
+///     `MAX_FOLDER_ANCESTORS` levels). **landing_filename** matches the
+///     basename; **creator_process** the exe path. All hash compares.
 #[inline(always)]
 unsafe fn check_allowlist(filename: &[u8; EXEC_PATH_LEN], origin: &OriginRecord) -> bool {
     let count = ALLOW_RULE_COUNT.get(0).copied().unwrap_or(0);
@@ -754,6 +797,10 @@ unsafe fn check_allowlist(filename: &[u8; EXEC_PATH_LEN], origin: &OriginRecord)
         return false;
     }
     let exec_uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
+    // Immediate parent of the live exec path, for exact target_folder
+    // rules. Computed once (one walk); recursive rules still walk per
+    // rule via folder_match.
+    let target_parent = parent_folder_hash(filename.as_ptr());
 
     let n = if count as usize > MAX_RULES {
         MAX_RULES as u32
@@ -799,20 +846,36 @@ unsafe fn check_allowlist(filename: &[u8; EXEC_PATH_LEN], origin: &OriginRecord)
         {
             continue;
         }
-        if (f & dim::LANDING_FOLDER) != 0 && !landing_folder_match(origin, rule.landing_folder_hash)
-        {
-            continue;
+        if (f & dim::LANDING_FOLDER) != 0 {
+            let ok = if (f & dim::LANDING_FOLDER_RECURSIVE) != 0 {
+                // recursive: immediate parent or any stored ancestor.
+                landing_folder_match(origin, rule.landing_folder_hash)
+            } else {
+                // exact: the immediate parent only.
+                rule.landing_folder_hash != 0
+                    && origin.landing_folder_hash == rule.landing_folder_hash
+            };
+            if !ok {
+                continue;
+            }
         }
-        // target dims: walk the live exec path.
+        // target dims: against the live exec path.
         if (f & dim::TARGET_FILENAME) != 0
             && fnv_full(filename.as_ptr()) != rule.target_filename_hash
         {
             continue;
         }
-        if (f & dim::TARGET_FOLDER) != 0
-            && !folder_match(filename.as_ptr(), rule.target_folder_hash)
-        {
-            continue;
+        if (f & dim::TARGET_FOLDER) != 0 {
+            let ok = if (f & dim::TARGET_FOLDER_RECURSIVE) != 0 {
+                // recursive: rule folder is any `/`-prefix of the path.
+                folder_match(filename.as_ptr(), rule.target_folder_hash)
+            } else {
+                // exact: rule folder is the file's immediate parent.
+                rule.target_folder_hash != 0 && target_parent == rule.target_folder_hash
+            };
+            if !ok {
+                continue;
+            }
         }
         return true;
     }

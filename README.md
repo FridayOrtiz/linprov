@@ -216,9 +216,9 @@ execution_uid=1000;creator_comm=firefox;target_folder=/home/user/.local/bin
 | dim | example | matches if … |
 |---|---|---|
 | `target_filename` | `/usr/bin/foo` | the executed binary's full path equals this |
-| `target_folder` | `/opt/my-app/` | the executed binary lives under this folder at **any depth** (`/opt/my-app/bin/foo`, `/opt/my-app/plugins/bin/bar`, …) |
+| `target_folder` | `/opt/my-app/` | the executed binary is **directly in** this folder (exact). Add a trailing `*` (`/opt/my-app/*`) to also match **any descendant** (`/opt/my-app/bin/foo`, `/opt/my-app/plugins/bin/bar`, …) |
 | `landing_filename` | `installer.sh` | the **basename** of the file's download path equals this |
-| `landing_folder` | `/home/user/Downloads/` | this is the file's download folder, or **any ancestor** of it (up to 32 levels) |
+| `landing_folder` | `/home/user/Downloads/` | the file's download folder is exactly this; with a trailing `*` (`/home/user/Downloads/*`), this or **any ancestor** of the download folder (up to 32 levels) |
 | `creator_process` | `/usr/bin/curl` | the full `exe` path of the writer matches |
 | `creator_comm` | `curl` | the 16-byte `comm` of the writer matches |
 | `creator_uid` | `1000` | the writer's UID matches |
@@ -230,22 +230,32 @@ download and execve — e.g. `curl -o /tmp/foo http://…; mv /tmp/foo
 ~/.local/bin/foo; ~/.local/bin/foo` has `landing_folder=/tmp/`,
 `landing_filename=foo`, and `target_filename=/home/user/.local/bin/foo`.
 
-Folder rules must end in `/` (userspace normalizes).
+Folder rules must end in `/` (userspace normalizes). Folder matching is
+**exact by default** — `target_folder=/opt/app/` permits `/opt/app/x`
+but not `/opt/app/bin/x`. A trailing `*` makes it **recursive**:
+`target_folder=/opt/app/*` permits any depth below `/opt/app/`. Same for
+`landing_folder`. `soak` emits exact rules (least privilege); add the
+`*` yourself to broaden. (Only a trailing `*` is supported — no
+mid-path wildcards or regexes, since matching walks `/`-delimited hash
+prefixes.)
 
 ### Path length and matching model
 
 There is **no length limit** on any path-shaped rule value — they're all
-stored as FNV-1a-64 hashes in a fixed 64-byte record, so a 4096-byte path
-hashes to the same 8 bytes as a short one. What differs is the *matching
-model*, because the exec-time path is available live at the gate while
-the landing path is only present (as hashes) in the stored record:
+stored as FNV-1a-64 hashes in a fixed 320-byte record, so a 4096-byte
+path hashes to the same 8 bytes as a short one. What differs is *how far
+the recursive (`*`) form can nest*, because the exec-time path is
+available live at the gate while the landing path is only present (as
+hashes) in the stored record:
 
-- **`target_*`** walks the live exec path at the gate, so `target_folder`
-  matches **nested at any depth**, for paths up to `PATH_MAX` (4096).
-- **`landing_folder`** matches the immediate parent or any of up to 32
-  recorded ancestor folders — so nesting is bounded to 32 *levels* (not
-  bytes), which is far deeper than any real download path.
-- **`landing_filename`** is the basename only.
+- **`target_folder*`** walks the live exec path at the gate, so it
+  matches nested at **any depth**, for paths up to `PATH_MAX` (4096).
+- **`landing_folder*`** matches against up to 32 ancestor-folder hashes
+  recorded in the file's mark — so its nesting is bounded to 32 *levels*
+  (not bytes), far deeper than any real download path.
+- Exact (no `*`) forms are a single hash compare, any length.
+- **`landing_filename`** is the basename only; **`target_filename`** is
+  the full exec path.
 
 Up to 32 rules per allowlist (BPF verifier budget — bump `MAX_RULES` and
 rebuild for more).

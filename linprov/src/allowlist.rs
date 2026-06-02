@@ -145,13 +145,21 @@ impl RuleSpec {
                 self.target_filename = Some(value.to_string());
             }
             Dim::TargetFolder => {
-                self.target_folder = Some(normalize_folder(value));
+                let (folder, recursive) = split_recursive(value);
+                self.target_folder = Some(normalize_folder(folder));
+                if recursive {
+                    self.flags |= dim::TARGET_FOLDER_RECURSIVE;
+                }
             }
             Dim::LandingFilename => {
                 self.landing_filename = Some(value.to_string());
             }
             Dim::LandingFolder => {
-                self.landing_folder = Some(normalize_folder(value));
+                let (folder, recursive) = split_recursive(value);
+                self.landing_folder = Some(normalize_folder(folder));
+                if recursive {
+                    self.flags |= dim::LANDING_FOLDER_RECURSIVE;
+                }
             }
             Dim::CreatorProcess => {
                 self.creator_process = Some(value.to_string());
@@ -193,9 +201,23 @@ impl RuleSpec {
             }
             let v = match d {
                 Dim::TargetFilename => self.target_filename.clone(),
-                Dim::TargetFolder => self.target_folder.clone(),
+                // Re-emit the trailing `*` for recursive folder rules so
+                // the canonical line round-trips (and dedups correctly).
+                Dim::TargetFolder => self.target_folder.clone().map(|f| {
+                    if self.flags & dim::TARGET_FOLDER_RECURSIVE != 0 {
+                        format!("{f}*")
+                    } else {
+                        f
+                    }
+                }),
                 Dim::LandingFilename => self.landing_filename.clone(),
-                Dim::LandingFolder => self.landing_folder.clone(),
+                Dim::LandingFolder => self.landing_folder.clone().map(|f| {
+                    if self.flags & dim::LANDING_FOLDER_RECURSIVE != 0 {
+                        format!("{f}*")
+                    } else {
+                        f
+                    }
+                }),
                 Dim::CreatorProcess => self.creator_process.clone(),
                 Dim::CreatorComm => self.creator_comm.clone(),
                 Dim::CreatorUid => self.creator_uid.map(|u| u.to_string()),
@@ -263,6 +285,18 @@ fn normalize_folder(value: &str) -> String {
         // Folder rules must end in `/` so the BPF FNV walk hits the
         // hash exactly when crossing the corresponding separator.
         format!("{value}/")
+    }
+}
+
+/// Split a folder rule value into `(folder, recursive)`. A trailing `*`
+/// means recursive (match the folder or any descendant); without it the
+/// rule is exact (only files directly in the folder). `/opt/app/*` and
+/// `/opt/app*` both yield `("/opt/app", true)` → normalized
+/// `/opt/app/`; `/opt/app/` yields `("/opt/app/", false)`.
+fn split_recursive(value: &str) -> (&str, bool) {
+    match value.strip_suffix('*') {
+        Some(rest) => (rest, true),
+        None => (value, false),
     }
 }
 
@@ -529,6 +563,27 @@ mod tests {
         let long = format!("/opt/{}/bin/", "seg/".repeat(2000));
         let r = RuleSpec::parse(&format!("target_folder={long}")).unwrap();
         assert_eq!(r.flags, dim::TARGET_FOLDER);
+    }
+
+    #[test]
+    fn folder_recursive_suffix_parses_and_round_trips() {
+        // Trailing `*` → recursive modifier; folder normalized without it.
+        let r = RuleSpec::parse("target_folder=/opt/app/*").unwrap();
+        assert_eq!(r.flags, dim::TARGET_FOLDER | dim::TARGET_FOLDER_RECURSIVE);
+        assert_eq!(r.target_folder.as_deref(), Some("/opt/app/"));
+        assert_eq!(r.to_line(), "target_folder=/opt/app/*");
+
+        // No `*` → exact, no modifier bit.
+        let r = RuleSpec::parse("target_folder=/opt/app/").unwrap();
+        assert_eq!(r.flags, dim::TARGET_FOLDER);
+        assert_eq!(r.to_line(), "target_folder=/opt/app/");
+
+        // Same for landing_folder, and `*` without a trailing slash still
+        // normalizes the folder.
+        let r = RuleSpec::parse("landing_folder=/home/u/Downloads*").unwrap();
+        assert_eq!(r.flags, dim::LANDING_FOLDER | dim::LANDING_FOLDER_RECURSIVE);
+        assert_eq!(r.landing_folder.as_deref(), Some("/home/u/Downloads/"));
+        assert_eq!(r.to_line(), "landing_folder=/home/u/Downloads/*");
     }
 
     #[test]

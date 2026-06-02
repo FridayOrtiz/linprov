@@ -99,8 +99,8 @@ pub fn fnv_hash_bytes(bytes: &[u8]) -> u64 {
 // ----- Allowlist rule. One per line in the allowlist file; each rule
 // is a conjunction of (dim, value) conditions. Rules OR together.
 
-/// `flags` bits on [`AllowRule`]. Set bits indicate which dims this
-/// rule requires the record / execve context to match.
+/// `flags` bits on [`AllowRule`]. Bits 0–7 are the dims a rule requires.
+/// Bits 8+ are *modifiers* on a dim already set.
 pub mod dim {
     pub const TARGET_FILENAME: u32 = 1 << 0;
     pub const TARGET_FOLDER: u32 = 1 << 1;
@@ -110,6 +110,17 @@ pub mod dim {
     pub const CREATOR_COMM: u32 = 1 << 5;
     pub const CREATOR_UID: u32 = 1 << 6;
     pub const EXECUTION_UID: u32 = 1 << 7;
+
+    /// Modifier on `TARGET_FOLDER`: match the folder **or any descendant**
+    /// (`target_folder=/opt/app/*`) instead of only files directly in it
+    /// (`target_folder=/opt/app/`). Recursive = the rule folder is any
+    /// `/`-prefix of the live exec path; exact = the rule folder is the
+    /// executed file's immediate parent.
+    pub const TARGET_FOLDER_RECURSIVE: u32 = 1 << 8;
+    /// Modifier on `LANDING_FOLDER`, same meaning for the landing path.
+    /// Recursive = any of the record's stored ancestor hashes; exact =
+    /// the immediate-parent hash.
+    pub const LANDING_FOLDER_RECURSIVE: u32 = 1 << 9;
 }
 
 /// Maximum number of allowlist rules carried by the BPF Array map.

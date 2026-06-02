@@ -38,13 +38,21 @@ fetch_to probe "$DEEP/prog"
 echo "=== T1 target_folder=<316B path> — expect PASS ==="
 exec_check probe "$DEEP/prog"
 
-# T2: nested landing. The file landed deep; the rule names a SHALLOW
-# ancestor of that landing folder. Expect PASS (ancestor-hash match).
-sudo bash -c "echo 'landing_folder=/tmp/linprov-deep/;creator_comm=curl' > /tmp/linprov-smoke/allow"
+# T2: recursive nested landing. The file landed deep; the rule names a
+# SHALLOW ancestor with the recursive `*` suffix. Expect PASS.
+sudo bash -c "echo 'landing_folder=/tmp/linprov-deep/*;creator_comm=curl' > /tmp/linprov-smoke/allow"
 start_daemon enforce /tmp/linprov-smoke/allow /tmp/linprov-smoke/daemon-deep2.log || exit 1
 fetch_to probe "$DEEP/prog"
-echo "=== T2 landing_folder=/tmp/linprov-deep/ (shallow ancestor of deep landing) — expect PASS ==="
+echo "=== T2 landing_folder=/tmp/linprov-deep/* (recursive shallow ancestor) — expect PASS ==="
 exec_check probe "$DEEP/prog"
+
+# T2b: the SAME shallow ancestor WITHOUT `*` is exact — the file landed
+# many levels below it, so it must NOT match. Expect BLOCK.
+sudo bash -c "echo 'landing_folder=/tmp/linprov-deep/;creator_comm=curl' > /tmp/linprov-smoke/allow"
+start_daemon enforce /tmp/linprov-smoke/allow /tmp/linprov-smoke/daemon-deep2b.log || exit 1
+fetch_to probe "$DEEP/prog"
+echo "=== T2b landing_folder=/tmp/linprov-deep/ (exact, file is deeper) — expect BLOCK ==="
+exec_check probe "$DEEP/prog" || true
 
 # T3: nested landing negative — a folder that is NOT an ancestor of the
 # landing path. Expect BLOCK.
