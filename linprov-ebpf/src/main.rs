@@ -45,8 +45,8 @@ use aya_ebpf::{
 };
 use linprov_common::{
     dim, AllowRule, Event, OriginRecord, COMM_LEN, EVENT_KIND_EXECVE, EVENT_KIND_NETWORK_FILE_OPEN,
-    FNV_OFFSET, FNV_PRIME, MAX_FOLDER_HASHES, MAX_RULES, MODE_ENFORCE, ORIGIN_VERSION,
-    PATH_HASH_SCAN_LEN, PATH_LEN,
+    EXEC_PATH_LEN, FNV_OFFSET, FNV_PRIME, MAX_FOLDER_ANCESTORS, MAX_RULES, MODE_ENFORCE,
+    ORIGIN_VERSION, PATH_HASH_SCAN_LEN,
 };
 
 // Kernel kfunc. Resolved at load time by the patched aya: the unresolved
@@ -162,6 +162,19 @@ static SCRATCH: PerCpuArray<OriginRecord> = PerCpuArray::with_max_entries(2, 0);
 
 const SCRATCH_FILE_OPEN: u32 = 0;
 const SCRATCH_BPRM: u32 = 1;
+
+/// A `PATH_MAX`-sized byte buffer; map value type for [`PATH_SCRATCH`].
+/// Wrapper struct so it's a single named map value.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PathScratch([u8; EXEC_PATH_LEN]);
+
+/// Per-CPU scratch for the landing path in `file_open`: `bpf_d_path`
+/// resolves into here, then [`landing_hashes`] walks it. Separate from
+/// the ringbuf event's filename buffer (which `emit_event` fills
+/// independently) and big enough for any path the kernel can name.
+#[map]
+static PATH_SCRATCH: PerCpuArray<PathScratch> = PerCpuArray::with_max_entries(1, 0);
 
 /// Runtime config set by userspace before attach.
 ///   Index 0: a value from the `MODE_*` constants in `linprov_common`.
@@ -320,26 +333,38 @@ pub fn file_open(ctx: LsmContext) -> i32 {
         Some(p) => p,
         None => return 0,
     };
+    let path_buf = match PATH_SCRATCH.get_ptr_mut(0) {
+        Some(p) => p,
+        None => return 0,
+    };
     let path_ptr = unsafe { &(*file_ptr).f_path } as *const KernelPath as *mut bpf_path;
     unsafe {
-        // Zero everything first so creator_path (filled by userspace later)
-        // starts clean — bprm_check_security uses `creator_path[0] == 0` as
-        // the "not yet augmented" signal.
+        // Zero everything first so creator_path_hash (filled by userspace
+        // later) starts at 0 — bprm_check_security uses
+        // `creator_path_hash == 0` as the "not yet augmented" signal.
         core::ptr::write_bytes(rec_ptr as *mut u8, 0, core::mem::size_of::<OriginRecord>());
         (*rec_ptr).version = ORIGIN_VERSION;
         (*rec_ptr).pid = pid;
         (*rec_ptr).ts_boot_ns = bpf_ktime_get_boot_ns();
         (*rec_ptr).comm = current_comm();
         (*rec_ptr).creator_uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
-        // landing_filename: where the file is being written right now.
-        // Distinct from the eventual exec-time path (the file may be
-        // renamed before execve); the record carries this through.
-        let _ = bpf_d_path(
-            path_ptr,
-            (*rec_ptr).landing_filename.as_mut_ptr() as *mut c_char,
-            PATH_LEN as u32,
+        // Landing path = where the file is being written right now
+        // (distinct from the eventual exec-time path; the file may be
+        // renamed before execve). Resolve it into the scratch buffer and
+        // hash its immediate-parent folder and basename in one pass, so
+        // bprm_check_security can match landing_folder / landing_filename
+        // rules on the same-boot fast path. The full path string never
+        // gets stored — userspace logs the path → hash mapping into the
+        // audit db when it sees this file_open event.
+        let buf = (*path_buf).0.as_mut_ptr() as *mut c_char;
+        let _ = bpf_d_path(path_ptr, buf, EXEC_PATH_LEN as u32);
+        let (folder_hash, basename_hash) = landing_hashes(
+            buf as *const u8,
+            (*rec_ptr).landing_ancestor_hashes.as_mut_ptr(),
         );
-        // creator_path stays all-zero. Userspace reads /proc/$pid/exe and
+        (*rec_ptr).landing_folder_hash = folder_hash;
+        (*rec_ptr).landing_basename_hash = basename_hash;
+        // creator_path_hash stays 0. Userspace reads /proc/$pid/exe and
         // writes the augmented record into the xattr.
     }
 
@@ -404,8 +429,10 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
         }
     }
 
-    // Try xattr if there's no storage record, or storage was partial.
-    let need_xattr = !have_storage || unsafe { (*buf).creator_path[0] == 0 };
+    // Try xattr if there's no storage record, or storage was partial
+    // (file_open wrote the landing hashes but not creator_path_hash;
+    // userspace fills that only in the xattr).
+    let need_xattr = !have_storage || unsafe { (*buf).creator_path_hash == 0 };
     let mut have_xattr = false;
     if need_xattr {
         let mut dynptr = MaybeUninit::<bpf_dynptr>::uninit();
@@ -465,7 +492,7 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
         let _ = bpf_d_path(
             path_ptr,
             (*p).filename.as_mut_ptr() as *mut c_char,
-            PATH_LEN as u32,
+            EXEC_PATH_LEN as u32,
         );
     }
 
@@ -481,6 +508,27 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     }
     entry.submit(0);
     decision
+}
+
+/// `landing_folder` rule match: the rule's folder hash equals the
+/// record's immediate-parent hash (exact, any depth) OR any stored
+/// ancestor hash (nested, up to `MAX_FOLDER_ANCESTORS` levels). Fixed
+/// loop, constant index — no per-element bounds concern.
+#[inline(always)]
+fn landing_folder_match(origin: &OriginRecord, needle: u64) -> bool {
+    if needle == 0 {
+        return false;
+    }
+    if origin.landing_folder_hash == needle {
+        return true;
+    }
+    let mut found = false;
+    for j in 0..MAX_FOLDER_ANCESTORS {
+        if origin.landing_ancestor_hashes[j] == needle {
+            found = true;
+        }
+    }
+    found
 }
 
 #[inline(always)]
@@ -603,17 +651,104 @@ unsafe fn folder_match(src: *const u8, needle: u64) -> bool {
     ctx.found != 0
 }
 
+#[repr(C)]
+struct LandingCtx {
+    src: *const u8,
+    /// Running FNV over the whole path so far.
+    full_hash: u64,
+    /// Running FNV over the current path component (reset after each `/`).
+    comp_hash: u64,
+    /// `full_hash` captured at the most recent `/` — the immediate parent.
+    folder_hash: u64,
+    /// Count of `/`-prefixes seen (drives the masked array index).
+    count: u32,
+    _pad: u32,
+    /// FNV of each `/`-terminated prefix, shallow → deep. By-value in the
+    /// ctx (not a pointer into a map value) so the bpf_loop callback
+    /// writes to its own stack frame — keeps the verifier's pointer
+    /// provenance simple. Copied into the record after the walk.
+    ancestors: [u64; MAX_FOLDER_ANCESTORS],
+}
+
+#[inline(never)]
+unsafe extern "C" fn landing_step(i: u32, ctx: *mut c_void) -> i64 {
+    if i >= PATH_HASH_SCAN_LEN as u32 {
+        return 1;
+    }
+    let ctx = &mut *(ctx as *mut LandingCtx);
+    let b = *ctx.src.add(i as usize);
+    if b == 0 {
+        return 1; // break
+    }
+    ctx.full_hash ^= b as u64;
+    ctx.full_hash = ctx.full_hash.wrapping_mul(FNV_PRIME);
+    if b == b'/' {
+        // Prefix up to & including this slash = an ancestor folder. The
+        // last one seen is the immediate parent.
+        ctx.folder_hash = ctx.full_hash;
+        // Masked index: provably in-bounds with no panic branch (N is a
+        // power of two). Real paths stay under N, so this never wraps.
+        let idx = (ctx.count as usize) & (MAX_FOLDER_ANCESTORS - 1);
+        ctx.ancestors[idx] = ctx.full_hash;
+        ctx.count = ctx.count.wrapping_add(1);
+        // The basename is whatever follows the final slash, so restart
+        // the component hash from the offset basis here.
+        ctx.comp_hash = FNV_OFFSET;
+    } else {
+        ctx.comp_hash ^= b as u64;
+        ctx.comp_hash = ctx.comp_hash.wrapping_mul(FNV_PRIME);
+    }
+    0
+}
+
+/// One pass over a NUL-terminated path. Fills `out_ancestors` (a
+/// `[u64; MAX_FOLDER_ANCESTORS]` in the record) with each `/`-terminated
+/// prefix hash for nested `landing_folder` matching, and returns
+/// `(folder_hash, basename_hash)`:
+///   * `folder_hash` = FNV of the immediate parent directory **including
+///     its trailing `/`** (matches userspace `normalize_folder`), for
+///     exact matching and soak/log resolution.
+///   * `basename_hash` = FNV of the final path component (no slash).
+///
+/// Not inlined: the by-value `ancestors` array makes this a ~290-byte
+/// frame, kept off `file_open`'s stack.
+#[inline(never)]
+unsafe fn landing_hashes(src: *const u8, out_ancestors: *mut u64) -> (u64, u64) {
+    let mut ctx = LandingCtx {
+        src,
+        full_hash: FNV_OFFSET,
+        comp_hash: FNV_OFFSET,
+        folder_hash: 0,
+        count: 0,
+        _pad: 0,
+        ancestors: [0u64; MAX_FOLDER_ANCESTORS],
+    };
+    bpf_loop(
+        PATH_HASH_SCAN_LEN as u32,
+        landing_step,
+        &mut ctx as *mut _ as *mut c_void,
+        0,
+    );
+    core::ptr::copy_nonoverlapping(ctx.ancestors.as_ptr(), out_ancestors, MAX_FOLDER_ANCESTORS);
+    (ctx.folder_hash, ctx.comp_hash)
+}
+
 /// Returns true if any allowlist rule's conditions all match. Rules OR
 /// together; within a rule, dim conditions AND.
 ///
-/// Path-shaped dims (`*_filename`, `*_folder`) compute their hashes
-/// **per rule, on demand** rather than pre-computing into a stack array
-/// — pre-computation with conditional stores at `/` positions exploded
-/// the verifier's per-instruction state space. Re-walking per rule is
-/// O(MAX_RULES × PATH_HASH_SCAN_LEN), but with simpler control flow the
-/// verifier can prune state much more aggressively.
+/// Asymmetry by design:
+///   * **target_* dims** walk the live exec path (`filename`) on demand,
+///     so `target_folder` matches nested prefixes at any depth and
+///     `target_filename` matches the full path — both up to `PATH_MAX`.
+///   * **landing_* and creator_process dims** match against hashes in
+///     the stored record (the path strings were never stored).
+///     `landing_folder` matches the immediate parent or any of the
+///     record's ancestor hashes (nested, up to `MAX_FOLDER_ANCESTORS`
+///     levels); `landing_filename` matches the basename;
+///     `creator_process` matches the exe path. All exact-hash, so any
+///     length.
 #[inline(always)]
-unsafe fn check_allowlist(filename: &[u8; PATH_LEN], origin: &OriginRecord) -> bool {
+unsafe fn check_allowlist(filename: &[u8; EXEC_PATH_LEN], origin: &OriginRecord) -> bool {
     let count = ALLOW_RULE_COUNT.get(0).copied().unwrap_or(0);
     if count == 0 {
         return false;
@@ -649,19 +784,28 @@ unsafe fn check_allowlist(filename: &[u8; PATH_LEN], origin: &OriginRecord) -> b
         if (f & dim::CREATOR_COMM) != 0 && !comm_eq(&rule.creator_comm, &origin.comm) {
             continue;
         }
+        // creator_process: direct hash compare. 0 means "not yet
+        // augmented" (file_open didn't know the creator exe) — treat as
+        // no-match so we never permit on a half-filled record.
         if (f & dim::CREATOR_PROCESS) != 0
-            && (origin.creator_path[0] == 0
-                || fnv_full(origin.creator_path.as_ptr()) != rule.creator_process_hash)
+            && (origin.creator_path_hash == 0
+                || origin.creator_path_hash != rule.creator_process_hash)
         {
             continue;
         }
+        // landing dims: direct hash compares against the stored record.
+        if (f & dim::LANDING_FILENAME) != 0
+            && origin.landing_basename_hash != rule.landing_filename_hash
+        {
+            continue;
+        }
+        if (f & dim::LANDING_FOLDER) != 0 && !landing_folder_match(origin, rule.landing_folder_hash)
+        {
+            continue;
+        }
+        // target dims: walk the live exec path.
         if (f & dim::TARGET_FILENAME) != 0
             && fnv_full(filename.as_ptr()) != rule.target_filename_hash
-        {
-            continue;
-        }
-        if (f & dim::LANDING_FILENAME) != 0
-            && fnv_full(origin.landing_filename.as_ptr()) != rule.landing_filename_hash
         {
             continue;
         }
@@ -670,21 +814,10 @@ unsafe fn check_allowlist(filename: &[u8; PATH_LEN], origin: &OriginRecord) -> b
         {
             continue;
         }
-        if (f & dim::LANDING_FOLDER) != 0
-            && !folder_match(origin.landing_filename.as_ptr(), rule.landing_folder_hash)
-        {
-            continue;
-        }
         return true;
     }
     false
 }
-
-// MAX_FOLDER_HASHES is no longer used by BPF — the per-rule walk
-// doesn't need a precomputed array — but the constant stays in
-// linprov-common for the userspace check.
-#[allow(dead_code)]
-const _MAX_FOLDER_HASHES_REFERENCE: usize = MAX_FOLDER_HASHES;
 
 /// Reserve an `Event` on the ring buffer and have bpf_d_path() fill in the
 /// filename. Embeds the origin record so userspace doesn't have to retrieve
@@ -713,7 +846,7 @@ fn emit_event(
         let _ = bpf_d_path(
             path_ptr,
             (*p).filename.as_mut_ptr() as *mut c_char,
-            PATH_LEN as u32,
+            EXEC_PATH_LEN as u32,
         );
     }
     entry.submit(0);

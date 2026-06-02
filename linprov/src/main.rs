@@ -11,6 +11,7 @@ use clap::{Parser, Subcommand};
 mod allowlist;
 mod config;
 mod handler;
+mod hashdb;
 mod install;
 mod mode;
 mod privilege;

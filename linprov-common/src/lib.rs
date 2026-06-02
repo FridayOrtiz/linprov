@@ -31,24 +31,37 @@
 #![cfg_attr(not(feature = "user"), no_std)]
 
 pub const COMM_LEN: usize = 16;
-pub const PATH_LEN: usize = 256;
-pub const CREATOR_PATH_LEN: usize = 256;
 
-/// Max path length the BPF FNV walks inspect (one for `target_filename`,
-/// one for `landing_filename`, plus the folder-match walk). Now equal
-/// to [`PATH_LEN`] — the walks run inside `bpf_loop()`, so the
-/// verifier inspects the loop body once instead of unrolling it
-/// across iterations, and the scan length is bounded only by the
-/// buffer size, not by the verifier's instruction budget. Older
-/// builds capped this at 80; bumped to 256 alongside the
-/// `bpf_loop`-based walk refactor.
-pub const PATH_HASH_SCAN_LEN: usize = PATH_LEN;
+/// Live exec/target path buffer size: the ringbuf [`Event`] filename
+/// and the per-CPU scratch the target-dim walks scan. Sized to Linux
+/// `PATH_MAX` so `target_filename` / `target_folder` match the full
+/// execution path at any depth and any length. These buffers are
+/// transient (per-CPU scratch + ringbuf), never persisted, so they
+/// aren't bound by the xattr block-size limit that caps stored data.
+pub const EXEC_PATH_LEN: usize = 4096;
 
-/// Max number of `/`-separated ancestor hashes we collect per filename
-/// for folder-rule matching. Each represents one ancestor directory
-/// (`/`, `/opt/`, `/opt/installed/`, …). Bounded so the verifier can
-/// reason about the rule-iteration loop and the inner folder match.
-pub const MAX_FOLDER_HASHES: usize = 4;
+/// Max bytes the BPF path walks inspect. Equal to [`EXEC_PATH_LEN`]:
+/// the walk body is a `bpf_loop` callback the verifier inspects once,
+/// so this is bounded only by the buffer, not the instruction budget.
+pub const PATH_HASH_SCAN_LEN: usize = EXEC_PATH_LEN;
+
+/// Number of landing-folder ancestor hashes stored per record, for
+/// nested `landing_folder` matching. The walk records the hash of each
+/// `/`-terminated prefix of the landing path (shallow → deep) into a
+/// `[u64; MAX_FOLDER_ANCESTORS]`; a rule matches if its folder hash
+/// equals any of them, so `landing_folder=/home/user/` matches a file
+/// that landed in `/home/user/Downloads/sub/`. Bounds nesting *depth*
+/// (path length is still unbounded — these are hashes). Must be a power
+/// of two: the in-kernel walk masks the index (`& (N-1)`) to keep the
+/// array write provably in-bounds without a panic branch. Real landing
+/// paths sit well under this, so the mask never actually wraps.
+///
+/// Capped at 32 by the BPF 512-byte stack limit: the `file_open` walk
+/// holds this array by value in its `bpf_loop` context (`32 × 8 = 256`
+/// bytes, plus the other context fields). 64 would overflow the stack
+/// frame — it'd need the array in a per-CPU map instead, not worth it
+/// when 32 ancestor levels already exceeds any real landing path.
+pub const MAX_FOLDER_ANCESTORS: usize = 32;
 
 // FNV-1a-64 constants. Used by both sides to hash strings.
 pub const FNV_OFFSET: u64 = 0xcbf2_9ce4_8422_2325;
@@ -72,8 +85,8 @@ pub fn fnv_hash(s: &str) -> u64 {
 }
 
 /// Same as [`fnv_hash`], but takes a byte slice. Useful when the source
-/// isn't UTF-8 (e.g., a `[u8; PATH_LEN]` filename buffer read out of a
-/// ringbuf event).
+/// isn't UTF-8 (e.g., a `[u8; EXEC_PATH_LEN]` filename buffer read out
+/// of a ringbuf event).
 pub fn fnv_hash_bytes(bytes: &[u8]) -> u64 {
     let mut h = FNV_OFFSET;
     for &b in bytes {
@@ -139,22 +152,40 @@ pub const MODE_ENFORCE: u32 = 2;
 
 /// Current schema version of [`OriginRecord`]. Records carrying a different
 /// version are treated as unmarked.
-pub const ORIGIN_VERSION: u32 = 3;
+///
+/// v4 made the record fully hash-based: the variable-length path fields
+/// (`creator_path`, the landing folder, the landing basename) became
+/// `u64` FNV hashes instead of fixed buffers. This lifts the path-length
+/// ceiling (a hash is the same 8 bytes whether the path is 12 or 4096
+/// bytes) and shrinks the record to 64 bytes, well under the xattr
+/// block limit. Human-readable resolution of those hashes lives in the
+/// plaintext audit db (see the `hashdb` userspace module), not in the
+/// record. v3 records (which embedded path strings) are treated as
+/// unmarked and get re-marked on next open.
+pub const ORIGIN_VERSION: u32 = 4;
 
 /// Provenance record. Carried in the `security.bpf.linprov.origin` xattr
-/// and in the INODE_MARKS storage map.
+/// and in the INODE_MARKS storage map. Fixed 64 bytes — every
+/// variable-length field is an FNV-1a-64 hash, so the record never
+/// grows with path length and always fits a single xattr block.
 ///
 /// Filled in stages:
-///   * BPF `file_open` writes `version`, `pid`, `ts_boot_ns`, `comm`,
-///     `creator_uid`, and `landing_filename` (the path where the file
-///     was first written, via `bpf_d_path`).
+///   * BPF `file_open` sets `version`, `pid`, `ts_boot_ns`, `comm`,
+///     `creator_uid`, and the two landing hashes (`landing_folder_hash`,
+///     `landing_basename_hash`), computed in one pass over the landing
+///     path. `creator_path_hash` is left 0 — BPF can't cheaply resolve
+///     the creator's exe path here.
 ///   * Userspace, on the corresponding ringbuf event, reads
-///     `/proc/$pid/exe` and overwrites the xattr with the augmented
-///     record (`creator_path` filled).
+///     `/proc/$pid/exe`, fills `creator_path_hash`, and overwrites the
+///     xattr with the augmented record. It also records each hash →
+///     path mapping in the plaintext audit db so logs, soak, and the
+///     user's own `grep` can resolve hashes back to paths.
 ///
-/// `creator_path` may be all-zeros if the creator process exited
-/// before userspace got to it. Allowlist rules keyed on
-/// `creator_process` won't match such records, but other dims still do.
+/// `creator_path_hash == 0` is the "not yet augmented" sentinel:
+/// `bprm_check_security` reads the storage record first and falls
+/// through to the xattr when it sees a zero creator hash. Rules keyed
+/// on `creator_process` won't match an unaugmented record, but other
+/// dims still do.
 #[repr(C)]
 #[derive(Copy, Clone)]
 #[cfg_attr(feature = "user", derive(bytemuck::Pod, bytemuck::Zeroable))]
@@ -165,8 +196,22 @@ pub struct OriginRecord {
     pub comm: [u8; COMM_LEN],
     pub creator_uid: u32,
     pub _pad: u32,
-    pub creator_path: [u8; CREATOR_PATH_LEN],
-    pub landing_filename: [u8; PATH_LEN],
+    /// FNV-1a-64 of the creator's full exe path (`/proc/$pid/exe`).
+    /// 0 until userspace augments the record.
+    pub creator_path_hash: u64,
+    /// FNV-1a-64 of the landing file's immediate parent directory,
+    /// including the trailing `/` (matches `normalize_folder`). Always
+    /// the immediate parent regardless of depth — used for exact
+    /// `landing_folder` matching and for soak/log resolution.
+    pub landing_folder_hash: u64,
+    /// FNV-1a-64 of the landing file's basename (final path component,
+    /// no slash).
+    pub landing_basename_hash: u64,
+    /// FNV-1a-64 of each `/`-terminated ancestor of the landing path
+    /// (shallow → deep), up to [`MAX_FOLDER_ANCESTORS`]. Enables nested
+    /// `landing_folder` matching: a rule whose folder hash equals any
+    /// entry matches. Unused slots are 0.
+    pub landing_ancestor_hashes: [u64; MAX_FOLDER_ANCESTORS],
 }
 
 /// Ring-buffer record. Two kinds:
@@ -184,7 +229,9 @@ pub struct Event {
     pub status: i32,
     pub comm: [u8; COMM_LEN],
     pub origin: OriginRecord,
-    pub filename: [u8; PATH_LEN],
+    /// The live path: landing path for `NetworkFileOpen`, exec/target
+    /// path for `Execve`. Sized to `PATH_MAX`; transient (ringbuf only).
+    pub filename: [u8; EXEC_PATH_LEN],
 }
 
 impl Event {
@@ -231,9 +278,13 @@ mod tests {
     }
 
     #[test]
-    fn origin_record_size_is_v3_expected() {
-        // 4 + 4 + 8 + 16 + 4 + 4 + 256 + 256 = 552
-        assert_eq!(core::mem::size_of::<OriginRecord>(), 552);
+    fn origin_record_size_is_v4_expected() {
+        // 4 + 4 + 8 + 16 + 4 + 4 + 8 + 8 + 8 + 8*MAX_FOLDER_ANCESTORS
+        let base = 4 + 4 + 8 + 16 + 4 + 4 + 8 + 8 + 8;
+        assert_eq!(
+            core::mem::size_of::<OriginRecord>(),
+            base + 8 * MAX_FOLDER_ANCESTORS
+        );
     }
 
     #[test]

@@ -215,10 +215,10 @@ execution_uid=1000;creator_comm=firefox;target_folder=/home/user/.local/bin
 
 | dim | example | matches if … |
 |---|---|---|
-| `target_filename` | `/usr/bin/foo` | the executed binary's path equals this |
-| `target_folder` | `/opt/installed/` | the executed binary lives under this prefix (any depth) |
-| `landing_filename` | `/tmp/foo` | the file's *download* path (where it was first written) equals this |
-| `landing_folder` | `/tmp/` | the file's *download* directory matches at any depth |
+| `target_filename` | `/usr/bin/foo` | the executed binary's full path equals this |
+| `target_folder` | `/opt/my-app/` | the executed binary lives under this folder at **any depth** (`/opt/my-app/bin/foo`, `/opt/my-app/plugins/bin/bar`, …) |
+| `landing_filename` | `installer.sh` | the **basename** of the file's download path equals this |
+| `landing_folder` | `/home/user/Downloads/` | this is the file's download folder, or **any ancestor** of it (up to 32 levels) |
 | `creator_process` | `/usr/bin/curl` | the full `exe` path of the writer matches |
 | `creator_comm` | `curl` | the 16-byte `comm` of the writer matches |
 | `creator_uid` | `1000` | the writer's UID matches |
@@ -227,15 +227,28 @@ execution_uid=1000;creator_comm=firefox;target_folder=/home/user/.local/bin
 `target_*` reflects the file's location at execve time; `landing_*` is
 where it was first written. They diverge when the file is moved between
 download and execve — e.g. `curl -o /tmp/foo http://…; mv /tmp/foo
-~/.local/bin/foo; ~/.local/bin/foo` has `landing_filename=/tmp/foo` and
-`target_filename=~/.local/bin/foo`.
+~/.local/bin/foo; ~/.local/bin/foo` has `landing_folder=/tmp/`,
+`landing_filename=foo`, and `target_filename=/home/user/.local/bin/foo`.
 
-Folder rules must end in `/` (userspace normalizes). All path-shaped
-values are bounded to 64 bytes by the BPF FNV walk; longer rules are
-rejected at parse time.
+Folder rules must end in `/` (userspace normalizes).
 
-Up to 32 rules per allowlist (BPF verifier budget — bump
-`MAX_RULES` and rebuild for more).
+### Path length and matching model
+
+There is **no length limit** on any path-shaped rule value — they're all
+stored as FNV-1a-64 hashes in a fixed 64-byte record, so a 4096-byte path
+hashes to the same 8 bytes as a short one. What differs is the *matching
+model*, because the exec-time path is available live at the gate while
+the landing path is only present (as hashes) in the stored record:
+
+- **`target_*`** walks the live exec path at the gate, so `target_folder`
+  matches **nested at any depth**, for paths up to `PATH_MAX` (4096).
+- **`landing_folder`** matches the immediate parent or any of up to 32
+  recorded ancestor folders — so nesting is bounded to 32 *levels* (not
+  bytes), which is far deeper than any real download path.
+- **`landing_filename`** is the basename only.
+
+Up to 32 rules per allowlist (BPF verifier budget — bump `MAX_RULES` and
+rebuild for more).
 
 `creator_process` is populated by userspace via `readlink /proc/$pid/exe`
 when handling the file-open event. If the creator process exits before
@@ -243,22 +256,43 @@ userspace lands the augmented xattr, rules requiring `creator_process`
 won't match for that file — use `creator_comm` (always populated by BPF)
 as the fallback dim.
 
+### The audit db: resolving hashes back to paths
+
+Because the record stores hashes, not strings, the daemon keeps a
+plaintext, append-only map of every hash it stores → the path it came
+from, at `/var/lib/linprov/hashes.tsv` (configurable via `hash_db` /
+`--hash-db`):
+
+```
+$ grep Downloads /var/lib/linprov/hashes.tsv
+7ba1f0cc8598e793	/home/user/Downloads/
+```
+
+This is what lets the daemon log readable paths, lets `soak` emit
+plaintext rules, and lets you audit what's been marked with `grep`. It
+**persists across reboots**, so resolution still works for files marked
+in a previous boot. Enforcement never consults it — the BPF program
+matches on hashes alone, so losing or pruning the db costs only human
+readability, never correctness.
+
 ## Inspecting the xattr by hand
 
 ```
 getfattr -d -m '.*' /path/to/file
-# security.bpf.linprov.origin=0sAgAAAA...
+# security.bpf.linprov.origin=0sBAAAAA...
 ```
 
-The value is the binary `OriginRecord` (v3 layout):
+The value is the binary `OriginRecord` (v4 layout, 320 bytes):
 
 ```
-version u32 | pid u32 | ts_boot_ns u64 | comm[16] |
-creator_uid u32 | _pad u32 | creator_path[256] | landing_filename[256]
+version u32 | pid u32 | ts_boot_ns u64 | comm[16] | creator_uid u32 |
+_pad u32 | creator_path_hash u64 | landing_folder_hash u64 |
+landing_basename_hash u64 | landing_ancestor_hashes[32]
 ```
 
-The daemon's log lines already format it. Earlier-version xattrs from
-prior linprov builds are ignored (treated as unmarked).
+The daemon's log lines already format it, resolving the hashes via the
+audit db. Earlier-version xattrs from prior linprov builds are ignored
+(treated as unmarked), so files re-mark on next open after an upgrade.
 
 ## Roadmap
 

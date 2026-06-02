@@ -3,7 +3,7 @@ name = "linprov-common"
 # ABI between the daemon and the BPF program: schema (OriginRecord,
 # AllowRule, dim flags). Bump 0.x → 0.(x+1) on any change that alters
 # the on-wire layout or fnv_hash semantics.
-version = "0.1.2"
+version = "0.1.3"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

@@ -34,6 +34,12 @@ pub const DEFAULT_SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/linprov.service
 /// Default name of the systemd unit (without the file extension).
 pub const DEFAULT_SYSTEMD_UNIT_NAME: &str = "linprov.service";
 
+/// Default plaintext hash → path audit db. Maps every FNV hash the
+/// daemon stores in a record back to its path, for log resolution,
+/// soak rule emission, and `grep`-based auditing. `/var/lib` is the
+/// conventional home for app state that should persist across reboots.
+pub const DEFAULT_HASHDB_PATH: &str = "/var/lib/linprov/hashes.tsv";
+
 /// Where `setup` and `upgrade` copy the binary so it lands on root's
 /// `secure_path` (and `sudo linprov ...` works without a leading
 /// absolute path). `/usr/local/bin` is the conventional spot for
@@ -51,6 +57,7 @@ pub struct FileConfig {
     pub log_level: Option<String>,
     pub mark_localhost: Option<bool>,
     pub soak: Option<Vec<Dim>>,
+    pub hash_db: Option<PathBuf>,
 }
 
 impl FileConfig {
@@ -75,6 +82,7 @@ pub struct EffectiveConfig {
     pub log_level: String,
     pub mark_localhost: bool,
     pub soak: Vec<Dim>,
+    pub hash_db: PathBuf,
 }
 
 impl EffectiveConfig {
@@ -94,6 +102,10 @@ impl EffectiveConfig {
                 .soak
                 .or(file.soak)
                 .unwrap_or_else(|| vec![Dim::CreatorProcess]),
+            hash_db: cli
+                .hash_db
+                .or(file.hash_db)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_HASHDB_PATH)),
         }
     }
 }
@@ -108,6 +120,7 @@ pub struct CliOverrides {
     pub log_level: Option<String>,
     pub mark_localhost: Option<bool>,
     pub soak: Option<Vec<Dim>>,
+    pub hash_db: Option<PathBuf>,
 }
 
 #[cfg(test)]

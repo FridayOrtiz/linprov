@@ -27,6 +27,7 @@ use crate::{
         CliOverrides, EffectiveConfig, FileConfig, DEFAULT_ALLOWLIST_PATH, DEFAULT_CONFIG_PATH,
     },
     handler,
+    hashdb::HashDb,
     mode::Mode,
 };
 
@@ -80,6 +81,11 @@ pub struct RunArgs {
     /// Append logs to this file instead of stderr.
     #[arg(long)]
     log_file: Option<PathBuf>,
+
+    /// Plaintext hash → path audit db. Maps the FNV hashes stored in
+    /// records back to paths for logs, soak, and `grep`-based audit.
+    #[arg(long)]
+    hash_db: Option<PathBuf>,
 }
 
 pub fn execute(args: RunArgs) -> Result<()> {
@@ -91,6 +97,7 @@ pub fn execute(args: RunArgs) -> Result<()> {
         log_level: args.log_level,
         mark_localhost: args.mark_localhost,
         soak: args.soak,
+        hash_db: args.hash_db,
     };
     let cfg = EffectiveConfig::resolve(cli, file);
     init_logger(&cfg.log_level, cfg.log_file.as_deref())?;
@@ -158,9 +165,13 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
         _ => None,
     };
 
+    let hashdb = HashDb::open(&cfg.hash_db)
+        .with_context(|| format!("opening hash db `{}`", cfg.hash_db.display()))?;
+
     let handler_cfg = handler::Config {
         mode: cfg.mode,
         soak,
+        hashdb: &hashdb,
     };
 
     info!(

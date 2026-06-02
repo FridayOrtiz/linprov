@@ -3,7 +3,7 @@ name = "linprov-ebpf"
 # BPF program source. Bump 0.0.x for BPF logic / verifier-shape
 # changes; 0.x → 0.(x+1) for changes that linprov's build.rs needs to
 # know about (new features, flag changes).
-version = "0.2.2"
+version = "0.2.3"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

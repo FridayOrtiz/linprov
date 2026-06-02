@@ -221,6 +221,12 @@ mark_localhost = false
 # mix `creator_uid`, `target_folder`, `landing_filename`, etc.
 soak = ["creator_process"]
 
+# Plaintext audit db mapping the FNV hashes stored in xattrs/records
+# back to their paths. Lets the daemon log readable paths, lets soak
+# emit plaintext rules, and lets you `grep` what's been marked. Persists
+# across reboots; enforcement never reads it. Default shown:
+# hash_db = "/var/lib/linprov/hashes.tsv"
+
 # Optional: append logs to a file instead of stderr. Leave commented
 # out under systemd — journald captures stderr automatically. Useful
 # if you run linprov outside of systemd (`runit`, manual, container).

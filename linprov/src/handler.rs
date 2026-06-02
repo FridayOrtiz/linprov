@@ -1,30 +1,35 @@
 //! Ring-buffer event handler.
 //!
-//! `NetworkFileOpen` events: read `/proc/$pid/exe` to fill the creator's
-//! full exe path, then write the augmented `OriginRecord` to the
-//! `security.bpf.linprov.origin` xattr.
+//! `NetworkFileOpen` events: read `/proc/$pid/exe` to learn the creator's
+//! full exe path, record the path → hash mappings (creator exe, landing
+//! folder, landing basename) in the audit db, then write the augmented
+//! v4 `OriginRecord` (all hashes) to the `security.bpf.linprov.origin`
+//! xattr.
 //!
 //! `Execve` events (only emitted when the file was marked): log; in
 //! enforce mode the LSM verdict in `event.status` tells us whether the
 //! exec was blocked; in soak mode we emit one allowlist rule per
-//! configured dimension.
+//! configured dimension, resolving the record's hashes back to paths via
+//! the audit db.
 
 use std::{fs, path::PathBuf};
 
 use linprov_common::{
-    Event, OriginRecord, COMM_LEN, CREATOR_PATH_LEN, EVENT_KIND_EXECVE,
-    EVENT_KIND_NETWORK_FILE_OPEN, ORIGIN_VERSION, PATH_LEN, XATTR_NAME,
+    Event, OriginRecord, COMM_LEN, EVENT_KIND_EXECVE, EVENT_KIND_NETWORK_FILE_OPEN, EXEC_PATH_LEN,
+    MAX_FOLDER_ANCESTORS, ORIGIN_VERSION, XATTR_NAME,
 };
 use log::{debug, info, warn};
 
 use crate::{
     allowlist::{OriginContext, Soak},
+    hashdb::HashDb,
     ModeArg,
 };
 
-pub struct Config {
+pub struct Config<'a> {
     pub mode: ModeArg,
     pub soak: Option<Soak>,
+    pub hashdb: &'a HashDb,
 }
 
 pub fn handle_event(cfg: &Config, raw: &[u8]) {
@@ -46,31 +51,58 @@ pub fn handle_event(cfg: &Config, raw: &[u8]) {
         };
 
     match event.kind {
-        EVENT_KIND_NETWORK_FILE_OPEN => on_file_marked(event),
+        EVENT_KIND_NETWORK_FILE_OPEN => on_file_marked(cfg, event),
         EVENT_KIND_EXECVE => on_execve_marked(cfg, event),
         other => warn!("unknown event kind: {other}"),
     }
 }
 
-fn on_file_marked(event: &Event) {
-    let path = c_str_to_string(&event.filename);
+fn on_file_marked(cfg: &Config, event: &Event) {
+    let landing_path = c_str_to_string(&event.filename);
     let comm = comm_to_string(&event.comm);
-    let target = PathBuf::from(&path);
+    let target = PathBuf::from(&landing_path);
 
     if is_pseudo_fs(&target) {
         debug!("skipping non-regular target: {}", target.display());
         return;
     }
 
-    // Augment the OriginRecord with the creator's full exe path. /proc/$pid/exe
-    // is a symlink to the binary the process was exec'd from. Best-effort:
-    // if the creator already exited we keep creator_path empty, and rules
-    // keyed on it just won't match.
+    // Start from the BPF-written record (landing hashes already set on the
+    // in-kernel storage copy) and fill in what only userspace can resolve.
     let mut augmented: OriginRecord = event.origin;
     augmented.version = ORIGIN_VERSION;
+
+    // Record path → hash mappings in the audit db, and set the same hashes
+    // on the record we persist. `HashDb::record` hashes with the same
+    // FNV the BPF side uses, so these match the in-kernel storage record
+    // (and the allowlist rule hashes).
+    //
+    // Ancestor hashes (shallow → deep) for nested landing_folder
+    // matching — mirrors the BPF walk, including the power-of-two index
+    // mask, so the userspace-written xattr and the in-kernel
+    // inode_storage record agree byte-for-byte.
+    augmented.landing_ancestor_hashes = [0u64; MAX_FOLDER_ANCESTORS];
+    let mut count = 0usize;
+    for (i, b) in landing_path.bytes().enumerate() {
+        if b == b'/' {
+            let prefix = &landing_path[..=i]; // includes the trailing '/'
+            let h = cfg.hashdb.record(prefix);
+            augmented.landing_ancestor_hashes[count & (MAX_FOLDER_ANCESTORS - 1)] = h;
+            count += 1;
+            // The deepest `/`-prefix is the immediate parent.
+            augmented.landing_folder_hash = h;
+        }
+    }
+    if let Some(base) = basename_of(&landing_path) {
+        augmented.landing_basename_hash = cfg.hashdb.record(base);
+    }
+
+    // /proc/$pid/exe is a symlink to the binary the creator was exec'd
+    // from. Best-effort: if the creator already exited we leave
+    // creator_path_hash at 0, and rules keyed on it just won't match.
     let creator_path = read_creator_exe(event.pid);
     if let Some(p) = creator_path.as_deref() {
-        write_path_field(&mut augmented.creator_path, p);
+        augmented.creator_path_hash = cfg.hashdb.record(p);
     }
 
     let value = bytemuck::bytes_of(&augmented).to_vec();
@@ -100,12 +132,6 @@ fn read_creator_exe(pid: u32) -> Option<String> {
     }
 }
 
-fn write_path_field(buf: &mut [u8; CREATOR_PATH_LEN], s: &str) {
-    let bytes = s.as_bytes();
-    let n = bytes.len().min(CREATOR_PATH_LEN - 1);
-    buf[..n].copy_from_slice(&bytes[..n]);
-}
-
 fn is_pseudo_fs(target: &std::path::Path) -> bool {
     let Some(s) = target.to_str() else {
         return true;
@@ -118,16 +144,22 @@ fn is_pseudo_fs(target: &std::path::Path) -> bool {
 
 fn on_execve_marked(cfg: &Config, event: &Event) {
     let target_path = c_str_to_string(&event.filename);
-    let landing_path = c_str_to_string(&event.origin.landing_filename);
     let exec_comm = comm_to_string(&event.comm);
     let creator_comm = comm_to_string(&event.origin.comm);
-    let creator_path = c_str_to_string_full(&event.origin.creator_path);
+
+    // Resolve the record's hashes back to human-readable paths via the
+    // audit db. `None` means the db doesn't know this hash (e.g. it was
+    // pruned, or the creator exited before it could be recorded).
+    let creator_path = cfg.hashdb.resolve(event.origin.creator_path_hash);
+    let landing_folder = cfg.hashdb.resolve(event.origin.landing_folder_hash);
+    let landing_basename = cfg.hashdb.resolve(event.origin.landing_basename_hash);
 
     if event.status != 0 {
         warn!(
-            "BLOCKED-EXEC target={} landing={} pid={} comm={} origin={} (LSM verdict {})",
+            "BLOCKED-EXEC target={} landing_folder={} landing_file={} pid={} comm={} origin={} (LSM verdict {})",
             target_path,
-            landing_path,
+            resolved(&landing_folder, event.origin.landing_folder_hash),
+            resolved(&landing_basename, event.origin.landing_basename_hash),
             event.pid,
             exec_comm,
             format_origin(&event.origin, &creator_comm, &creator_path),
@@ -137,9 +169,10 @@ fn on_execve_marked(cfg: &Config, event: &Event) {
     }
 
     info!(
-        "PROVENANCE-EXEC target={} landing={} pid={} comm={} origin={}",
+        "PROVENANCE-EXEC target={} landing_folder={} landing_file={} pid={} comm={} origin={}",
         target_path,
-        landing_path,
+        resolved(&landing_folder, event.origin.landing_folder_hash),
+        resolved(&landing_basename, event.origin.landing_basename_hash),
         event.pid,
         exec_comm,
         format_origin(&event.origin, &creator_comm, &creator_path),
@@ -150,8 +183,9 @@ fn on_execve_marked(cfg: &Config, event: &Event) {
             let exec_uid = get_uid_for_pid(event.pid).unwrap_or(0);
             let ctx = OriginContext {
                 target_filename: &target_path,
-                landing_filename: &landing_path,
-                creator_path: &creator_path,
+                landing_folder: landing_folder.as_deref(),
+                landing_basename: landing_basename.as_deref(),
+                creator_path: creator_path.as_deref(),
                 creator_comm: &creator_comm,
                 creator_uid: event.origin.creator_uid,
                 execution_uid: exec_uid,
@@ -177,19 +211,25 @@ fn get_uid_for_pid(pid: u32) -> Option<u32> {
     None
 }
 
-fn format_origin(o: &OriginRecord, creator_comm: &str, creator_path: &str) -> String {
+/// Render a db-resolved value, or the raw hash if it couldn't be
+/// resolved (so logs stay actionable: `grep <hash> hashes.tsv`).
+fn resolved(s: &Option<String>, hash: u64) -> String {
+    match s {
+        Some(v) => v.clone(),
+        None if hash == 0 => "<none>".to_string(),
+        None => format!("<hash:{hash:016x}>"),
+    }
+}
+
+fn format_origin(o: &OriginRecord, creator_comm: &str, creator_path: &Option<String>) -> String {
     format!(
-        "{{v:{},ts_boot_ns:{},pid:{},uid:{},comm:{},path:{}}}",
+        "{{v:{},ts_boot_ns:{},pid:{},uid:{},comm:{},creator:{}}}",
         o.version,
         o.ts_boot_ns,
         o.pid,
         o.creator_uid,
         creator_comm,
-        if creator_path.is_empty() {
-            "<unknown>"
-        } else {
-            creator_path
-        }
+        resolved(creator_path, o.creator_path_hash),
     )
 }
 
@@ -198,12 +238,43 @@ fn comm_to_string(comm: &[u8; COMM_LEN]) -> String {
     String::from_utf8_lossy(&comm[..end]).into_owned()
 }
 
-fn c_str_to_string(buf: &[u8; PATH_LEN]) -> String {
+fn c_str_to_string(buf: &[u8; EXEC_PATH_LEN]) -> String {
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     String::from_utf8_lossy(&buf[..end]).into_owned()
 }
 
-fn c_str_to_string_full(buf: &[u8; CREATOR_PATH_LEN]) -> String {
-    let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
-    String::from_utf8_lossy(&buf[..end]).into_owned()
+/// Final path component (basename), no slash. `None` for empty input or
+/// a trailing-slash path (which has no basename).
+fn basename_of(path: &str) -> Option<&str> {
+    let base = path.rsplit_once('/').map(|(_, b)| b).unwrap_or(path);
+    if base.is_empty() {
+        None
+    } else {
+        Some(base)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn basename_split() {
+        assert_eq!(basename_of("/a/b/foo.sh"), Some("foo.sh"));
+        assert_eq!(basename_of("/foo"), Some("foo"));
+        assert_eq!(basename_of("/a/b/"), None);
+    }
+
+    #[test]
+    fn ancestor_prefixes_shallow_to_deep() {
+        // The byte loop in on_file_marked produces these `/`-prefixes.
+        let path = "/a/b/c/foo";
+        let prefixes: Vec<&str> = path
+            .bytes()
+            .enumerate()
+            .filter(|(_, b)| *b == b'/')
+            .map(|(i, _)| &path[..=i])
+            .collect();
+        assert_eq!(prefixes, vec!["/", "/a/", "/a/b/", "/a/b/c/"]);
+    }
 }
