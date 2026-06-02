@@ -64,10 +64,18 @@ fn main() {
         // `.BTF`, `panic=abort` because BPF has no unwinder,
         // `overflow-checks=off` because the panic landing pads from
         // overflow checks would also need an unwinder.
+        // `opt-level=3` is load-bearing, not just for speed: the BPF
+        // LLVM backend can't lower several constructs without
+        // optimization (e.g. aggregate/tuple returns get an "aggregate
+        // returns are not supported" error at opt-level=0). The
+        // workspace `[profile]` sets opt-level=3, but that doesn't apply
+        // when linprov-ebpf is built standalone from the registry —
+        // which is exactly what `cargo publish`'s verify step and
+        // `cargo install linprov` do — so we pin it here.
         .env(
             "CARGO_TARGET_BPFEL_UNKNOWN_NONE_RUSTFLAGS",
             "-C link-arg=--btf \
-             -C debuginfo=2 -C panic=abort -C overflow-checks=off",
+             -C opt-level=3 -C debuginfo=2 -C panic=abort -C overflow-checks=off",
         )
         // Detach inherited build-time state that would confuse the
         // nested cargo (separate lockfile, separate target dir).
