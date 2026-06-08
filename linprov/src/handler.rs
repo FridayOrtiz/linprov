@@ -12,17 +12,21 @@
 //! configured dimension, resolving the record's hashes back to paths via
 //! the audit db.
 
-use std::{fs, path::PathBuf};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+};
 
 use linprov_common::{
-    Event, OriginRecord, COMM_LEN, EVENT_KIND_EXECVE, EVENT_KIND_NETWORK_FILE_OPEN, EXEC_PATH_LEN,
-    MAX_FOLDER_ANCESTORS, ORIGIN_VERSION, XATTR_NAME,
+    Event, OriginRecord, COMM_LEN, EVENT_KIND_DERIVED_FILE_OPEN, EVENT_KIND_EXECVE,
+    EVENT_KIND_NETWORK_FILE_OPEN, EXEC_PATH_LEN, MAX_FOLDER_ANCESTORS, ORIGIN_VERSION, XATTR_NAME,
 };
 use log::{debug, info, warn};
 
 use crate::{
     allowlist::{OriginContext, Soak},
     hashdb::HashDb,
+    inode_storage::InodeMarks,
     ModeArg,
 };
 
@@ -32,7 +36,7 @@ pub struct Config<'a> {
     pub hashdb: &'a HashDb,
 }
 
-pub fn handle_event(cfg: &Config, raw: &[u8]) {
+pub fn handle_event(cfg: &Config, inode_marks: &mut InodeMarks, raw: &[u8]) {
     if raw.len() < std::mem::size_of::<Event>() {
         warn!(
             "short ring-buf record: got {} bytes, expected {}",
@@ -51,13 +55,19 @@ pub fn handle_event(cfg: &Config, raw: &[u8]) {
         };
 
     match event.kind {
-        EVENT_KIND_NETWORK_FILE_OPEN => on_file_marked(cfg, event),
+        EVENT_KIND_NETWORK_FILE_OPEN => on_file_marked(cfg, inode_marks, event, false),
+        EVENT_KIND_DERIVED_FILE_OPEN => on_file_marked(cfg, inode_marks, event, true),
         EVENT_KIND_EXECVE => on_execve_marked(cfg, event),
         other => warn!("unknown event kind: {other}"),
     }
 }
 
-fn on_file_marked(cfg: &Config, event: &Event) {
+/// Handle a file-marked event. `derived == false` for a network-touched
+/// write (the writer is the creator → resolve its exe path); `derived ==
+/// true` for a taint-propagated write (e.g. `tar` extracting a marked
+/// archive → the record's creator identity is *inherited* and must not be
+/// overwritten with the extractor's exe).
+fn on_file_marked(cfg: &Config, inode_marks: &mut InodeMarks, event: &Event, derived: bool) {
     let landing_path = c_str_to_string(&event.filename);
     let comm = comm_to_string(&event.comm);
     let target = PathBuf::from(&landing_path);
@@ -97,19 +107,38 @@ fn on_file_marked(cfg: &Config, event: &Event) {
         augmented.landing_basename_hash = cfg.hashdb.record(base);
     }
 
-    // /proc/$pid/exe is a symlink to the binary the creator was exec'd
-    // from. Best-effort: if the creator already exited we leave
-    // creator_path_hash at 0, and rules keyed on it just won't match.
-    let creator_path = read_creator_exe(event.pid);
-    if let Some(p) = creator_path.as_deref() {
-        augmented.creator_path_hash = cfg.hashdb.record(p);
-    }
+    // Resolve the creator's exe path — but only for fresh (network) marks.
+    //
+    //   * network: /proc/$pid/exe is the binary the creator was exec'd from.
+    //     Best-effort: if the creator already exited we leave
+    //     creator_path_hash at 0, and rules keyed on it just won't match.
+    //   * derived: the marking process is the *extractor* (e.g. tar), not the
+    //     creator — the creator identity is inherited from the source file's
+    //     record and must be kept as-is. We only resolve the already-set
+    //     hash for the log line.
+    let creator_path = if derived {
+        cfg.hashdb.resolve(augmented.creator_path_hash)
+    } else {
+        let p = read_creator_exe(event.pid);
+        if let Some(path) = p.as_deref() {
+            augmented.creator_path_hash = cfg.hashdb.record(path);
+        }
+        p
+    };
 
     let value = bytemuck::bytes_of(&augmented).to_vec();
+    let kind = if derived {
+        "marked (derived)"
+    } else {
+        "marked"
+    };
 
+    // Marking a written file is routine and high-volume; log it at DEBUG.
+    // INFO is reserved for actual executions (the PROVENANCE-EXEC line in
+    // `on_execve_marked`).
     match xattr::set(&target, XATTR_NAME, &value) {
-        Ok(()) => info!(
-            "marked {} (pid={} comm={} uid={} creator_path={} ts_boot_ns={})",
+        Ok(()) => debug!(
+            "{kind} {} (pid={} comm={} creator_uid={} creator_path={} ts_boot_ns={})",
             target.display(),
             event.pid,
             comm,
@@ -118,6 +147,39 @@ fn on_file_marked(cfg: &Config, event: &Event) {
             event.origin.ts_boot_ns
         ),
         Err(e) => debug!("setxattr({}, {XATTR_NAME}) failed: {e}", target.display()),
+    }
+
+    // Back-fill the in-kernel INODE_MARKS record with the augmented record so
+    // the bprm fast path (which otherwise re-reads the xattr when
+    // creator_path_hash == 0) and same-boot taint propagation both carry the
+    // full creator identity. Best-effort.
+    backfill_inode_mark(inode_marks, &target, &augmented);
+}
+
+/// Open `target` `O_PATH` (which does *not* fire `security_file_open`, so it
+/// can't re-taint the daemon) and update its `INODE_MARKS` record. Failures
+/// (file renamed/removed between the event and now, fs without inode storage
+/// support, etc.) are non-fatal — the durable xattr is already written.
+fn backfill_inode_mark(inode_marks: &mut InodeMarks, target: &Path, rec: &OriginRecord) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    // read(true) only satisfies std's "an access mode is required"; O_PATH
+    // overrides it in the kernel, yielding a path-only fd we use purely as
+    // the inode-storage key.
+    match fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+        .open(target)
+    {
+        Ok(f) => {
+            if let Err(e) = inode_marks.backfill(&f, rec) {
+                debug!("INODE_MARKS back-fill for {} failed: {e}", target.display());
+            }
+        }
+        Err(e) => debug!(
+            "O_PATH open of {} for INODE_MARKS back-fill failed: {e}",
+            target.display()
+        ),
     }
 }
 

@@ -28,6 +28,7 @@ use crate::{
     },
     handler,
     hashdb::HashDb,
+    inode_storage::InodeMarks,
     mode::Mode,
 };
 
@@ -149,6 +150,12 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
         config_map
             .set(1, u32::from(cfg.mark_localhost), 0)
             .context("setting CONFIG[1] = mark_localhost")?;
+        // Index 2 = the daemon's own PID. The eBPF read-taint branch skips
+        // it so the daemon — which opens marked files (O_PATH) to back-fill
+        // INODE_MARKS — never taints itself and marks its own writes.
+        config_map
+            .set(2, std::process::id(), 0)
+            .context("setting CONFIG[2] = self_pid")?;
     }
 
     let events_map = bpf
@@ -156,6 +163,15 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
         .ok_or_else(|| anyhow!("EVENTS map not found in eBPF object"))?;
     let ring_buf = RingBuf::try_from(events_map).context("opening ring buffer")?;
     let mut poll = AsyncFd::with_interest(RingBufFd(ring_buf), tokio::io::Interest::READABLE)?;
+
+    // Userspace handle to INODE_MARKS, used to back-fill the augmented record
+    // (with the resolved creator_path_hash) after each file is marked. Taking
+    // the map out of `bpf` keeps it live in the kernel — the attached
+    // programs hold their own load-time reference.
+    let inode_marks_map = bpf
+        .take_map("INODE_MARKS")
+        .ok_or_else(|| anyhow!("INODE_MARKS map not found in eBPF object"))?;
+    let mut inode_marks = InodeMarks::new(inode_marks_map)?;
 
     let soak = match cfg.mode {
         Mode::Soak => {
@@ -201,7 +217,7 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
                 let mut guard = res.context("polling ring buffer")?;
                 let ring = &mut guard.get_inner_mut().0;
                 while let Some(item) = ring.next() {
-                    handler::handle_event(&handler_cfg, item.as_ref());
+                    handler::handle_event(&handler_cfg, &mut inode_marks, item.as_ref());
                 }
                 guard.clear_ready();
             }

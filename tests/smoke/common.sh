@@ -84,8 +84,10 @@ start_daemon() {
     rm -f "$logfile"
 
     # `run` subcommand. Empty --config keeps us off /etc/linprov/config.toml
-    # — the smoke suite is purely CLI-driven.
-    local args=(run --config /dev/null --mode "$mode" --log-level info)
+    # — the smoke suite is purely CLI-driven. Log level defaults to info;
+    # tests that assert on the (DEBUG-level) "marked ..." lines set
+    # LINPROV_LOG_LEVEL=debug.
+    local args=(run --config /dev/null --mode "$mode" --log-level "${LINPROV_LOG_LEVEL:-info}")
     if [ "$allowlist" != "-" ]; then
         args+=(--allowlist "$allowlist")
     fi

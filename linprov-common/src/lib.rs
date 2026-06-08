@@ -155,6 +155,12 @@ pub const XATTR_NAME: &str = "security.bpf.linprov.origin";
 
 pub const EVENT_KIND_NETWORK_FILE_OPEN: u32 = 1;
 pub const EVENT_KIND_EXECVE: u32 = 2;
+/// A file written by a process that had **read** a marked file (taint
+/// propagation — e.g. `tar`/`unzip` extracting a marked archive, or `cp`
+/// of a marked file). The carried `origin` is inherited from the source
+/// file's record; userspace persists the xattr without re-resolving the
+/// creator (the inherited creator identity is kept verbatim).
+pub const EVENT_KIND_DERIVED_FILE_OPEN: u32 = 3;
 
 /// Runtime mode communicated to the eBPF program via the CONFIG map.
 pub const MODE_OBSERVE: u32 = 0;

@@ -12,14 +12,18 @@ Three sleepable BPF LSM hooks plus one cleanup tracepoint:
 | Hook | What it does |
 |---|---|
 | `socket_connect` | When a PID `connect()`s to a non-loopback `AF_INET`/`AF_INET6` address, mark the PID as network-touched in an LRU hash map. Loopback connects (`127.0.0.0/8`, `::1`) are skipped by default — pass `--mark-localhost` or `LINPROV_MARK_LOCALHOST=1` to include them (e.g. for the smoke tests, which use a local HTTP server). |
-| `file_open` | If the opener is network-touched and the file is opened for write, write the OriginRecord into a `BPF_MAP_TYPE_INODE_STORAGE` map keyed on the file's inode, and emit a ringbuf event with the path. |
+| `file_open` | **Write:** if the opener is a *mark source* and the file is opened for write, write the OriginRecord into a `BPF_MAP_TYPE_INODE_STORAGE` map keyed on the file's inode and emit a ringbuf event. A mark source is either a network-touched PID (fresh record, the opener is the creator) or a *taint-propagating* PID (inherits the source file's record). **Read:** if the opener reads an already-marked inode, taint it (`PROP_PIDS`) carrying that record — so files it later writes inherit the mark. This is how a `tar`/`unzip` of a marked archive — or a `cp` of a marked file — propagates provenance to the outputs (same-boot; see ROADMAP for caveats). |
 | `bprm_check_security` | On every exec, look the inode up in INODE_MARKS first; if absent, fall back to the `bpf_get_file_xattr` kfunc. If either source has the mark, emit a ringbuf event — and in enforce mode, return `-EPERM` for paths not on the allowlist. |
-| `sched_process_exit` (tracepoint) | Reap the network-touched PID entry on task teardown. |
+| `sched_process_exit` (tracepoint) | Reap the network-touched and taint-propagating PID entries (`NET_PIDS`, `PROP_PIDS`) on task teardown. |
 
 Userspace consumes the ringbuf, applies the `security.bpf.linprov.origin`
 xattr (the kernel restricts `bpf_set_dentry_xattr` to LSM hooks that
 natively take a trusted dentry, which `file_open` isn't), and — in
-enforce mode — seeds an in-kernel hash map of permitted paths.
+enforce mode — seeds an in-kernel hash map of permitted paths. It also
+back-fills the augmented record (with the resolved creator exe-path hash)
+into INODE_MARKS, since the in-kernel `file_open` copy can't resolve the
+creator path itself — this lets the `bprm` fast path skip the xattr kfunc
+and lets read-taint propagation inherit the full creator identity.
 
 The two mark sources play different roles:
 

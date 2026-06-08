@@ -5,12 +5,25 @@ picking up the repo knows where it's going.
 
 ## Provenance scope
 
-- **Archive-aware provenance.** The mark currently lives on a single
-  inode. If you `tar xf` or `unzip` a marked archive, the extracted
-  files come out unmarked. Hook tar/zip in userspace (FUSE? `inotify`?
-  LD_PRELOAD on `libarchive`?) or — better — extend the BPF program to
-  track inode derivation through `inode_create` when the creating
-  process is reading a marked file.
+- **Archive-aware provenance.** *Landed (same-boot).* A process that
+  **reads** a marked inode is tainted (`PROP_PIDS`); files it later
+  **writes** inherit the source's `OriginRecord` with their own landing
+  hashes. So `tar xf` / `unzip` of a marked archive marks the extracted
+  files, and `cp` of a marked file propagates too. Implemented in
+  `file_open` (read branch taints, write branch inherits) — no separate
+  `inode_create` hook needed. Remaining work:
+  - **Cross-boot.** Taint reads only the in-kernel `INODE_MARKS` map (one
+    cheap lookup on the hot read path), so an archive whose mark survives
+    only as an xattr (downloaded a previous boot, inode-storage evicted)
+    won't propagate. Reading the xattr via the `bpf_get_file_xattr` kfunc
+    on every non-write open would close this but is a real cost on the
+    kernel's busiest path — deferred.
+  - **`creator_path_hash` race.** Userspace back-fills the augmented record
+    (with the resolved creator exe-path hash) into `INODE_MARKS` after
+    marking, so inheritance normally carries the full creator identity. But
+    if extraction beats that async back-fill, the derived file inherits
+    `creator_path_hash == 0` (creator `comm`/uid/pid/ts still propagate) —
+    same best-effort timing as the xattr.
 - **Script support.** Today only ELF binaries trigger the exec hook in
   a useful way. `#!/usr/bin/env python` runs Python on a marked
   script, but it's Python that the exec hook sees — not the script.
@@ -35,14 +48,19 @@ picking up the repo knows where it's going.
 
 ## Allowlist
 
-- **Bigger rule set.** `MAX_RULES = 32` today because each rule's
-  conditions are walked per execve and the kernel verifier caps the
-  per-program-load instruction count at 1M. The current bottleneck is
-  re-walking path-shaped dims for each rule. Folding into a single
-  pre-pass + bitset lookup would scale beyond 32, but the pre-pass
-  itself exploded the verifier (per-byte conditional stores). A
-  `bpf_loop`-based path scan would sidestep this.
-- **Path globs** (`/opt/installed/*.so`) — currently exact paths and
+- **Bigger rule set.** `MAX_RULES = 32` today. The `bpf_loop`-based
+  path scan that this entry used to propose as future work has since
+  landed (`linprov-ebpf/src/main.rs`: the FNV walks run inside a
+  `bpf_loop` callback via helper 181, kernel >= 5.17) — the verifier
+  now inspects the callback once instead of unrolling the loop body
+  across every rule × dim. That removed the verifier-amortization
+  blocker, but the 32-rule ceiling itself has not moved. Pushing past
+  32 still wants the single pre-pass + bitset lookup (the naive
+  per-byte conditional-store version exploded the verifier).
+- **Path globs.** Recursive folder matching via a trailing `*`
+  (`target_folder=/opt/app/*` → `TARGET_FOLDER_RECURSIVE`, matches the
+  folder or any descendant) has landed. Still missing: infix globs
+  like `/opt/installed/*.so`. Today's rules are exact paths and
   recursive folder prefixes only.
 - **LPM-trie folder match.** FNV hashing works but it's exact-prefix.
   LPM trie isn't allowed in sleepable programs; if we ever split exec
@@ -56,10 +74,12 @@ picking up the repo knows where it's going.
   defaults. A follow-up: an interactive flow that enables the unit in
   `soak` mode, watches for N hours / executions, and proposes the
   resulting allowlist for review before flipping to `enforce`.
-- **Ad-hoc allow at block time.** Every `BLOCKED-EXEC` log line emits
-  a short stable token. `linprov allow <token>` appends a rule that
-  would have permitted that exec to the allowlist file and signals
-  the daemon to hot-reload (SIGHUP or inotify). No daemon restart
-  required.
+- **Ad-hoc allow at block time.** Not yet implemented. The design:
+  have every `BLOCKED-EXEC` log line emit a short stable token, then a
+  `linprov allow <token>` subcommand that appends a rule which would
+  have permitted that exec to the allowlist file and signals the
+  daemon to hot-reload (SIGHUP or inotify). No daemon restart
+  required. (Today `BLOCKED-EXEC` logs full context but no token, and
+  there is no `allow` subcommand.)
 - **Hot reload.** SIGHUP re-parses the allowlist file and re-seeds
   the BPF rules map.

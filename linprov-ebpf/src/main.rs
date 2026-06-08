@@ -44,9 +44,9 @@ use aya_ebpf::{
     programs::{LsmContext, TracePointContext},
 };
 use linprov_common::{
-    dim, AllowRule, Event, OriginRecord, COMM_LEN, EVENT_KIND_EXECVE, EVENT_KIND_NETWORK_FILE_OPEN,
-    EXEC_PATH_LEN, FNV_OFFSET, FNV_PRIME, MAX_FOLDER_ANCESTORS, MAX_RULES, MODE_ENFORCE,
-    ORIGIN_VERSION, PATH_HASH_SCAN_LEN,
+    dim, AllowRule, Event, OriginRecord, COMM_LEN, EVENT_KIND_DERIVED_FILE_OPEN, EVENT_KIND_EXECVE,
+    EVENT_KIND_NETWORK_FILE_OPEN, EXEC_PATH_LEN, FNV_OFFSET, FNV_PRIME, MAX_FOLDER_ANCESTORS,
+    MAX_RULES, MODE_ENFORCE, ORIGIN_VERSION, PATH_HASH_SCAN_LEN,
 };
 
 // Kernel kfunc. Resolved at load time by the patched aya: the unresolved
@@ -133,6 +133,14 @@ struct KernelLinuxBinprm {
 #[map]
 static NET_PIDS: LruHashMap<u32, u8> = LruHashMap::with_max_entries(8192, 0);
 
+/// PIDs tainted by **reading** a marked inode (same-boot, via INODE_MARKS).
+/// The value is the source file's `OriginRecord`: files this PID
+/// subsequently writes inherit it (with their own landing hashes), so a
+/// `tar`/`unzip`/`cp` of a marked file propagates the mark to its outputs.
+/// Reaped on task exit alongside `NET_PIDS`.
+#[map]
+static PROP_PIDS: LruHashMap<u32, OriginRecord> = LruHashMap::with_max_entries(8192, 0);
+
 /// Per-inode provenance mark. Written in `file_open` the moment a
 /// network-touched PID opens a file for write; read first in
 /// `bprm_check_security` before falling back to the on-disk xattr.
@@ -181,11 +189,15 @@ static PATH_SCRATCH: PerCpuArray<PathScratch> = PerCpuArray::with_max_entries(1,
 ///   Index 1: non-zero to mark PIDs that connect to a loopback address
 ///            (default is to skip loopback so local dev / package
 ///            mirrors on 127.0.0.1 don't litter the allowlist).
+///   Index 2: the daemon's own PID. The read-taint branch skips it so the
+///            daemon — which opens marked files to back-fill INODE_MARKS —
+///            never taints itself and marks its own log/db/allowlist writes.
 #[map]
-static CONFIG: Array<u32> = Array::with_max_entries(2, 0);
+static CONFIG: Array<u32> = Array::with_max_entries(3, 0);
 
 const CONFIG_MODE: u32 = 0;
 const CONFIG_MARK_LOCALHOST: u32 = 1;
+const CONFIG_SELF_PID: u32 = 2;
 
 // ------ Allowlist rules. One slot per rule; each rule is an AND of
 // (dim, value) conditions. Rules OR together (first fully-matching rule
@@ -315,47 +327,94 @@ pub fn socket_connect(ctx: LsmContext) -> i32 {
 #[lsm(hook = "file_open", sleepable)]
 pub fn file_open(ctx: LsmContext) -> i32 {
     let pid = current_pid();
-    if unsafe { NET_PIDS.get(pid) }.is_none() {
-        return 0;
-    }
 
     let file_ptr: *const KernelFile = ctx.arg(0);
     if file_ptr.is_null() {
         return 0;
     }
-
+    let inode_ptr = unsafe { (*file_ptr).f_inode };
     let f_mode = unsafe { (*file_ptr).f_mode };
+
+    // --- Read branch: taint the reader if it opened a marked inode. ---
+    //
+    // Runs on every non-write open (the kernel's hottest path), so it does
+    // only a single cheap INODE_MARKS lookup — same-boot propagation only,
+    // no xattr read here. A process that reads a marked file is recorded in
+    // PROP_PIDS carrying the source's OriginRecord; files it later writes
+    // inherit it (the write branch below). This is what makes `tar`/`unzip`
+    // of a marked archive — and `cp` of a marked file — propagate the mark.
+    //
+    // The daemon is excluded: it opens marked files (O_PATH) to back-fill
+    // INODE_MARKS with the augmented record, and must never taint itself
+    // and start marking its own log / hashdb / allowlist writes.
     if f_mode & FMODE_WRITE == 0 {
+        let self_pid = CONFIG.get(CONFIG_SELF_PID).copied().unwrap_or(0);
+        if pid != self_pid && !inode_ptr.is_null() {
+            if let Some(stored) = unsafe { INODE_MARKS.get_ptr(inode_ptr) } {
+                // Pass the value BY REFERENCE: `insert` forwards the `&V`
+                // straight to bpf_map_update_elem, so this updates from the
+                // INODE_MARKS storage pointer with no 320-byte by-value copy
+                // on the BPF stack. clippy's "simplify `&*stored` to
+                // `*stored`" would reintroduce exactly that stack copy, so
+                // the lint is suppressed here deliberately.
+                #[allow(clippy::needless_borrows_for_generic_args)]
+                let _ = PROP_PIDS.insert(pid, unsafe { &*stored }, 0);
+            }
+        }
         return 0;
     }
 
+    // --- Write branch: mark the output if the writer is a mark source. ---
     let rec_ptr = match SCRATCH.get_ptr_mut(SCRATCH_FILE_OPEN) {
         Some(p) => p,
         None => return 0,
     };
+
+    // Two mark sources, in priority order:
+    //   * network-touched (NET_PIDS) → fresh record naming this process as
+    //     creator (creator_path_hash left 0 for userspace to augment);
+    //   * taint-propagating (PROP_PIDS) → inherit the source file's record
+    //     verbatim (creator identity, ts, and creator_path_hash if userspace
+    //     already back-filled it). Landing hashes are overwritten below.
+    // Neither → not a mark source; nothing to do.
+    let kind = if unsafe { NET_PIDS.get(pid) }.is_some() {
+        unsafe {
+            // Zero first so creator_path_hash (filled by userspace later)
+            // starts at 0 — bprm_check_security uses `creator_path_hash == 0`
+            // as the "not yet augmented" signal.
+            core::ptr::write_bytes(rec_ptr as *mut u8, 0, core::mem::size_of::<OriginRecord>());
+            (*rec_ptr).version = ORIGIN_VERSION;
+            (*rec_ptr).pid = pid;
+            (*rec_ptr).ts_boot_ns = bpf_ktime_get_boot_ns();
+            (*rec_ptr).comm = current_comm();
+            (*rec_ptr).creator_uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
+        }
+        EVENT_KIND_NETWORK_FILE_OPEN
+    } else if let Some(src) = PROP_PIDS.get_ptr(pid) {
+        // Inherit the source file's origin. Both maps hold OriginRecord, so
+        // this is a map→map copy with no by-value stack temporary.
+        unsafe { core::ptr::copy_nonoverlapping(src, rec_ptr, 1) };
+        EVENT_KIND_DERIVED_FILE_OPEN
+    } else {
+        return 0;
+    };
+
     let path_buf = match PATH_SCRATCH.get_ptr_mut(0) {
         Some(p) => p,
         None => return 0,
     };
     let path_ptr = unsafe { &(*file_ptr).f_path } as *const KernelPath as *mut bpf_path;
     unsafe {
-        // Zero everything first so creator_path_hash (filled by userspace
-        // later) starts at 0 — bprm_check_security uses
-        // `creator_path_hash == 0` as the "not yet augmented" signal.
-        core::ptr::write_bytes(rec_ptr as *mut u8, 0, core::mem::size_of::<OriginRecord>());
-        (*rec_ptr).version = ORIGIN_VERSION;
-        (*rec_ptr).pid = pid;
-        (*rec_ptr).ts_boot_ns = bpf_ktime_get_boot_ns();
-        (*rec_ptr).comm = current_comm();
-        (*rec_ptr).creator_uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
-        // Landing path = where the file is being written right now
-        // (distinct from the eventual exec-time path; the file may be
-        // renamed before execve). Resolve it into the scratch buffer and
-        // hash its immediate-parent folder and basename in one pass, so
+        // Landing path = where the file is being written right now (distinct
+        // from the eventual exec-time path; the file may be renamed before
+        // execve). Resolve it into the scratch buffer and hash its
+        // immediate-parent folder, basename, and ancestors in one pass — so
         // bprm_check_security can match landing_folder / landing_filename
-        // rules on the same-boot fast path. The full path string never
-        // gets stored — userspace logs the path → hash mapping into the
-        // audit db when it sees this file_open event.
+        // rules on the same-boot fast path. For the inherited (derived) case
+        // this overwrites the source's landing fields so the record describes
+        // *this* file's location, not the archive's. The full path string is
+        // never stored — userspace logs the path → hash mapping into the
+        // audit db when it sees the ringbuf event.
         let buf = (*path_buf).0.as_mut_ptr() as *mut c_char;
         let _ = bpf_d_path(path_ptr, buf, EXEC_PATH_LEN as u32);
         let (folder_hash, basename_hash) = landing_hashes(
@@ -364,19 +423,16 @@ pub fn file_open(ctx: LsmContext) -> i32 {
         );
         (*rec_ptr).landing_folder_hash = folder_hash;
         (*rec_ptr).landing_basename_hash = basename_hash;
-        // creator_path_hash stays 0. Userspace reads /proc/$pid/exe and
-        // writes the augmented record into the xattr.
     }
 
     // In-kernel mark: write the OriginRecord into inode storage right now.
     // bprm_check_security can then enforce on this inode without waiting on
     // userspace to land the xattr.
-    let inode_ptr = unsafe { (*file_ptr).f_inode };
     if !inode_ptr.is_null() {
         let _ = unsafe { INODE_MARKS.get_or_insert_ptr(inode_ptr, rec_ptr) };
     }
 
-    emit_event(EVENT_KIND_NETWORK_FILE_OPEN, path_ptr, pid, rec_ptr, 0);
+    emit_event(kind, path_ptr, pid, rec_ptr, 0);
     0
 }
 
@@ -917,7 +973,9 @@ fn emit_event(
 
 #[tracepoint]
 pub fn sched_process_exit(_ctx: TracePointContext) -> u32 {
-    let _ = NET_PIDS.remove(current_pid());
+    let pid = current_pid();
+    let _ = NET_PIDS.remove(pid);
+    let _ = PROP_PIDS.remove(pid);
     0
 }
 

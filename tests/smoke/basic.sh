@@ -5,6 +5,10 @@ here=$(dirname "$(realpath "$0")")
 . "$here/common.sh"
 smoke_preflight
 
+# The "marked ..." line is logged at DEBUG (INFO is reserved for execs), and
+# this test asserts on it.
+export LINPROV_LOG_LEVEL=debug
+
 cleanup_all
 mkdir -p /tmp/linprov-smoke
 cp -f /bin/true /tmp/linprov-smoke/probe
