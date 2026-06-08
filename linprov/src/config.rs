@@ -58,6 +58,25 @@ pub struct FileConfig {
     pub mark_localhost: Option<bool>,
     pub soak: Option<Vec<Dim>>,
     pub hash_db: Option<PathBuf>,
+    /// Script interpreters (by `comm`) whose reads of a marked file are
+    /// enforced like an execve — see [`default_interpreters`]. An explicit
+    /// empty list (`interpreters = []`) disables script enforcement.
+    pub interpreters: Option<Vec<String>>,
+}
+
+/// Built-in interpreter `comm` set used when neither the CLI nor the
+/// config file specifies one. These are the common shells / language
+/// runtimes that load a script by reading it (so the script never reaches
+/// the execve hook). Matched against the reader's `comm`, which the kernel
+/// truncates to 15 bytes — names here stay well under that.
+pub fn default_interpreters() -> Vec<String> {
+    [
+        "sh", "bash", "dash", "zsh", "ash", "ksh", "fish", "python", "python3", "perl", "ruby",
+        "node", "php", "lua", "awk", "gawk", "tclsh",
+    ]
+    .iter()
+    .map(|s| s.to_string())
+    .collect()
 }
 
 impl FileConfig {
@@ -83,6 +102,7 @@ pub struct EffectiveConfig {
     pub mark_localhost: bool,
     pub soak: Vec<Dim>,
     pub hash_db: PathBuf,
+    pub interpreters: Vec<String>,
 }
 
 impl EffectiveConfig {
@@ -106,6 +126,10 @@ impl EffectiveConfig {
                 .hash_db
                 .or(file.hash_db)
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_HASHDB_PATH)),
+            interpreters: cli
+                .interpreters
+                .or(file.interpreters)
+                .unwrap_or_else(default_interpreters),
         }
     }
 }
@@ -121,6 +145,7 @@ pub struct CliOverrides {
     pub mark_localhost: Option<bool>,
     pub soak: Option<Vec<Dim>>,
     pub hash_db: Option<PathBuf>,
+    pub interpreters: Option<Vec<String>>,
 }
 
 #[cfg(test)]
@@ -136,6 +161,17 @@ mod tests {
         assert_eq!(eff.soak, vec![Dim::CreatorProcess]);
         assert!(eff.allowlist.is_none());
         assert!(eff.log_file.is_none());
+        // Interpreters default to the built-in set, and an explicit empty
+        // list (disable) round-trips through resolution.
+        assert!(eff.interpreters.contains(&"bash".to_string()));
+        let disabled = EffectiveConfig::resolve(
+            CliOverrides {
+                interpreters: Some(vec![]),
+                ..Default::default()
+            },
+            FileConfig::default(),
+        );
+        assert!(disabled.interpreters.is_empty());
     }
 
     #[test]

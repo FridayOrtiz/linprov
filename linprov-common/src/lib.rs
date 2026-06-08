@@ -161,6 +161,16 @@ pub const EVENT_KIND_EXECVE: u32 = 2;
 /// file's record; userspace persists the xattr without re-resolving the
 /// creator (the inherited creator identity is kept verbatim).
 pub const EVENT_KIND_DERIVED_FILE_OPEN: u32 = 3;
+/// A marked file opened for **read** by a known script interpreter
+/// (bash/python/…) — i.e. `python foo.py` / `bash foo.sh` / `. foo.sh`,
+/// where the kernel execve's the unmarked interpreter and the script
+/// itself never reaches `bprm_check_security`. The eBPF `file_open` read
+/// branch runs the same allowlist check used at execve against the
+/// script's path; in enforce mode `status` is the LSM verdict (`-1`
+/// blocked). The `filename` carries the script's path and `comm` the
+/// script's basename, so the script — not the interpreter — is the unit
+/// surfaced in logs and soak. Matches `EVENT_KIND_EXECVE` handling.
+pub const EVENT_KIND_SCRIPT_EXEC: u32 = 4;
 
 /// Runtime mode communicated to the eBPF program via the CONFIG map.
 pub const MODE_OBSERVE: u32 = 0;

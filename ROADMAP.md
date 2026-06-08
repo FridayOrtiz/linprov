@@ -12,24 +12,56 @@ picking up the repo knows where it's going.
   files, and `cp` of a marked file propagates too. Implemented in
   `file_open` (read branch taints, write branch inherits) — no separate
   `inode_create` hook needed. Remaining work:
-  - **Cross-boot.** Taint reads only the in-kernel `INODE_MARKS` map (one
-    cheap lookup on the hot read path), so an archive whose mark survives
-    only as an xattr (downloaded a previous boot, inode-storage evicted)
-    won't propagate. Reading the xattr via the `bpf_get_file_xattr` kfunc
-    on every non-write open would close this but is a real cost on the
-    kernel's busiest path — deferred.
+  - **Cross-boot.** *Landed* (alongside script support). The `file_open`
+    read branch now falls back to the `bpf_get_file_xattr` kfunc when
+    `INODE_MARKS` misses, and **promotes** the on-disk record back into
+    `INODE_MARKS` — so an archive whose mark survives only as an xattr
+    (downloaded a previous boot, inode-storage evicted) propagates, and
+    the kfunc cost is paid once per inode per boot rather than on every
+    read. The trade-off the earlier note worried about is real but
+    bounded: the very first read of each previously-unseen inode now does
+    one (usually `-ENODATA`) xattr probe.
   - **`creator_path_hash` race.** Userspace back-fills the augmented record
     (with the resolved creator exe-path hash) into `INODE_MARKS` after
     marking, so inheritance normally carries the full creator identity. But
     if extraction beats that async back-fill, the derived file inherits
     `creator_path_hash == 0` (creator `comm`/uid/pid/ts still propagate) —
     same best-effort timing as the xattr.
-- **Script support.** Today only ELF binaries trigger the exec hook in
-  a useful way. `#!/usr/bin/env python` runs Python on a marked
-  script, but it's Python that the exec hook sees — not the script.
-  Want to read the script's xattr in `inode_permission` (or a
-  userspace shebang-aware wrapper) so script execution honors the same
-  enforce policy.
+- **Script support.** *Landed.* Shebang scripts (`./foo.sh`) were
+  always enforced — the kernel runs `bprm_check_security` on the script
+  file itself (depth 0 of `exec_binprm`, before binfmt_script swaps in
+  the interpreter). The gap was the *interpreter-invoked* form —
+  `bash foo.sh`, `python foo.py`, `. foo.sh` — where the kernel only
+  execve's the unmarked interpreter and the script reaches it as an
+  ordinary `open()`, never `bprm_check`. Now the `file_open` read branch
+  recognizes a known interpreter (configurable `comm` set, `INTERPRETERS`
+  map — bash/sh/python/perl/node/…) reading a *marked* file and runs the
+  same `check_allowlist` against the script's path, denying with
+  `-EPERM` when not permitted. So a rule keyed on the script
+  (`target_filename=/x/script.py`, `target_folder=/x/`) permits both the
+  interpreter and shebang forms identically. Remaining edges:
+  - **Interpreter reading marked *data*.** Once an interpreter is cleared
+    to run an approved (allowlisted) script, its PID is recorded in
+    `APPROVED_INTERP` and its *later* marked reads pass — so an allowlisted
+    script may open its own marked data files, exactly as an allowlisted
+    ELF reads marked files freely. The allowlist check (and the SCRIPT
+    event) therefore fire only on the first marked read per interpreter
+    invocation: the script itself. The residual case is an interpreter
+    reading a marked file *without* having been cleared to run a script —
+    an interactive `python` opening a marked `.json`, or a local/unmarked
+    script reading marked data — which is still denied (the kernel can't
+    tell code from data). Mitigated by the allowlist and by
+    narrowing/emptying the interpreter set (an empty set disables script
+    enforcement). The grant lasts the interpreter's lifetime: approved
+    (trusted) code may then read/source any marked file — consistent with
+    how an approved ELF is unrestricted, and the same reason
+    `exec(open(...).read())`-style in-process loading can't be caught at
+    the VFS layer regardless.
+  - **comm spoofing/truncation.** Interpreters are matched by `comm`,
+    which the kernel truncates to 15 bytes and which a process can
+    rename. Fine for cooperative environments; an exe-path-hash variant
+    (a `bpf_d_path` of the reader's exe) would harden it at a hot-path
+    cost.
 - **In-kernel xattr WRITE.** The `bpf_set_dentry_xattr` kfunc carries
   `KF_TRUSTED_ARGS` and `file->f_path.dentry` isn't on the verifier's
   safe-trusted list, so we can't call it from `file_open`. Either get

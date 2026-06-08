@@ -19,7 +19,8 @@ use std::{
 
 use linprov_common::{
     Event, OriginRecord, COMM_LEN, EVENT_KIND_DERIVED_FILE_OPEN, EVENT_KIND_EXECVE,
-    EVENT_KIND_NETWORK_FILE_OPEN, EXEC_PATH_LEN, MAX_FOLDER_ANCESTORS, ORIGIN_VERSION, XATTR_NAME,
+    EVENT_KIND_NETWORK_FILE_OPEN, EVENT_KIND_SCRIPT_EXEC, EXEC_PATH_LEN, MAX_FOLDER_ANCESTORS,
+    ORIGIN_VERSION, XATTR_NAME,
 };
 use log::{debug, info, warn};
 
@@ -58,6 +59,7 @@ pub fn handle_event(cfg: &Config, inode_marks: &mut InodeMarks, raw: &[u8]) {
         EVENT_KIND_NETWORK_FILE_OPEN => on_file_marked(cfg, inode_marks, event, false),
         EVENT_KIND_DERIVED_FILE_OPEN => on_file_marked(cfg, inode_marks, event, true),
         EVENT_KIND_EXECVE => on_execve_marked(cfg, event),
+        EVENT_KIND_SCRIPT_EXEC => on_script_exec(cfg, event),
         other => warn!("unknown event kind: {other}"),
     }
 }
@@ -240,24 +242,107 @@ fn on_execve_marked(cfg: &Config, event: &Event) {
         format_origin(&event.origin, &creator_comm, &creator_path),
     );
 
-    if cfg.mode == ModeArg::Soak {
-        if let Some(soak) = cfg.soak.as_ref() {
-            let exec_uid = get_uid_for_pid(event.pid).unwrap_or(0);
-            let ctx = OriginContext {
-                target_filename: &target_path,
-                landing_folder: landing_folder.as_deref(),
-                landing_basename: landing_basename.as_deref(),
-                creator_path: creator_path.as_deref(),
-                creator_comm: &creator_comm,
-                creator_uid: event.origin.creator_uid,
-                execution_uid: exec_uid,
-            };
-            match soak.record(&ctx) {
-                Ok(Some(line)) => info!("soak: added `{line}`"),
-                Ok(None) => {}
-                Err(e) => warn!("soak append failed: {e}"),
-            }
-        }
+    maybe_soak(
+        cfg,
+        event,
+        &target_path,
+        &landing_folder,
+        &landing_basename,
+        &creator_path,
+        &creator_comm,
+    );
+}
+
+/// Handle a script-exec event: a marked file opened for read by a known
+/// interpreter (`bash foo.sh` / `python foo.py` / `. foo.sh`). The script
+/// — not the interpreter — is the unit: `event.filename` is the script
+/// path and drives allowlist matching exactly like an execve; the
+/// interpreter's `comm` is carried for context. `status != 0` means the
+/// LSM denied the read (enforce). Mirrors `on_execve_marked`, including
+/// soak rule emission keyed on the script path, so a
+/// `target_filename=<script>` / `target_folder=<dir>` rule permits the
+/// script under any interpreter and under `./script` (shebang) alike.
+fn on_script_exec(cfg: &Config, event: &Event) {
+    let script_path = c_str_to_string(&event.filename);
+    let interp_comm = comm_to_string(&event.comm);
+    let creator_comm = comm_to_string(&event.origin.comm);
+
+    let creator_path = cfg.hashdb.resolve(event.origin.creator_path_hash);
+    let landing_folder = cfg.hashdb.resolve(event.origin.landing_folder_hash);
+    let landing_basename = cfg.hashdb.resolve(event.origin.landing_basename_hash);
+    let script_name = basename_of(&script_path).unwrap_or(&script_path);
+
+    if event.status != 0 {
+        warn!(
+            "BLOCKED-SCRIPT script={} name={} interp={} landing_folder={} landing_file={} pid={} origin={} (LSM verdict {})",
+            script_path,
+            script_name,
+            interp_comm,
+            resolved(&landing_folder, event.origin.landing_folder_hash),
+            resolved(&landing_basename, event.origin.landing_basename_hash),
+            event.pid,
+            format_origin(&event.origin, &creator_comm, &creator_path),
+            event.status,
+        );
+        return;
+    }
+
+    info!(
+        "PROVENANCE-SCRIPT script={} name={} interp={} landing_folder={} landing_file={} pid={} origin={}",
+        script_path,
+        script_name,
+        interp_comm,
+        resolved(&landing_folder, event.origin.landing_folder_hash),
+        resolved(&landing_basename, event.origin.landing_basename_hash),
+        event.pid,
+        format_origin(&event.origin, &creator_comm, &creator_path),
+    );
+
+    maybe_soak(
+        cfg,
+        event,
+        &script_path,
+        &landing_folder,
+        &landing_basename,
+        &creator_path,
+        &creator_comm,
+    );
+}
+
+/// In soak mode, emit one allowlist rule for this event keyed on `target`
+/// (the live exec path for execve, the script path for script-exec) plus
+/// the record-resolved landing/creator dims. Shared by `on_execve_marked`
+/// and `on_script_exec`.
+#[allow(clippy::too_many_arguments)]
+fn maybe_soak(
+    cfg: &Config,
+    event: &Event,
+    target: &str,
+    landing_folder: &Option<String>,
+    landing_basename: &Option<String>,
+    creator_path: &Option<String>,
+    creator_comm: &str,
+) {
+    if cfg.mode != ModeArg::Soak {
+        return;
+    }
+    let Some(soak) = cfg.soak.as_ref() else {
+        return;
+    };
+    let exec_uid = get_uid_for_pid(event.pid).unwrap_or(0);
+    let ctx = OriginContext {
+        target_filename: target,
+        landing_folder: landing_folder.as_deref(),
+        landing_basename: landing_basename.as_deref(),
+        creator_path: creator_path.as_deref(),
+        creator_comm,
+        creator_uid: event.origin.creator_uid,
+        execution_uid: exec_uid,
+    };
+    match soak.record(&ctx) {
+        Ok(Some(line)) => info!("soak: added `{line}`"),
+        Ok(None) => {}
+        Err(e) => warn!("soak append failed: {e}"),
     }
 }
 

@@ -3,7 +3,7 @@ name = "linprov"
 # Userspace daemon — what `cargo install linprov` ships. Bump 0.0.x for
 # fixes / log tweaks / docs; 0.x → 0.(x+1) for CLI surface changes
 # (mode/flags/env vars) or new operational behavior.
-version = "0.2.9"
+version = "0.2.10"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true

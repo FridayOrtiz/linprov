@@ -227,6 +227,15 @@ soak = ["creator_process"]
 # across reboots; enforcement never reads it. Default shown:
 # hash_db = "/var/lib/linprov/hashes.tsv"
 
+# Script interpreters (by `comm`) whose reads of a marked file are
+# enforced like an execve — so `bash foo.sh` / `python foo.py` /
+# `. foo.sh` honor the same policy as `./foo.sh`. A rule keyed on the
+# script (target_filename / target_folder) permits both forms. Defaults
+# to the common shells / runtimes (shown below). Set to `[]` to disable
+# script enforcement. Note: an interpreter reading a marked *data* file
+# is subject to the same check — allowlist it or trim this list.
+# interpreters = ["sh", "bash", "dash", "zsh", "python", "python3", "perl", "ruby", "node", "php", "lua", "awk"]
+
 # Optional: append logs to a file instead of stderr. Leave commented
 # out under systemd — journald captures stderr automatically. Useful
 # if you run linprov outside of systemd (`runit`, manual, container).

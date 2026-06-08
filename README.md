@@ -12,7 +12,7 @@ Three sleepable BPF LSM hooks plus one cleanup tracepoint:
 | Hook | What it does |
 |---|---|
 | `socket_connect` | When a PID `connect()`s to a non-loopback `AF_INET`/`AF_INET6` address, mark the PID as network-touched in an LRU hash map. Loopback connects (`127.0.0.0/8`, `::1`) are skipped by default — pass `--mark-localhost` or `LINPROV_MARK_LOCALHOST=1` to include them (e.g. for the smoke tests, which use a local HTTP server). |
-| `file_open` | **Write:** if the opener is a *mark source* and the file is opened for write, write the OriginRecord into a `BPF_MAP_TYPE_INODE_STORAGE` map keyed on the file's inode and emit a ringbuf event. A mark source is either a network-touched PID (fresh record, the opener is the creator) or a *taint-propagating* PID (inherits the source file's record). **Read:** if the opener reads an already-marked inode, taint it (`PROP_PIDS`) carrying that record — so files it later writes inherit the mark. This is how a `tar`/`unzip` of a marked archive — or a `cp` of a marked file — propagates provenance to the outputs (same-boot; see ROADMAP for caveats). |
+| `file_open` | **Write:** if the opener is a *mark source* and the file is opened for write, write the OriginRecord into a `BPF_MAP_TYPE_INODE_STORAGE` map keyed on the file's inode and emit a ringbuf event. A mark source is either a network-touched PID (fresh record, the opener is the creator) or a *taint-propagating* PID (inherits the source file's record). **Read:** look the inode up in INODE_MARKS; on a miss, fall back to the `bpf_get_file_xattr` kfunc and *promote* the result back into INODE_MARKS (so the kfunc cost is paid once per inode per boot). If the file is marked, taint the opener (`PROP_PIDS`) carrying that record — so files it later writes inherit the mark (this is how `tar`/`unzip`/`cp` propagate provenance). And if the opener's `comm` is a known **interpreter** (`bash`, `python`, …; the `INTERPRETERS` map) that hasn't yet been cleared (`APPROVED_INTERP`), this read is a *script being loaded for execution* — run the same allowlist check `bprm_check_security` uses against the script's path and, in enforce mode, return `-EPERM` when not permitted. On success the interpreter PID is approved so its later marked reads (the script's own data files) pass unchecked, like an allowlisted ELF. This closes `bash foo.sh` / `python foo.py` / `. foo.sh` (the interpreter is unmarked, so the script never reaches the execve hook); shebang `./foo.sh` was already covered by `bprm_check_security`. |
 | `bprm_check_security` | On every exec, look the inode up in INODE_MARKS first; if absent, fall back to the `bpf_get_file_xattr` kfunc. If either source has the mark, emit a ringbuf event — and in enforce mode, return `-EPERM` for paths not on the allowlist. |
 | `sched_process_exit` (tracepoint) | Reap the network-touched and taint-propagating PID entries (`NET_PIDS`, `PROP_PIDS`) on task teardown. |
 
@@ -187,6 +187,24 @@ override. The systemd unit calls `linprov run --config
   emitted rule AND-joins.
 - **enforce**: block any marked execve whose origin doesn't match a
   rule.
+
+Enforcement also covers **interpreter-invoked scripts** (`bash foo.sh`,
+`python foo.py`, `. foo.sh`), not just shebang execs: a known
+interpreter reading a marked file is checked against the allowlist by
+the script's path, so a rule like `target_filename=/x/script.py` or
+`target_folder=/x/` permits both the interpreter and shebang forms
+alike. The interpreter set is configurable — `--interpreters bash,sh,…`
+(or `interpreters = [...]` in the config); it defaults to the common
+shells / runtimes (bash, sh, python, perl, node, …). Pass an empty value
+(`--interpreters ''` or `interpreters = []`) to disable script
+enforcement. Blocked / observed scripts log as `BLOCKED-SCRIPT` /
+`PROVENANCE-SCRIPT`, surfacing the script (not the interpreter) as the
+unit. The check fires only on the *first* marked read per interpreter
+invocation — the script — so an allowlisted script may then open its own
+marked data files freely (just like an allowlisted ELF). An interpreter
+reading a marked file *without* having been cleared to run a script
+(interactive use, a local script reading downloaded data) is still
+denied — allowlist it or narrow the interpreter set if that's undesirable.
 
 By default logs go to stderr (journald captures them under
 systemd). Set `log_file = "/path/to/file"` in the config (or

@@ -11,13 +11,13 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use aya::{
     include_bytes_aligned,
-    maps::{Array, RingBuf},
+    maps::{Array, HashMap, RingBuf},
     programs::{Lsm, TracePoint},
     Btf, Ebpf,
 };
 use clap::Parser;
 use env_logger::Target;
-use linprov_common::{AllowRule, MAX_RULES};
+use linprov_common::{fnv_hash_bytes, AllowRule, COMM_LEN, MAX_RULES};
 use log::{info, warn};
 use tokio::{io::unix::AsyncFd, signal};
 
@@ -87,6 +87,14 @@ pub struct RunArgs {
     /// records back to paths for logs, soak, and `grep`-based audit.
     #[arg(long)]
     hash_db: Option<PathBuf>,
+
+    /// Script interpreters (by `comm`) whose reads of a marked file are
+    /// enforced like an execve, so `bash foo.sh` / `python foo.py` /
+    /// `. foo.sh` honor the same policy as `./foo.sh`. Comma-separated;
+    /// pass an empty value to disable script enforcement. Defaults to a
+    /// built-in set (bash, sh, python, perl, node, …).
+    #[arg(long, value_delimiter = ',')]
+    interpreters: Option<Vec<String>>,
 }
 
 pub fn execute(args: RunArgs) -> Result<()> {
@@ -99,6 +107,7 @@ pub fn execute(args: RunArgs) -> Result<()> {
         mark_localhost: args.mark_localhost,
         soak: args.soak,
         hash_db: args.hash_db,
+        interpreters: args.interpreters,
     };
     let cfg = EffectiveConfig::resolve(cli, file);
     init_logger(&cfg.log_level, cfg.log_file.as_deref())?;
@@ -139,6 +148,7 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
     rules.check_capacity()?;
 
     seed_allowlist_rules(&mut bpf, &rules)?;
+    seed_interpreters(&mut bpf, &cfg.interpreters)?;
 
     {
         let mut config_map: Array<_, u32> =
@@ -270,6 +280,40 @@ fn seed_allowlist_rules(bpf: &mut Ebpf, rules: &Rules) -> Result<()> {
         .context("setting ALLOW_RULE_COUNT[0]")?;
 
     info!("loaded {} allowlist rules", rules.len());
+    Ok(())
+}
+
+/// Seed the `INTERPRETERS` BPF map from the configured interpreter list.
+/// Each name is hashed with the same FNV-1a-64 the eBPF `fnv_comm` uses,
+/// over the bytes the kernel would keep in `comm` (truncated to
+/// `COMM_LEN - 1`). An empty list leaves the map empty, which disables
+/// script enforcement in the read branch.
+fn seed_interpreters(bpf: &mut Ebpf, interpreters: &[String]) -> Result<()> {
+    let mut map: HashMap<_, u64, u8> = HashMap::try_from(
+        bpf.map_mut("INTERPRETERS")
+            .context("INTERPRETERS map missing")?,
+    )
+    .context("opening INTERPRETERS")?;
+
+    let mut n = 0u32;
+    for name in interpreters {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        let bytes = name.as_bytes();
+        let truncated = &bytes[..bytes.len().min(COMM_LEN - 1)];
+        let h = fnv_hash_bytes(truncated);
+        map.insert(h, 1u8, 0)
+            .with_context(|| format!("seeding interpreter `{name}`"))?;
+        n += 1;
+    }
+
+    if n == 0 {
+        info!("script enforcement disabled (no interpreters configured)");
+    } else {
+        info!("script enforcement on for {n} interpreters: {}", interpreters.join(","));
+    }
     Ok(())
 }
 

@@ -60,8 +60,8 @@ xattr = "1"
 # as a `[build-dependencies]` so that on `cargo install linprov`
 # cargo downloads its source into the registry cache, where
 # linprov's build.rs picks it up via `linprov_ebpf::SOURCE_DIR`.
-linprov-common = { path = "linprov-common", version = "0.1.5" }
-linprov-ebpf = { path = "linprov-ebpf", version = "0.2.5" }
+linprov-common = { path = "linprov-common", version = "0.1.6" }
+linprov-ebpf = { path = "linprov-ebpf", version = "0.2.6" }
 
 # BPF objects need: panic="abort" (no unwinding in kernel), no
 # overflow checks / debug-assertions (the compiler emits `loop {}`

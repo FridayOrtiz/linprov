@@ -40,13 +40,13 @@ use aya_ebpf::{
         bpf_get_current_uid_gid, bpf_ktime_get_boot_ns, bpf_probe_read_kernel,
     },
     macros::{btf_map, lsm, map, tracepoint},
-    maps::{Array, LruHashMap, PerCpuArray, RingBuf},
+    maps::{Array, HashMap, LruHashMap, PerCpuArray, RingBuf},
     programs::{LsmContext, TracePointContext},
 };
 use linprov_common::{
     dim, AllowRule, Event, OriginRecord, COMM_LEN, EVENT_KIND_DERIVED_FILE_OPEN, EVENT_KIND_EXECVE,
-    EVENT_KIND_NETWORK_FILE_OPEN, EXEC_PATH_LEN, FNV_OFFSET, FNV_PRIME, MAX_FOLDER_ANCESTORS,
-    MAX_RULES, MODE_ENFORCE, ORIGIN_VERSION, PATH_HASH_SCAN_LEN,
+    EVENT_KIND_NETWORK_FILE_OPEN, EVENT_KIND_SCRIPT_EXEC, EXEC_PATH_LEN, FNV_OFFSET, FNV_PRIME,
+    MAX_FOLDER_ANCESTORS, MAX_RULES, MODE_ENFORCE, ORIGIN_VERSION, PATH_HASH_SCAN_LEN,
 };
 
 // Kernel kfunc. Resolved at load time by the patched aya: the unresolved
@@ -81,6 +81,32 @@ unsafe fn call_get_file_xattr(
         options(nostack),
     );
     ret as i32
+}
+
+/// Read the `security.bpf.linprov.origin` xattr off `file_ptr` into `buf`
+/// (a record-sized scratch buffer, e.g. a `SCRATCH` map value) via the
+/// `bpf_get_file_xattr` kfunc. Returns true on success — `buf` then holds
+/// the on-disk [`OriginRecord`]; on failure (no xattr, dynptr setup error)
+/// `buf` is left untouched and we return false. Used by both
+/// `bprm_check_security` and the `file_open` read branch.
+#[inline(always)]
+unsafe fn read_origin_xattr(file_ptr: *const KernelFile, buf: *mut OriginRecord) -> bool {
+    let mut dynptr = MaybeUninit::<bpf_dynptr>::uninit();
+    let r = bpf_dynptr_from_mem(
+        buf as *mut c_void,
+        core::mem::size_of::<OriginRecord>() as u32,
+        0,
+        dynptr.as_mut_ptr(),
+    );
+    if r != 0 {
+        return false;
+    }
+    let get_ret = call_get_file_xattr(
+        file_ptr as *mut c_void,
+        XATTR_NAME_C.as_ptr() as *const c_char,
+        dynptr.as_mut_ptr(),
+    );
+    get_ret >= 0
 }
 
 // Helper 147; aya doesn't re-export it.
@@ -140,6 +166,33 @@ static NET_PIDS: LruHashMap<u32, u8> = LruHashMap::with_max_entries(8192, 0);
 /// Reaped on task exit alongside `NET_PIDS`.
 #[map]
 static PROP_PIDS: LruHashMap<u32, OriginRecord> = LruHashMap::with_max_entries(8192, 0);
+
+/// Known script interpreters, keyed by `FNV-1a-64` of their `comm`
+/// (`fnv_comm`, identical to userspace `fnv_hash` of the comm string).
+/// Seeded by userspace from config. When a process whose comm is in this
+/// set opens a *marked* file for read — `bash foo.sh`, `python foo.py`,
+/// `. foo.sh` — the `file_open` read branch runs the same allowlist check
+/// `bprm_check_security` uses, so interpreter-invoked scripts honor the
+/// enforce policy that shebang scripts already get (the kernel runs
+/// `bprm_check` on the script itself for `#!`-dispatched execs, but the
+/// interpreter-as-argv form never reaches it). An empty map disables
+/// script enforcement.
+#[map]
+static INTERPRETERS: HashMap<u64, u8> = HashMap::with_max_entries(64, 0);
+
+/// Interpreter PIDs already cleared to run an approved script. Once an
+/// interpreter's read of a marked file passes the allowlist (it IS an
+/// allowlisted script), its PID lands here and its *subsequent* marked
+/// reads are no longer gated — the running script may open its own marked
+/// data files, just as an allowlisted ELF reads marked files freely (the
+/// read branch only taints those, never blocks). Without this, an
+/// allowlisted `python foo.py` that did `open("marked.json")` would be
+/// blocked on the data read — both wrong and inconsistent with ELF
+/// behavior. The grant lasts the life of the interpreter process (running
+/// approved code is trusted to do I/O); reaped on task exit alongside
+/// `NET_PIDS`/`PROP_PIDS`.
+#[map]
+static APPROVED_INTERP: LruHashMap<u32, u8> = LruHashMap::with_max_entries(8192, 0);
 
 /// Per-inode provenance mark. Written in `file_open` the moment a
 /// network-touched PID opens a file for write; read first in
@@ -219,6 +272,23 @@ fn current_pid() -> u32 {
 #[inline(always)]
 fn current_comm() -> [u8; 16] {
     bpf_get_current_comm().unwrap_or([0u8; 16])
+}
+
+/// FNV-1a-64 of a NUL-terminated `comm` (kernel `comm` is always
+/// NUL-terminated within 16 bytes). Identical to userspace
+/// `fnv_hash`/`fnv_hash_bytes` over the comm string, so the
+/// [`INTERPRETERS`] lookup matches what userspace seeded.
+#[inline(always)]
+fn fnv_comm(comm: &[u8; COMM_LEN]) -> u64 {
+    let mut h = FNV_OFFSET;
+    for &b in comm.iter() {
+        if b == 0 {
+            break;
+        }
+        h ^= b as u64;
+        h = h.wrapping_mul(FNV_PRIME);
+    }
+    h
 }
 
 // sockaddr layout, family-specific. We only need the address bytes —
@@ -335,32 +405,110 @@ pub fn file_open(ctx: LsmContext) -> i32 {
     let inode_ptr = unsafe { (*file_ptr).f_inode };
     let f_mode = unsafe { (*file_ptr).f_mode };
 
-    // --- Read branch: taint the reader if it opened a marked inode. ---
+    // --- Read branch: taint the reader, and enforce on interpreters. ---
     //
-    // Runs on every non-write open (the kernel's hottest path), so it does
-    // only a single cheap INODE_MARKS lookup — same-boot propagation only,
-    // no xattr read here. A process that reads a marked file is recorded in
-    // PROP_PIDS carrying the source's OriginRecord; files it later writes
-    // inherit it (the write branch below). This is what makes `tar`/`unzip`
-    // of a marked archive — and `cp` of a marked file — propagate the mark.
-    //
-    // The daemon is excluded: it opens marked files (O_PATH) to back-fill
+    // Runs on every non-write open (the kernel's hottest path). The daemon
+    // is excluded first: it opens marked files (O_PATH) to back-fill
     // INODE_MARKS with the augmented record, and must never taint itself
     // and start marking its own log / hashdb / allowlist writes.
     if f_mode & FMODE_WRITE == 0 {
         let self_pid = CONFIG.get(CONFIG_SELF_PID).copied().unwrap_or(0);
-        if pid != self_pid && !inode_ptr.is_null() {
-            if let Some(stored) = unsafe { INODE_MARKS.get_ptr(inode_ptr) } {
-                // Pass the value BY REFERENCE: `insert` forwards the `&V`
-                // straight to bpf_map_update_elem, so this updates from the
-                // INODE_MARKS storage pointer with no 320-byte by-value copy
-                // on the BPF stack. clippy's "simplify `&*stored` to
-                // `*stored`" would reintroduce exactly that stack copy, so
-                // the lint is suppressed here deliberately.
-                #[allow(clippy::needless_borrows_for_generic_args)]
-                let _ = PROP_PIDS.insert(pid, unsafe { &*stored }, 0);
-            }
+        if pid == self_pid || inode_ptr.is_null() {
+            return 0;
         }
+
+        // Obtain the mark for this inode into the per-CPU scratch record.
+        // Fast path is INODE_MARKS (one cheap lookup, same boot). On a
+        // miss, fall back to the on-disk xattr and PROMOTE it into
+        // INODE_MARKS, so the very next read of this inode hits the fast
+        // path and the cost is paid once per inode per boot. This warms the
+        // cache for both branches below — and is what lets `tar`/`cp`
+        // propagation and script enforcement work across boots (when the
+        // inode-storage mark is gone but the xattr survives), not just
+        // same-boot.
+        //
+        // The record is always materialized into the SAME scratch buffer so
+        // everything downstream (`check_allowlist`, the PROP_PIDS taint)
+        // sees ONE pointer provenance. Letting `rec_ptr` straddle two map
+        // types (INODE_MARKS vs SCRATCH) makes the verifier re-explore the
+        // allowlist loop under both, which blows the 1M-insn budget.
+        let rec_ptr = match SCRATCH.get_ptr_mut(SCRATCH_FILE_OPEN) {
+            Some(p) => p,
+            None => return 0,
+        };
+        if let Some(stored) = unsafe { INODE_MARKS.get_ptr(inode_ptr) } {
+            unsafe { core::ptr::copy_nonoverlapping(stored, rec_ptr, 1) };
+        } else {
+            unsafe {
+                core::ptr::write_bytes(rec_ptr as *mut u8, 0, core::mem::size_of::<OriginRecord>());
+            }
+            if !unsafe { read_origin_xattr(file_ptr, rec_ptr) } {
+                return 0; // no mark — unmarked file, nothing to do
+            }
+            if unsafe { (*rec_ptr).version } != ORIGIN_VERSION {
+                return 0; // stale schema — treat as unmarked
+            }
+            // Promote into the in-kernel fast path for next time.
+            let _ = unsafe { INODE_MARKS.get_or_insert_ptr(inode_ptr, rec_ptr) };
+        }
+        let rec_ptr: *const OriginRecord = rec_ptr;
+
+        // Interpreter enforcement. If the reader is a known interpreter,
+        // this read is (the first time) the script being loaded for
+        // execution — apply the same allowlist policy bprm_check_security
+        // uses, against the script's path. This closes the `bash foo.sh` /
+        // `python foo.py` / `. foo.sh` gap (the interpreter is an unmarked
+        // system binary, so the script never reaches the execve hook).
+        //
+        // Once an interpreter has been cleared to run an approved script
+        // its PID is recorded in APPROVED_INTERP and we stop gating its
+        // reads: the running (approved) script may open its own marked
+        // data files, exactly as an allowlisted ELF reads marked files
+        // freely. So the allowlist check (and the SCRIPT event) fire only
+        // on the first marked read per interpreter invocation — the script
+        // itself — not on every data file it subsequently touches.
+        let comm_hash = fnv_comm(&current_comm());
+        if unsafe { INTERPRETERS.get(&comm_hash) }.is_some()
+            && unsafe { APPROVED_INTERP.get(pid) }.is_none()
+        {
+            let path_ptr = unsafe { &(*file_ptr).f_path } as *const KernelPath as *mut bpf_path;
+            let mode = CONFIG.get(CONFIG_MODE).copied().unwrap_or(0);
+            let permit = if mode == MODE_ENFORCE {
+                // Resolve the script path and match exactly like execve.
+                match PATH_SCRATCH.get_ptr_mut(0) {
+                    Some(path_buf) => unsafe {
+                        let b = (*path_buf).0.as_mut_ptr() as *mut c_char;
+                        let _ = bpf_d_path(path_ptr, b, EXEC_PATH_LEN as u32);
+                        check_allowlist(&(*path_buf).0, &*rec_ptr)
+                    },
+                    None => return 0,
+                }
+            } else {
+                true
+            };
+            let decision: i32 = if !permit { -1 } else { 0 };
+            // Surface the SCRIPT as the unit (filename = script path); the
+            // event carries the interpreter's comm for context, and
+            // userspace headlines the script basename. status = LSM verdict.
+            emit_event(EVENT_KIND_SCRIPT_EXEC, path_ptr, pid, rec_ptr, decision);
+            if decision != 0 {
+                // Blocked: the open is denied, so the interpreter never
+                // gets the bytes — do NOT taint it, do NOT approve it.
+                return decision;
+            }
+            // Permitted: this interpreter is now running an approved
+            // script; clear its later marked reads.
+            let _ = APPROVED_INTERP.insert(pid, 1u8, 0);
+        }
+
+        // Taint: this reader is allowed to consume the marked file, so files
+        // it later writes inherit the source's OriginRecord (the write
+        // branch below). Pass BY REFERENCE: `insert` forwards the `&V`
+        // straight to bpf_map_update_elem — no 320-byte by-value copy on the
+        // BPF stack. clippy's "simplify `&*rec_ptr` to `*rec_ptr`" would
+        // reintroduce exactly that copy, so the lint is suppressed here.
+        #[allow(clippy::needless_borrows_for_generic_args)]
+        let _ = PROP_PIDS.insert(pid, unsafe { &*rec_ptr }, 0);
         return 0;
     }
 
@@ -491,25 +639,7 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     let need_xattr = !have_storage || unsafe { (*buf).creator_path_hash == 0 };
     let mut have_xattr = false;
     if need_xattr {
-        let mut dynptr = MaybeUninit::<bpf_dynptr>::uninit();
-        let r = unsafe {
-            bpf_dynptr_from_mem(
-                buf as *mut c_void,
-                core::mem::size_of::<OriginRecord>() as u32,
-                0,
-                dynptr.as_mut_ptr(),
-            )
-        };
-        if r == 0 {
-            let get_ret = unsafe {
-                call_get_file_xattr(
-                    file_ptr as *mut c_void,
-                    XATTR_NAME_C.as_ptr() as *const c_char,
-                    dynptr.as_mut_ptr(),
-                )
-            };
-            have_xattr = get_ret >= 0;
-        }
+        have_xattr = unsafe { read_origin_xattr(file_ptr, buf) };
     }
 
     // If xattr was missing and storage was empty, the file isn't marked.
@@ -976,6 +1106,7 @@ pub fn sched_process_exit(_ctx: TracePointContext) -> u32 {
     let pid = current_pid();
     let _ = NET_PIDS.remove(pid);
     let _ = PROP_PIDS.remove(pid);
+    let _ = APPROVED_INTERP.remove(pid);
     0
 }
 
