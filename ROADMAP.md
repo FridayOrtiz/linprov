@@ -57,6 +57,12 @@ picking up the repo knows where it's going.
     how an approved ELF is unrestricted, and the same reason
     `exec(open(...).read())`-style in-process loading can't be caught at
     the VFS layer regardless.
+  - **Pseudo-fs exclusion.** `/dev`, `/proc`, `/sys`, `/run` are never
+    marked (the eBPF write branch skips them, mirroring userspace
+    `is_pseudo_fs`). Without this a net-touched process writing to
+    `/dev/null` — which everything does — marked its inode, and then any
+    interpreter reading `/dev/null` (every shell, every `2>/dev/null`) was
+    denied in enforce mode, wedging the box. Found by dogfooding.
   - **comm spoofing/truncation.** Interpreters are matched by `comm`,
     which the kernel truncates to 15 bytes and which a process can
     rename. Fine for cooperative environments; an exe-path-hash variant

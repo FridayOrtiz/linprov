@@ -307,6 +307,36 @@ fn fnv_comm(comm: &[u8; COMM_LEN]) -> u64 {
     h
 }
 
+/// Whether the NUL-terminated path at `path` begins with `prefix`. `N` is a
+/// const so the verifier fully unrolls the compare; `path` points into the
+/// `PATH_SCRATCH` map value (≥ `prefix.len()` bytes, so the reads are
+/// provably in-bounds — pseudo-fs prefixes are ≤ 6 bytes vs a 4096 buffer).
+#[inline(always)]
+unsafe fn starts_with<const N: usize>(path: *const u8, prefix: &[u8; N]) -> bool {
+    let mut i = 0;
+    while i < N {
+        if *path.add(i) != prefix[i] {
+            return false;
+        }
+        i += 1;
+    }
+    true
+}
+
+/// Pseudo-filesystem path? (`/dev/`, `/proc/`, `/sys/`, `/run/`.) Mirrors
+/// the userspace `is_pseudo_fs` skip. We must NOT mark these in-kernel: a
+/// net-touched process writing to `/dev/null` (everything does) would
+/// otherwise stamp its inode into `INODE_MARKS`, and any interpreter later
+/// reading `/dev/null` (every shell does) would be denied in enforce mode —
+/// wedging the box.
+#[inline(always)]
+unsafe fn is_pseudo_fs(path: *const u8) -> bool {
+    starts_with(path, b"/dev/")
+        || starts_with(path, b"/proc/")
+        || starts_with(path, b"/sys/")
+        || starts_with(path, b"/run/")
+}
+
 // sockaddr layout, family-specific. We only need the address bytes —
 // port / flow / scope are uninteresting.
 
@@ -581,6 +611,12 @@ pub fn file_open(ctx: LsmContext) -> i32 {
         // audit db when it sees the ringbuf event.
         let buf = (*path_buf).0.as_mut_ptr() as *mut c_char;
         let _ = bpf_d_path(path_ptr, buf, EXEC_PATH_LEN as u32);
+        // Never mark pseudo-filesystem files (/dev, /proc, /sys, /run).
+        // Otherwise a net-touched writer hitting /dev/null marks its inode
+        // and every interpreter that later reads /dev/null gets -EPERM.
+        if is_pseudo_fs(buf as *const u8) {
+            return 0;
+        }
         let (folder_hash, basename_hash) = landing_hashes(
             buf as *const u8,
             (*rec_ptr).landing_ancestor_hashes.as_mut_ptr(),
