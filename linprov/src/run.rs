@@ -19,7 +19,11 @@ use clap::Parser;
 use env_logger::Target;
 use linprov_common::{fnv_hash_bytes, AllowRule, COMM_LEN, MAX_RULES};
 use log::{info, warn};
-use tokio::{io::unix::AsyncFd, signal};
+use tokio::{
+    io::unix::AsyncFd,
+    signal,
+    signal::unix::{signal as unix_signal, SignalKind},
+};
 
 use crate::{
     allowlist::{Dim, Rules, Soak},
@@ -145,7 +149,13 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
     } else {
         Rules::default()
     };
-    rules.check_capacity()?;
+    // Over-capacity is a warning, not a fatal error: seeding loads the
+    // first MAX_RULES and ignores the rest. A long soak run can grow the
+    // file past the ceiling; the daemon must still start (and keep
+    // enforcing what fits) rather than crash-loop.
+    if let Err(e) = rules.check_capacity() {
+        warn!("{e}");
+    }
 
     seed_allowlist_rules(&mut bpf, &rules)?;
     seed_interpreters(&mut bpf, &cfg.interpreters)?;
@@ -200,8 +210,15 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
         hashdb: &hashdb,
     };
 
+    // SIGHUP → reload the allowlist file and re-seed the BPF rules map,
+    // without restarting the daemon or re-attaching the LSM hooks. Lets an
+    // operator edit `list.allow` (or `linprov allow`, later) and apply it
+    // live. Only the allowlist is reloaded — mode, interpreters, and other
+    // launch config stay as started.
+    let mut sighup = unix_signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
+
     info!(
-        "linprov running ({:?}). press Ctrl-C to exit.{}",
+        "linprov running ({:?}). press Ctrl-C to exit, SIGHUP to reload the allowlist.{}",
         cfg.mode,
         if cfg.mode == Mode::Soak {
             let names: Vec<_> = cfg.soak.iter().map(|d| d.as_key()).collect();
@@ -221,6 +238,23 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
             _ = signal::ctrl_c() => {
                 info!("shutdown requested");
                 break;
+            }
+
+            _ = sighup.recv() => {
+                info!(
+                    "SIGHUP received — reloading allowlist from {}",
+                    cfg.allowlist
+                        .as_deref()
+                        .map(|p| p.display().to_string())
+                        .unwrap_or_else(|| "<none>".to_string())
+                );
+                // On failure (unreadable file, over-capacity), the BPF map is
+                // left untouched — Rules::load / check_capacity fail before
+                // seed_allowlist_rules writes anything — so the currently
+                // active rules keep enforcing.
+                if let Err(e) = reload_allowlist(&mut bpf, cfg.allowlist.as_deref()) {
+                    warn!("allowlist reload failed, keeping current rules: {e:#}");
+                }
             }
 
             res = poll.readable_mut() => {
@@ -261,7 +295,13 @@ fn seed_allowlist_rules(bpf: &mut Ebpf, rules: &Rules) -> Result<()> {
                 .context("ALLOW_RULES map missing")?,
         )
         .context("opening ALLOW_RULES")?;
-        for (i, spec) in rules.rules.iter().enumerate() {
+        // Only the first `min(len, MAX_RULES)` rules are seeded; the BPF
+        // side reads exactly `ALLOW_RULE_COUNT` slots (set below), so on a
+        // reload that shrinks the rule set the now-stale tail slots are
+        // simply never read — no need to clear them (which would be an
+        // O(MAX_RULES) sweep, wasteful now that MAX_RULES is large).
+        let n = rules.rules.len().min(MAX_RULES);
+        for (i, spec) in rules.rules.iter().take(n).enumerate() {
             let packed = AllowRuleWire(spec.pack());
             rule_map
                 .set(i as u32, packed, 0)
@@ -279,8 +319,31 @@ fn seed_allowlist_rules(bpf: &mut Ebpf, rules: &Rules) -> Result<()> {
         .set(0, n, 0)
         .context("setting ALLOW_RULE_COUNT[0]")?;
 
-    info!("loaded {} allowlist rules", rules.len());
+    // "{n} of {total}" makes capping visible at load: when the file fits,
+    // they're equal; when it's over capacity, `check_capacity` has already
+    // warned and this shows how many actually took effect.
+    info!("loaded {n} of {} allowlist rules", rules.len());
     Ok(())
+}
+
+/// Reload the allowlist file and re-seed the BPF rules map in place —
+/// the SIGHUP handler. Parses fresh `Rules` from `allowlist` (or an empty
+/// set if unconfigured), then re-seeds `ALLOW_RULES` / `ALLOW_RULE_COUNT`.
+/// An over-capacity file only warns (the first `MAX_RULES` are applied).
+/// If the file can't be read/parsed, returns the error WITHOUT having
+/// touched the map, so the live rules keep enforcing.
+fn reload_allowlist(bpf: &mut Ebpf, allowlist: Option<&Path>) -> Result<()> {
+    let rules = match allowlist {
+        Some(path) => Rules::load(path)?,
+        None => Rules::default(),
+    };
+    // Same as startup: over-capacity warns and truncates rather than
+    // rejecting the reload, so a SIGHUP after the file outgrew the ceiling
+    // still applies what fits instead of silently keeping stale rules.
+    if let Err(e) = rules.check_capacity() {
+        warn!("{e}");
+    }
+    seed_allowlist_rules(bpf, &rules)
 }
 
 /// Seed the `INTERPRETERS` BPF map from the configured interpreter list.

@@ -237,6 +237,22 @@ struct PathScratch([u8; EXEC_PATH_LEN]);
 #[map]
 static PATH_SCRATCH: PerCpuArray<PathScratch> = PerCpuArray::with_max_entries(1, 0);
 
+/// `[u64; MAX_FOLDER_ANCESTORS]` map value type for [`TARGET_ANCESTORS`].
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct PathAncestors([u64; MAX_FOLDER_ANCESTORS]);
+
+/// Per-CPU scratch holding the live exec path's `/`-prefix ancestor hashes
+/// for the current `check_allowlist` call. Lives in a map, not on the
+/// stack, so the small [`AllowCtx`] (which carries the `origin` pointer the
+/// verifier must keep stack-tracked) and the `target_hashes` walk frame
+/// don't both blow the per-call-chain stack budget. Filled by
+/// `check_allowlist`, read by [`allow_step`] via [`target_folder_match`];
+/// per-CPU + non-recursive program invocation keeps it stable across the
+/// `bpf_loop`.
+#[map]
+static TARGET_ANCESTORS: PerCpuArray<PathAncestors> = PerCpuArray::with_max_entries(1, 0);
+
 /// Runtime config set by userspace before attach.
 ///   Index 0: a value from the `MODE_*` constants in `linprov_common`.
 ///   Index 1: non-zero to mark PIDs that connect to a loopback address
@@ -743,98 +759,126 @@ unsafe fn bpf_loop(nr_loops: u32, cb: LoopCb, ctx: *mut c_void, flags: u64) -> i
     fun(nr_loops, cb as *mut c_void, ctx, flags)
 }
 
+/// Per-`check_allowlist` execution context, shared into the [`allow_step`]
+/// `bpf_loop` callback. Everything about the live exec path that rules
+/// compare against is precomputed ONCE here (the three target hashes), so
+/// the per-rule loop body does only scalar/array compares — no path walks.
+/// That lets the rule loop be a single amortized `bpf_loop` whose body the
+/// verifier inspects once, so `MAX_RULES` costs runtime iterations only,
+/// not program size / verifier budget. (The old per-rule *unrolled* loop —
+/// with a `fnv_full`/`folder_match` walk inside each iteration — blew the
+/// 1M-instruction verifier budget above ~32 rules.)
 #[repr(C)]
-struct FnvCtx {
-    src: *const u8,
-    hash: u64,
-}
-
-/// `bpf_loop` callback for [`fnv_full`]. Marked `#[inline(never)]`
-/// so the linker emits it as a real subprog — the whole point of
-/// switching to `bpf_loop` is to let the verifier amortize this body
-/// across iterations, which only works if it's a separate function.
-///
-/// The explicit `i >= PATH_HASH_SCAN_LEN` bound check teaches the
-/// verifier the upper bound on the index — without it, `i` is a u32
-/// the verifier treats as `[0, u32::MAX]`, which makes `src + i` an
-/// unbounded memory access regardless of what `bpf_loop` actually
-/// passes in.
-#[inline(never)]
-unsafe extern "C" fn fnv_step(i: u32, ctx: *mut c_void) -> i64 {
-    if i >= PATH_HASH_SCAN_LEN as u32 {
-        return 1;
-    }
-    let ctx = &mut *(ctx as *mut FnvCtx);
-    let b = *ctx.src.add(i as usize);
-    if b == 0 {
-        return 1; // break
-    }
-    ctx.hash ^= b as u64;
-    ctx.hash = ctx.hash.wrapping_mul(FNV_PRIME);
-    0
-}
-
-/// FNV-1a-64 of a NUL-terminated path. Scans up to
-/// [`PATH_HASH_SCAN_LEN`] bytes via `bpf_loop`.
-#[inline(always)]
-unsafe fn fnv_full(src: *const u8) -> u64 {
-    let mut ctx = FnvCtx {
-        src,
-        hash: FNV_OFFSET,
-    };
-    bpf_loop(
-        PATH_HASH_SCAN_LEN as u32,
-        fnv_step,
-        &mut ctx as *mut _ as *mut c_void,
-        0,
-    );
-    ctx.hash
-}
-
-#[repr(C)]
-struct FolderCtx {
-    src: *const u8,
-    needle: u64,
-    hash: u64,
+struct AllowCtx {
+    origin: *const OriginRecord,
+    exec_uid: u32,
+    /// Number of valid rules to scan (`min(count, MAX_RULES)`).
+    count: u32,
+    /// Set to 1 by the callback when a rule fully matches.
     found: u32,
+    _pad: u32,
+    /// FNV of the whole exec path (for `target_filename`).
+    target_full_hash: u64,
+    /// FNV of the exec path's immediate parent (for exact `target_folder`).
+    target_parent_hash: u64,
 }
 
-#[inline(never)]
-unsafe extern "C" fn folder_step(i: u32, ctx: *mut c_void) -> i64 {
-    if i >= PATH_HASH_SCAN_LEN as u32 {
-        return 1;
-    }
-    let ctx = &mut *(ctx as *mut FolderCtx);
-    let b = *ctx.src.add(i as usize);
-    if b == 0 {
-        return 1; // break
-    }
-    ctx.hash ^= b as u64;
-    ctx.hash = ctx.hash.wrapping_mul(FNV_PRIME);
-    if b == b'/' && ctx.hash == ctx.needle {
-        ctx.found = 1;
-    }
-    0
-}
-
-/// True if `needle` equals the FNV-1a hash of any `/`-terminated prefix
-/// of the NUL-terminated path at `src`. Walks the path once via
-/// `bpf_loop`, checking at each separator.
+/// Recursive `target_folder` match: `needle` equals the exec path's
+/// immediate-parent hash or any of its `/`-prefix ancestors (held in the
+/// per-CPU [`TARGET_ANCESTORS`] map for this `check_allowlist` call). The
+/// target-side analogue of [`landing_folder_match`], over precomputed
+/// arrays instead of a per-rule path walk. Caps recursive target matching
+/// at `MAX_FOLDER_ANCESTORS` levels (the old `folder_match` walked to
+/// `PATH_MAX`, but no real exec path nests that deep, and the landing side
+/// already has this cap).
 #[inline(always)]
-unsafe fn folder_match(src: *const u8, needle: u64) -> bool {
-    let mut ctx = FolderCtx {
-        src,
-        needle,
-        hash: FNV_OFFSET,
-        found: 0,
+unsafe fn target_folder_match(ctx: &AllowCtx, needle: u64) -> bool {
+    if needle == 0 {
+        return false;
+    }
+    if ctx.target_parent_hash == needle {
+        return true;
+    }
+    let anc = match TARGET_ANCESTORS.get_ptr(0) {
+        Some(p) => &(*p).0,
+        None => return false,
     };
-    bpf_loop(
-        PATH_HASH_SCAN_LEN as u32,
-        folder_step,
-        &mut ctx as *mut _ as *mut c_void,
-        0,
-    );
-    ctx.found != 0
+    let mut found = false;
+    for j in 0..MAX_FOLDER_ANCESTORS {
+        if anc[j] == needle {
+            found = true;
+        }
+    }
+    found
+}
+
+/// `bpf_loop` callback: test allowlist rule `i` against the precomputed
+/// [`AllowCtx`]. Returns 1 (break) once a rule fully matches (setting
+/// `found`) or the count is exhausted; 0 to continue to the next rule.
+/// Within a rule, dim conditions AND; cheapest scalar checks first so a
+/// mismatch bails before the array compares. `#[inline(never)]` so it's a
+/// real subprog the verifier inspects once.
+#[inline(never)]
+unsafe extern "C" fn allow_step(i: u32, ctx: *mut c_void) -> i64 {
+    let ctx = &mut *(ctx as *mut AllowCtx);
+    if i >= ctx.count {
+        return 1; // scanned every rule, no match
+    }
+    let rule = match ALLOW_RULES.get(i) {
+        Some(r) => r,
+        None => return 1,
+    };
+    let f = rule.flags;
+    if f == 0 {
+        return 0; // empty slot
+    }
+    let origin = &*ctx.origin;
+
+    if (f & dim::CREATOR_UID) != 0 && rule.creator_uid != origin.creator_uid {
+        return 0;
+    }
+    if (f & dim::EXECUTION_UID) != 0 && rule.execution_uid != ctx.exec_uid {
+        return 0;
+    }
+    if (f & dim::CREATOR_COMM) != 0 && !comm_eq(&rule.creator_comm, &origin.comm) {
+        return 0;
+    }
+    // creator_process: 0 means "not yet augmented" — never match on a
+    // half-filled record.
+    if (f & dim::CREATOR_PROCESS) != 0
+        && (origin.creator_path_hash == 0 || origin.creator_path_hash != rule.creator_process_hash)
+    {
+        return 0;
+    }
+    if (f & dim::LANDING_FILENAME) != 0 && origin.landing_basename_hash != rule.landing_filename_hash
+    {
+        return 0;
+    }
+    if (f & dim::LANDING_FOLDER) != 0 {
+        let ok = if (f & dim::LANDING_FOLDER_RECURSIVE) != 0 {
+            landing_folder_match(origin, rule.landing_folder_hash)
+        } else {
+            rule.landing_folder_hash != 0 && origin.landing_folder_hash == rule.landing_folder_hash
+        };
+        if !ok {
+            return 0;
+        }
+    }
+    if (f & dim::TARGET_FILENAME) != 0 && ctx.target_full_hash != rule.target_filename_hash {
+        return 0;
+    }
+    if (f & dim::TARGET_FOLDER) != 0 {
+        let ok = if (f & dim::TARGET_FOLDER_RECURSIVE) != 0 {
+            target_folder_match(ctx, rule.target_folder_hash)
+        } else {
+            rule.target_folder_hash != 0 && ctx.target_parent_hash == rule.target_folder_hash
+        };
+        if !ok {
+            return 0;
+        }
+    }
+    ctx.found = 1;
+    1 // matched — break
 }
 
 #[repr(C)]
@@ -919,48 +963,32 @@ unsafe fn landing_hashes(src: *const u8, out_ancestors: *mut u64) -> (u64, u64) 
     (ctx.folder_hash, ctx.comp_hash)
 }
 
-#[repr(C)]
-struct ParentCtx {
-    src: *const u8,
-    full_hash: u64,
-    folder_hash: u64,
-}
-
+/// Like [`landing_hashes`] but for the live exec (target) path: fills
+/// `out_ancestors` with each `/`-terminated prefix hash and returns
+/// `(full_hash, parent_hash)` — the whole-path FNV (exact
+/// `target_filename`) and the immediate-parent FNV (exact `target_folder`).
+/// Precomputed once per `check_allowlist` so the per-rule loop is walk-free
+/// (see [`AllowCtx`]). Reuses the [`landing_step`] callback; not inlined
+/// for the same by-value-array stack reason as `landing_hashes`.
 #[inline(never)]
-unsafe extern "C" fn parent_step(i: u32, ctx: *mut c_void) -> i64 {
-    if i >= PATH_HASH_SCAN_LEN as u32 {
-        return 1;
-    }
-    let ctx = &mut *(ctx as *mut ParentCtx);
-    let b = *ctx.src.add(i as usize);
-    if b == 0 {
-        return 1;
-    }
-    ctx.full_hash ^= b as u64;
-    ctx.full_hash = ctx.full_hash.wrapping_mul(FNV_PRIME);
-    if b == b'/' {
-        ctx.folder_hash = ctx.full_hash;
-    }
-    0
-}
-
-/// FNV of a NUL-terminated path's immediate parent directory (the prefix
-/// up to and including the last `/`). Used for **exact** `target_folder`
-/// matching of the live exec path.
-#[inline(always)]
-unsafe fn parent_folder_hash(src: *const u8) -> u64 {
-    let mut ctx = ParentCtx {
+unsafe fn target_hashes(src: *const u8, out_ancestors: *mut u64) -> (u64, u64) {
+    let mut ctx = LandingCtx {
         src,
         full_hash: FNV_OFFSET,
+        comp_hash: FNV_OFFSET,
         folder_hash: 0,
+        count: 0,
+        _pad: 0,
+        ancestors: [0u64; MAX_FOLDER_ANCESTORS],
     };
     bpf_loop(
         PATH_HASH_SCAN_LEN as u32,
-        parent_step,
+        landing_step,
         &mut ctx as *mut _ as *mut c_void,
         0,
     );
-    ctx.folder_hash
+    core::ptr::copy_nonoverlapping(ctx.ancestors.as_ptr(), out_ancestors, MAX_FOLDER_ANCESTORS);
+    (ctx.full_hash, ctx.folder_hash)
 }
 
 /// Returns true if any allowlist rule's conditions all match. Rules OR
@@ -976,96 +1004,46 @@ unsafe fn parent_folder_hash(src: *const u8) -> u64 {
 ///     hash; recursive matches any stored ancestor hash (up to
 ///     `MAX_FOLDER_ANCESTORS` levels). **landing_filename** matches the
 ///     basename; **creator_process** the exe path. All hash compares.
-#[inline(always)]
+///
+/// The per-rule scan runs in a single `bpf_loop` ([`allow_step`]) over a
+/// precomputed [`AllowCtx`], so its cost to the verifier is O(1) in
+/// `MAX_RULES` — the loop body is inspected once. `#[inline(never)]` keeps
+/// the ~300-byte `AllowCtx` frame off the `bprm_check_security` /
+/// `file_open` stacks.
+#[inline(never)]
 unsafe fn check_allowlist(filename: &[u8; EXEC_PATH_LEN], origin: &OriginRecord) -> bool {
     let count = ALLOW_RULE_COUNT.get(0).copied().unwrap_or(0);
     if count == 0 {
         return false;
     }
-    let exec_uid = (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32;
-    // Immediate parent of the live exec path, for exact target_folder
-    // rules. Computed once (one walk); recursive rules still walk per
-    // rule via folder_match.
-    let target_parent = parent_folder_hash(filename.as_ptr());
-
     let n = if count as usize > MAX_RULES {
         MAX_RULES as u32
     } else {
         count
     };
-    for i in 0..MAX_RULES {
-        if (i as u32) >= n {
-            break;
-        }
-        let rule = match ALLOW_RULES.get(i as u32) {
-            Some(r) => r,
-            None => break,
-        };
-        let f = rule.flags;
-        if f == 0 {
-            continue;
-        }
 
-        // Cheapest dims first; bail out before the path walks if any of
-        // the scalar checks fail.
-        if (f & dim::CREATOR_UID) != 0 && rule.creator_uid != origin.creator_uid {
-            continue;
-        }
-        if (f & dim::EXECUTION_UID) != 0 && rule.execution_uid != exec_uid {
-            continue;
-        }
-        if (f & dim::CREATOR_COMM) != 0 && !comm_eq(&rule.creator_comm, &origin.comm) {
-            continue;
-        }
-        // creator_process: direct hash compare. 0 means "not yet
-        // augmented" (file_open didn't know the creator exe) — treat as
-        // no-match so we never permit on a half-filled record.
-        if (f & dim::CREATOR_PROCESS) != 0
-            && (origin.creator_path_hash == 0
-                || origin.creator_path_hash != rule.creator_process_hash)
-        {
-            continue;
-        }
-        // landing dims: direct hash compares against the stored record.
-        if (f & dim::LANDING_FILENAME) != 0
-            && origin.landing_basename_hash != rule.landing_filename_hash
-        {
-            continue;
-        }
-        if (f & dim::LANDING_FOLDER) != 0 {
-            let ok = if (f & dim::LANDING_FOLDER_RECURSIVE) != 0 {
-                // recursive: immediate parent or any stored ancestor.
-                landing_folder_match(origin, rule.landing_folder_hash)
-            } else {
-                // exact: the immediate parent only.
-                rule.landing_folder_hash != 0
-                    && origin.landing_folder_hash == rule.landing_folder_hash
-            };
-            if !ok {
-                continue;
-            }
-        }
-        // target dims: against the live exec path.
-        if (f & dim::TARGET_FILENAME) != 0
-            && fnv_full(filename.as_ptr()) != rule.target_filename_hash
-        {
-            continue;
-        }
-        if (f & dim::TARGET_FOLDER) != 0 {
-            let ok = if (f & dim::TARGET_FOLDER_RECURSIVE) != 0 {
-                // recursive: rule folder is any `/`-prefix of the path.
-                folder_match(filename.as_ptr(), rule.target_folder_hash)
-            } else {
-                // exact: rule folder is the file's immediate parent.
-                rule.target_folder_hash != 0 && target_parent == rule.target_folder_hash
-            };
-            if !ok {
-                continue;
-            }
-        }
-        return true;
-    }
-    false
+    // Precompute everything about the live exec path the rules compare
+    // against — once — so the per-rule loop body is walk-free. The ancestor
+    // prefixes go into the per-CPU TARGET_ANCESTORS map (off-stack), the two
+    // scalar hashes into the small AllowCtx.
+    let anc = match TARGET_ANCESTORS.get_ptr_mut(0) {
+        Some(p) => p,
+        None => return false,
+    };
+    let (full, parent) = target_hashes(filename.as_ptr(), (*anc).0.as_mut_ptr());
+
+    let mut ctx = AllowCtx {
+        origin: origin as *const OriginRecord,
+        exec_uid: (bpf_get_current_uid_gid() & 0xFFFF_FFFF) as u32,
+        count: n,
+        found: 0,
+        _pad: 0,
+        target_full_hash: full,
+        target_parent_hash: parent,
+    };
+
+    bpf_loop(n, allow_step, &mut ctx as *mut _ as *mut c_void, 0);
+    ctx.found != 0
 }
 
 /// Reserve an `Event` on the ring buffer and have bpf_d_path() fill in the

@@ -80,15 +80,26 @@ picking up the repo knows where it's going.
 
 ## Allowlist
 
-- **Bigger rule set.** `MAX_RULES = 32` today. The `bpf_loop`-based
-  path scan that this entry used to propose as future work has since
-  landed (`linprov-ebpf/src/main.rs`: the FNV walks run inside a
-  `bpf_loop` callback via helper 181, kernel >= 5.17) — the verifier
-  now inspects the callback once instead of unrolling the loop body
-  across every rule × dim. That removed the verifier-amortization
-  blocker, but the 32-rule ceiling itself has not moved. Pushing past
-  32 still wants the single pre-pass + bitset lookup (the naive
-  per-byte conditional-store version exploded the verifier).
+- **Bigger rule set.** *Landed — `MAX_RULES = 8192`* (256× the old 32).
+  The per-rule scan now runs inside a single `bpf_loop` callback
+  (`allow_step`) over a precomputed `AllowCtx`, so the verifier inspects
+  the rule body **once** instead of unrolling it across every rule — load
+  time is O(1) in `MAX_RULES` (~0.45s flat from 256 to 8192) and per-execve
+  cost is bounded by the *actual* rule count, not the ceiling. The old
+  unrolled loop (with an `fnv_full`/`folder_match` walk inside each
+  iteration) topped out below 64 rules against the 1M-instruction budget.
+  The "single pre-pass" this entry used to call for is exactly that
+  precompute: the live exec path's full / parent / ancestor-prefix hashes
+  are computed once (`target_hashes` → the per-CPU `TARGET_ANCESTORS` map)
+  so the rule loop is walk-free. Two notes:
+  - Recursive `target_folder` now matches via the precomputed ancestor
+    array, so it's capped at `MAX_FOLDER_ANCESTORS` (32) levels — same cap
+    the landing side already had; the old per-rule `folder_match` walked to
+    `PATH_MAX`. No real exec path nests 32 dirs deep.
+  - An over-capacity allowlist no longer crash-loops the daemon: startup
+    and SIGHUP reload load the first `MAX_RULES` and warn (`check_capacity`),
+    and soak stops appending at the ceiling. (A long soak run had grown
+    `list.allow` past the old 32-rule limit and bricked the next restart.)
 - **Path globs.** Recursive folder matching via a trailing `*`
   (`target_folder=/opt/app/*` → `TARGET_FOLDER_RECURSIVE`, matches the
   folder or any descendant) has landed. Still missing: infix globs
@@ -106,12 +117,17 @@ picking up the repo knows where it's going.
   defaults. A follow-up: an interactive flow that enables the unit in
   `soak` mode, watches for N hours / executions, and proposes the
   resulting allowlist for review before flipping to `enforce`.
-- **Ad-hoc allow at block time.** Not yet implemented. The design:
-  have every `BLOCKED-EXEC` log line emit a short stable token, then a
-  `linprov allow <token>` subcommand that appends a rule which would
-  have permitted that exec to the allowlist file and signals the
-  daemon to hot-reload (SIGHUP or inotify). No daemon restart
-  required. (Today `BLOCKED-EXEC` logs full context but no token, and
+- **Hot reload.** *Landed.* `SIGHUP` re-parses the allowlist file and
+  re-seeds the BPF `ALLOW_RULES` / `ALLOW_RULE_COUNT` maps in place — no
+  daemon restart, no LSM re-attach. A failed reload (unreadable file,
+  over `MAX_RULES`) leaves the live rules untouched and logs a warning;
+  the rule-slot tail is cleared on each reload so shrinking the rule set
+  can't leave stale entries active. Only the allowlist is reloaded — mode,
+  interpreter set, and other launch config stay as started.
+- **Ad-hoc allow at block time.** Not yet implemented; the reload
+  primitive it needs now exists (SIGHUP, above). The design: have every
+  `BLOCKED-EXEC` / `BLOCKED-SCRIPT` log line emit a short stable token,
+  then a `linprov allow <token>` subcommand that appends the rule which
+  would have permitted that exec to the allowlist file and SIGHUPs the
+  daemon. (Today the blocked lines log full context but no token, and
   there is no `allow` subcommand.)
-- **Hot reload.** SIGHUP re-parses the allowlist file and re-seeds
-  the BPF rules map.

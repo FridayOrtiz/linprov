@@ -279,6 +279,9 @@ After=network.target
 [Service]
 Type=simple
 ExecStart={0} run --config {1}
+# `systemctl reload linprov` → SIGHUP → re-parse the allowlist and
+# re-seed the in-kernel rules live, without a restart.
+ExecReload=/bin/kill -HUP $MAINPID
 Restart=on-failure
 RestartSec=5s
 

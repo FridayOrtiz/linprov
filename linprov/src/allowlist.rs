@@ -342,11 +342,17 @@ impl Rules {
         self.rules.len()
     }
 
+    /// Whether the rule set fits the BPF map. Returns `Err` describing the
+    /// overflow if not — but callers treat this as a **warning**, not a
+    /// fatal error: seeding loads the first [`MAX_RULES`] and ignores the
+    /// rest, so an over-capacity file degrades gracefully instead of
+    /// crash-looping the daemon (a long soak run can otherwise grow the
+    /// file past the ceiling and brick the next restart).
     pub fn check_capacity(&self) -> Result<()> {
         if self.rules.len() > MAX_RULES {
             return Err(anyhow!(
-                "{} rules exceeds BPF map capacity ({MAX_RULES}). \
-                 Trim the allowlist or bump MAX_RULES.",
+                "{} allowlist rules exceeds the BPF map capacity ({MAX_RULES}); \
+                 only the first {MAX_RULES} will be enforced",
                 self.rules.len()
             ));
         }
@@ -410,9 +416,18 @@ impl Soak {
         let line = spec.to_line();
         {
             let mut seen = self.seen.lock().expect("soak seen mutex poisoned");
-            if !seen.insert(line.clone()) {
+            if seen.contains(&line) {
+                return Ok(None); // already have this exact rule
+            }
+            // Cap soak at the BPF map capacity. Past it, appending more
+            // rules would just be ignored at load (and could grow the file
+            // until a restart trips the over-capacity path) — so stop, and
+            // signal that the allowlist is full and wants review / enforce.
+            if seen.len() >= MAX_RULES {
+                log::warn!("allowlist at capacity ({MAX_RULES}); soak not appending `{line}`");
                 return Ok(None);
             }
+            seen.insert(line.clone());
         }
         let mut w = self.writer.lock().expect("soak writer mutex poisoned");
         writeln!(w, "{line}").with_context(|| format!("appending `{line}`"))?;

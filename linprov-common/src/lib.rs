@@ -123,10 +123,20 @@ pub mod dim {
     pub const LANDING_FOLDER_RECURSIVE: u32 = 1 << 9;
 }
 
-/// Maximum number of allowlist rules carried by the BPF Array map.
-/// Each rule check is ~30 ops + 2 folder lookups; the verifier walks
-/// the full bounded loop, so this caps the per-execve cost.
-pub const MAX_RULES: usize = 32;
+/// Maximum number of allowlist rules carried by the BPF `ALLOW_RULES`
+/// Array map (× 72 bytes ≈ 590 KiB at this size).
+///
+/// The per-rule scan runs inside a single `bpf_loop` callback
+/// (`allow_step`), so the verifier inspects the rule body **once** instead
+/// of unrolling it — this value costs map memory and at-most-N runtime
+/// iterations per execve (N = the actual rule count, not this ceiling),
+/// but is O(1) to the verifier and to daemon load time. The earlier
+/// *unrolled* loop topped out below 64 rules against the 1M-instruction
+/// budget; this is 256× the old 32-rule limit. An over-capacity allowlist
+/// degrades gracefully (the daemon loads the first `MAX_RULES` and warns —
+/// see `check_capacity`), so it never crash-loops on a file that outgrew
+/// the ceiling.
+pub const MAX_RULES: usize = 8192;
 
 /// One allowlist rule. Set bits in `flags` mark required dims; the
 /// corresponding fields below are then compared against the record /

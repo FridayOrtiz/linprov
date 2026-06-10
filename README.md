@@ -206,6 +206,16 @@ reading a marked file *without* having been cleared to run a script
 (interactive use, a local script reading downloaded data) is still
 denied — allowlist it or narrow the interpreter set if that's undesirable.
 
+Send the daemon **`SIGHUP`** to reload the allowlist file and re-seed the
+in-kernel rules live — no restart, no re-attach (`sudo systemctl reload
+linprov` or `sudo pkill -HUP -x linprov`). Edit `list.allow`, SIGHUP, and
+the new rules enforce on the next exec. A reload whose file can't be read
+is rejected with a warning and the running rules stay in force; an
+over-capacity file (more than `MAX_RULES`, currently 8192) loads the first
+`MAX_RULES` and warns rather than failing — so neither a bad edit nor a
+long soak run that outgrew the ceiling can crash the daemon. Only the
+allowlist reloads — mode and other config need a restart.
+
 By default logs go to stderr (journald captures them under
 systemd). Set `log_file = "/path/to/file"` in the config (or
 `--log-file`) to append-log to a file instead — handy for non-systemd
