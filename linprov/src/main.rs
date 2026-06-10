@@ -17,6 +17,7 @@ mod hashdb;
 mod inode_storage;
 mod install;
 mod mode;
+mod notify;
 mod privilege;
 mod run;
 mod setup;
@@ -50,6 +51,10 @@ enum Cmd {
     /// `BLOCKED-SCRIPT` log line. Talks to the running daemon's control
     /// socket; `--once` applies it in memory only (not persisted).
     Allow(allow::AllowArgs),
+    /// User-session tray agent: subscribe to blocks over the control
+    /// socket and surface Allow once / Allow always / Close in a tray
+    /// menu. Run from your graphical session (e.g. sway `exec`).
+    Notify(notify::NotifyArgs),
 }
 
 fn main() -> Result<()> {
@@ -65,5 +70,6 @@ fn main() -> Result<()> {
         Cmd::Setup(args) => setup::run(args),
         Cmd::Upgrade(args) => upgrade::run(args),
         Cmd::Allow(args) => allow::run(args),
+        Cmd::Notify(args) => notify::run(args),
     }
 }

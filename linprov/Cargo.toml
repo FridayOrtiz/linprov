@@ -3,7 +3,7 @@ name = "linprov"
 # Userspace daemon — what `cargo install linprov` ships. Bump 0.0.x for
 # fixes / log tweaks / docs; 0.x → 0.(x+1) for CLI surface changes
 # (mode/flags/env vars) or new operational behavior.
-version = "0.2.13"
+version = "0.2.14"
 edition.workspace = true
 authors.workspace = true
 license.workspace = true
@@ -32,6 +32,14 @@ serde.workspace = true
 tokio.workspace = true
 toml.workspace = true
 xattr.workspace = true
+
+# `linprov notify` tray agent only. StatusNotifierItem tray (`ksni`,
+# blocking API — its own thread, no async runtime needed here) plus
+# send-only desktop notifications (`notify-rust`). Both reach the user
+# session bus via D-Bus.
+ksni = { version = "0.3", default-features = false, features = ["blocking", "tokio"] }
+notify-rust = "4"
+png = "0.17"
 
 linprov-common = { workspace = true, features = ["user"] }
 

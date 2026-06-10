@@ -24,9 +24,11 @@ use linprov_common::{
 };
 use log::{debug, info, warn};
 
+use tokio::sync::broadcast;
+
 use crate::{
     allowlist::{rule_from_context, OriginContext, Soak, ALLOW_DIMS},
-    control::BlocksTable,
+    control::{BlockEvent, BlocksTable},
     hashdb::HashDb,
     inode_storage::InodeMarks,
     ModeArg,
@@ -42,6 +44,7 @@ pub fn handle_event(
     cfg: &Config,
     inode_marks: &mut InodeMarks,
     blocks: &mut BlocksTable,
+    block_tx: &broadcast::Sender<BlockEvent>,
     raw: &[u8],
 ) {
     if raw.len() < std::mem::size_of::<Event>() {
@@ -64,8 +67,8 @@ pub fn handle_event(
     match event.kind {
         EVENT_KIND_NETWORK_FILE_OPEN => on_file_marked(cfg, inode_marks, event, false),
         EVENT_KIND_DERIVED_FILE_OPEN => on_file_marked(cfg, inode_marks, event, true),
-        EVENT_KIND_EXECVE => on_execve_marked(cfg, blocks, event),
-        EVENT_KIND_SCRIPT_EXEC => on_script_exec(cfg, blocks, event),
+        EVENT_KIND_EXECVE => on_execve_marked(cfg, blocks, block_tx, event),
+        EVENT_KIND_SCRIPT_EXEC => on_script_exec(cfg, blocks, block_tx, event),
         other => warn!("unknown event kind: {other}"),
     }
 }
@@ -212,7 +215,12 @@ fn is_pseudo_fs(target: &std::path::Path) -> bool {
         || s.starts_with("/run/")
 }
 
-fn on_execve_marked(cfg: &Config, blocks: &mut BlocksTable, event: &Event) {
+fn on_execve_marked(
+    cfg: &Config,
+    blocks: &mut BlocksTable,
+    block_tx: &broadcast::Sender<BlockEvent>,
+    event: &Event,
+) {
     let target_path = c_str_to_string(&event.filename);
     let exec_comm = comm_to_string(&event.comm);
     let creator_comm = comm_to_string(&event.origin.comm);
@@ -227,6 +235,8 @@ fn on_execve_marked(cfg: &Config, blocks: &mut BlocksTable, event: &Event) {
     if event.status != 0 {
         let token = record_block_token(
             blocks,
+            block_tx,
+            "exec",
             event,
             &target_path,
             &landing_folder,
@@ -277,7 +287,12 @@ fn on_execve_marked(cfg: &Config, blocks: &mut BlocksTable, event: &Event) {
 /// soak rule emission keyed on the script path, so a
 /// `target_filename=<script>` / `target_folder=<dir>` rule permits the
 /// script under any interpreter and under `./script` (shebang) alike.
-fn on_script_exec(cfg: &Config, blocks: &mut BlocksTable, event: &Event) {
+fn on_script_exec(
+    cfg: &Config,
+    blocks: &mut BlocksTable,
+    block_tx: &broadcast::Sender<BlockEvent>,
+    event: &Event,
+) {
     let script_path = c_str_to_string(&event.filename);
     let interp_comm = comm_to_string(&event.comm);
     let creator_comm = comm_to_string(&event.origin.comm);
@@ -290,6 +305,8 @@ fn on_script_exec(cfg: &Config, blocks: &mut BlocksTable, event: &Event) {
     if event.status != 0 {
         let token = record_block_token(
             blocks,
+            block_tx,
+            "script",
             event,
             &script_path,
             &landing_folder,
@@ -340,6 +357,8 @@ fn on_script_exec(cfg: &Config, blocks: &mut BlocksTable, event: &Event) {
 #[allow(clippy::too_many_arguments)]
 fn record_block_token(
     blocks: &mut BlocksTable,
+    block_tx: &broadcast::Sender<BlockEvent>,
+    kind: &'static str,
     event: &Event,
     target: &str,
     landing_folder: &Option<String>,
@@ -357,7 +376,22 @@ fn record_block_token(
         creator_uid: event.origin.creator_uid,
         execution_uid: exec_uid,
     };
-    blocks.record(rule_from_context(&ctx, ALLOW_DIMS).to_line())
+    let token = blocks.record(rule_from_context(&ctx, ALLOW_DIMS).to_line());
+
+    // Fan out to any control-socket subscribers (the tray agent). A
+    // non-blocking send; `Err(NoReceivers)` is the common case (no agent
+    // connected) and is ignored.
+    let creator = creator_path
+        .clone()
+        .filter(|s| !s.is_empty())
+        .unwrap_or_else(|| creator_comm.to_string());
+    let _ = block_tx.send(BlockEvent {
+        kind,
+        token: token.clone(),
+        target: target.to_string(),
+        creator,
+    });
+    token
 }
 
 /// In soak mode, emit one allowlist rule for this event keyed on `target`

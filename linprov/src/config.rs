@@ -16,9 +16,22 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use clap::ValueEnum;
 use serde::Deserialize;
 
 use crate::{allowlist::Dim, mode::Mode};
+
+/// Whether the daemon exposes its control socket to a local desktop agent.
+/// `Off` (default) keeps the socket root-only (0600) — headless behavior.
+/// `Tray` chmods it 0660 group `linprov` so a user-session `linprov notify`
+/// tray agent can subscribe to blocks and issue allows.
+#[derive(Clone, Copy, Debug, Default, Deserialize, ValueEnum, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum NotifyMode {
+    #[default]
+    Off,
+    Tray,
+}
 
 /// Default location the daemon reads at startup if `--config` isn't
 /// passed. `setup` writes here.
@@ -65,6 +78,9 @@ pub struct FileConfig {
     pub mark_localhost: Option<bool>,
     pub soak: Option<Vec<Dim>>,
     pub hash_db: Option<PathBuf>,
+    /// Expose the control socket to a local desktop agent — see
+    /// [`NotifyMode`]. Defaults to `off`.
+    pub notifications: Option<NotifyMode>,
     /// Script interpreters (by `comm`) whose reads of a marked file are
     /// enforced like an execve — see [`default_interpreters`]. An explicit
     /// empty list (`interpreters = []`) disables script enforcement.
@@ -110,6 +126,7 @@ pub struct EffectiveConfig {
     pub soak: Vec<Dim>,
     pub hash_db: PathBuf,
     pub interpreters: Vec<String>,
+    pub notifications: NotifyMode,
 }
 
 impl EffectiveConfig {
@@ -137,6 +154,10 @@ impl EffectiveConfig {
                 .interpreters
                 .or(file.interpreters)
                 .unwrap_or_else(default_interpreters),
+            notifications: cli
+                .notifications
+                .or(file.notifications)
+                .unwrap_or_default(),
         }
     }
 }
@@ -153,6 +174,7 @@ pub struct CliOverrides {
     pub soak: Option<Vec<Dim>>,
     pub hash_db: Option<PathBuf>,
     pub interpreters: Option<Vec<String>>,
+    pub notifications: Option<NotifyMode>,
 }
 
 #[cfg(test)]

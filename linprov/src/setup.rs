@@ -8,6 +8,7 @@ use std::{
     fs,
     os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use anyhow::{anyhow, Context, Result};
@@ -91,6 +92,7 @@ pub fn run(args: SetupArgs) -> Result<()> {
 
     write_config(&args.config, &args.allowlist, args.force)?;
     write_empty_allowlist(&args.allowlist, args.force)?;
+    ensure_linprov_group();
 
     if !args.no_systemd {
         write_systemd_unit(&args.systemd_unit, &binary, &args.config, args.force)?;
@@ -227,6 +229,14 @@ soak = ["creator_process"]
 # across reboots; enforcement never reads it. Default shown:
 # hash_db = "/var/lib/linprov/hashes.tsv"
 
+# Desktop tray agent. "off" (default) keeps the control socket root-only.
+# "tray" chmods it 0660 group `linprov` so a user-session `linprov notify`
+# tray agent can subscribe to blocks and apply allows. Add your user to the
+# group first (`sudo usermod -aG linprov $USER`, re-login) and run the agent
+# from your session (`exec linprov notify` in your sway config; needs a tray
+# host like waybar's tray module).
+# notifications = "tray"
+
 # Script interpreters (by `comm`) whose reads of a marked file are
 # enforced like an execve — so `bash foo.sh` / `python foo.py` /
 # `. foo.sh` honor the same policy as `./foo.sh`. A rule keyed on the
@@ -247,6 +257,19 @@ soak = ["creator_process"]
     fs::write(path, body).with_context(|| format!("writing `{}`", path.display()))?;
     info!("wrote config: {}", path.display());
     Ok(())
+}
+
+/// Create the `linprov` group (idempotent). With `notifications = "tray"`
+/// the daemon chowns its control socket to this group so a user-session
+/// `linprov notify` agent can connect; the user still has to add
+/// themselves (`usermod -aG linprov <user>`) and re-login. Best-effort —
+/// a missing `groupadd` or non-root run just logs and moves on.
+fn ensure_linprov_group() {
+    match Command::new("groupadd").args(["-f", "linprov"]).status() {
+        Ok(s) if s.success() => info!("ensured `linprov` group exists"),
+        Ok(s) => warn!("groupadd linprov exited {s}; create it by hand if you want the tray agent"),
+        Err(e) => warn!("couldn't run groupadd ({e}); create the `linprov` group by hand for the tray agent"),
+    }
 }
 
 fn write_empty_allowlist(path: &Path, force: bool) -> Result<()> {

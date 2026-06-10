@@ -1,0 +1,24 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <defs>
+    <radialGradient id="bg" cx="0.5" cy="0.4" r="0.8">
+      <stop offset="0" stop-color="#2a2046"/><stop offset="1" stop-color="#0a0712"/>
+    </radialGradient>
+    <radialGradient id="glow" cx="0.5" cy="0.5" r="0.5">
+      <stop offset="0" stop-color="#fde68a"/><stop offset="1" stop-color="#f59e0b" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect x="3" y="3" width="58" height="58" rx="15" fill="url(#bg)"/>
+  <g fill="none" stroke="#f5a524" stroke-width="2.4" stroke-linejoin="round" stroke-linecap="round">
+    <line x1="32" y1="32" x2="32.00" y2="8.00"/>
+    <line x1="32" y1="32" x2="52.78" y2="20.00"/>
+    <line x1="32" y1="32" x2="52.78" y2="44.00"/>
+    <line x1="32" y1="32" x2="32.00" y2="56.00"/>
+    <line x1="32" y1="32" x2="11.22" y2="44.00"/>
+    <line x1="32" y1="32" x2="11.22" y2="20.00"/>
+    <polygon points="32.00,17.00 44.99,24.50 44.99,39.50 32.00,47.00 19.01,39.50 19.01,24.50"/>
+    <polygon points="32.00,8.00 52.78,20.00 52.78,44.00 32.00,56.00 11.22,44.00 11.22,20.00"/>
+  </g>
+  <circle cx="44.99" cy="24.50" r="9" fill="url(#glow)"/>
+  <circle cx="44.99" cy="24.50" r="4" fill="#fff7ed"/>
+  <circle cx="44.99" cy="24.50" r="4" fill="none" stroke="#f5a524" stroke-width="1.5"/>
+</svg>

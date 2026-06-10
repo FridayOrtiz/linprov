@@ -140,48 +140,36 @@ picking up the repo knows where it's going.
   running; if it's down, hand-editing the file + SIGHUP is the offline
   path.
 
-## Desktop notifications (interactive approvals)
+## Desktop tray agent (interactive approvals)
 
-*Proposed.* When an exec is blocked, optionally raise a desktop
-notification with action buttons — **[Allow Once]**, **[Allow Always]**,
-**[Close]** (and later **[Quarantine]**) — so a user on a graphical
-session can approve a block without dropping to a terminal. First target
-is `mako` on `sway`, but the mechanism is the generic freedesktop.org
-`org.freedesktop.Notifications` D-Bus spec (notification *actions* + the
-`ActionInvoked` signal), so any compliant notifier works.
+*Landed* (except `[Quarantine]`). `linprov notify` is a user-session tray
+agent: it shows a StatusNotifierItem icon whose context menu lists recent
+blocked execs, each with **Allow once / Allow always / Close**, and fires a
+passive desktop notification per block as an alert. (We chose a tray over
+`mako` notification *actions* — mako has no inline buttons, only
+`makoctl menu`, so it's awkward and non-portable; SNI is served by waybar's
+tray on sway and works across desktops.)
 
-- **Off by default.** A config option gates it
-  (`notifications = "off" | "passive" | "interactive"`, default `off`):
-  `off` keeps today's headless behavior, `passive` notifies without
-  buttons, `interactive` adds the action buttons. Must be opt-in — a
-  headless/server box should never depend on a notifier.
-- **Reuses the allow plumbing.** Each blocked line already carries
-  `[allow: <token>]`; the notification's actions just carry that token and
-  drive the existing control-socket verbs: [Allow Once] →
-  `allow --once <token>` (transient), [Allow Always] → `allow <token>`
-  (persistent), [Close] → dismiss.
-- **Privilege boundary is the hard part.** The daemon runs as root on the
-  *system* bus; desktop notifications live on the logged-in user's
-  *session* bus (where `mako` runs), and a root system daemon can't
-  cleanly reach into a user session. The intended design is a small
-  **user-session agent** (shipped with linprov, started from the sway
-  config or a `systemd --user` unit) that (a) learns about blocks, (b)
-  pops the notification on the session bus, and (c) on a click calls back
-  to the daemon. That needs a user→daemon channel: either widen the
-  control socket from 0600-root to a `linprov` group the user belongs to,
-  or add a separate user-facing socket. The agent can learn about blocks
-  either by tailing the journal for `BLOCKED-*` lines (lowest-coupling
-  MVP — the token is right there) or via a new control-socket
-  "subscribe to block events" stream (cleaner push model).
+- **Off by default.** `notifications = "off" | "tray"` (default `off`).
+  `off` keeps the control socket root-only (headless). `tray` chmods it
+  0660 group `linprov` so the user-session agent can connect.
+- **Reuses the allow plumbing.** The daemon streams block events to
+  `subscribe`rs over the control socket (`BLOCK\t<token>\t<kind>\t<target>\t<creator>`);
+  menu clicks drive the existing verbs — Allow once → `once <token>`
+  (transient), Allow always → `allow <token>` (persistent), Close →
+  dismiss locally.
+- **Privilege boundary.** The daemon is root on the *system* bus; the tray
+  is on the user's *session* bus. The agent (run as the user from the sway
+  config — `exec linprov notify`) bridges them: it reaches the daemon via
+  the group-readable control socket and pops the tray/notifications on the
+  session bus. Needs a StatusNotifierHost (waybar's tray on sway).
 - **Enforcement stays synchronous.** The LSM hook denies the exec with
-  `-EPERM` *before* any notification round-trip — an LSM hook can't park
-  waiting on a human. So the prompt is post-hoc: clicking Allow permits
-  the *next* attempt (the user re-runs), not the one that just failed. A
-  "hold the exec until the user decides" gate isn't feasible from the
-  hook.
-- **[Quarantine] (later).** A fourth action that neutralizes the file
-  instead of allowing it — e.g. strip its exec bit and/or move it to a
-  quarantine directory, recording the origin so it can be restored.
-  Needs a new daemon-side quarantine action + policy (destination,
-  restore path); deferred until the notification agent + its
-  user→daemon channel exist.
+  `-EPERM` *before* the agent ever sees it — so the prompt is post-hoc:
+  Allow permits the *next* attempt (the user re-runs), not the one that
+  just failed. A "hold the exec until the user decides" gate isn't feasible
+  from the hook.
+- **[Quarantine] (still to do).** A fourth menu action that neutralizes the
+  file instead of allowing it — move it to a quarantine directory (stops
+  exec *and* interpreter-read) + record the origin so it can be restored.
+  Needs a new daemon `quarantine <token>` control-socket verb + policy
+  (destination, restore path); the tray menu reserves the slot.

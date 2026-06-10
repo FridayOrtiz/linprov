@@ -250,6 +250,34 @@ are per-daemon-session — if the daemon restarted since the block, re-run the
 command to get a fresh token. `allow` needs the daemon running (and root);
 with it down, edit `list.allow` and `SIGHUP` instead.
 
+### Tray agent — `linprov notify` (sway/Wayland)
+
+For a graphical workflow, `linprov notify` is a user-session tray agent: it
+shows a StatusNotifierItem icon whose menu lists recent blocked execs, each
+with **Allow once / Allow always / Close**, and fires a passive desktop
+notification as an alert. Menu clicks drive the same control-socket verbs as
+`linprov allow`.
+
+Because the daemon is root (system bus) and the tray is on your session bus,
+the agent runs as your user and reaches the daemon through a group-readable
+socket. One-time setup:
+
+```bash
+# 1. daemon side: expose the socket to a group
+sudo groupadd -f linprov                 # `linprov setup` also does this
+# set `notifications = "tray"` in /etc/linprov/config.toml, then:
+sudo systemctl restart linprov
+
+# 2. your side: join the group (re-login after), then run the agent
+sudo usermod -aG linprov "$USER"
+exec linprov notify                      # add to your sway config
+```
+
+Requires a StatusNotifierHost — on sway, enable waybar's `tray` module.
+Enforcement is synchronous, so the prompt is post-hoc: the blocked exec
+already failed; allowing it permits the **re-run**. Anyone in the `linprov`
+group can approve execs, so only add trusted users.
+
 ## Allowlist format
 
 One rule per line. `#` starts a comment; blank lines are ignored. Each

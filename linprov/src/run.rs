@@ -25,15 +25,16 @@ use tokio::{
     net::UnixListener,
     signal,
     signal::unix::{signal as unix_signal, SignalKind},
+    sync::broadcast,
 };
 
 use crate::{
     allowlist::{Dim, RuleSpec, Rules, Soak},
     config::{
-        CliOverrides, EffectiveConfig, FileConfig, DEFAULT_ALLOWLIST_PATH, DEFAULT_CONFIG_PATH,
-        DEFAULT_CONTROL_SOCKET_PATH,
+        CliOverrides, EffectiveConfig, FileConfig, NotifyMode, DEFAULT_ALLOWLIST_PATH,
+        DEFAULT_CONFIG_PATH, DEFAULT_CONTROL_SOCKET_PATH,
     },
-    control::Control,
+    control::{BlockEvent, Control},
     handler,
     hashdb::HashDb,
     inode_storage::InodeMarks,
@@ -103,6 +104,13 @@ pub struct RunArgs {
     /// built-in set (bash, sh, python, perl, node, …).
     #[arg(long, value_delimiter = ',')]
     interpreters: Option<Vec<String>>,
+
+    /// `off` (default) keeps the control socket root-only; `tray` exposes
+    /// it to the `linprov` group (socket 0660) so a user-session
+    /// `linprov notify` tray agent can subscribe to blocks and apply
+    /// allows.
+    #[arg(long, value_enum)]
+    notifications: Option<NotifyMode>,
 }
 
 pub fn execute(args: RunArgs) -> Result<()> {
@@ -116,6 +124,7 @@ pub fn execute(args: RunArgs) -> Result<()> {
         soak: args.soak,
         hash_db: args.hash_db,
         interpreters: args.interpreters,
+        notifications: args.notifications,
     };
     let cfg = EffectiveConfig::resolve(cli, file);
     init_logger(&cfg.log_level, cfg.log_file.as_deref())?;
@@ -215,6 +224,11 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
     // `control.combined()` = file rules ∪ transient on every live change.
     let mut control = Control::new(cfg.allowlist.clone());
 
+    // Block events fan out to control-socket `subscribe`rs (the tray
+    // agent). A bounded channel; if a slow subscriber lags it loses old
+    // events (RecvError::Lagged) rather than back-pressuring the daemon.
+    let (block_tx, _) = broadcast::channel::<BlockEvent>(256);
+
     // SIGHUP → reload the allowlist file and re-seed the BPF rules map,
     // without restarting the daemon or re-attaching the LSM hooks. Lets an
     // operator edit `list.allow` (or `linprov allow`) and apply it live.
@@ -225,9 +239,13 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
     // Control socket for `linprov allow [--once] <token>`. Best-effort: if
     // we can't bind (e.g. /run not writable), log and run without it rather
     // than fail to start — enforcement doesn't depend on it.
-    let listener = match bind_control_socket(Path::new(DEFAULT_CONTROL_SOCKET_PATH)) {
+    let listener = match bind_control_socket(Path::new(DEFAULT_CONTROL_SOCKET_PATH), cfg.notifications)
+    {
         Ok(l) => {
-            info!("control socket listening at {DEFAULT_CONTROL_SOCKET_PATH}");
+            info!(
+                "control socket listening at {DEFAULT_CONTROL_SOCKET_PATH} (notifications={:?})",
+                cfg.notifications
+            );
             Some(l)
         }
         Err(e) => {
@@ -281,7 +299,7 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
             conn = accept_opt(listener.as_ref()) => {
                 match conn {
                     Ok((stream, _)) => {
-                        handle_control_conn(stream, &mut control, &mut bpf).await;
+                        handle_control_conn(stream, &mut control, &mut bpf, &block_tx).await;
                     }
                     Err(e) => warn!("control socket accept failed: {e}"),
                 }
@@ -295,6 +313,7 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
                         &handler_cfg,
                         &mut inode_marks,
                         &mut control.blocks,
+                        &block_tx,
                         item.as_ref(),
                     );
                 }
@@ -319,27 +338,65 @@ async fn accept_opt(
     }
 }
 
-/// Create `/run/linprov` (0700), remove any stale socket, bind, and lock
-/// the socket to 0600 (root-only — `linprov allow` must run as root).
-fn bind_control_socket(path: &Path) -> Result<UnixListener> {
+/// Create `/run/linprov` (0700), remove any stale socket, and bind.
+///
+/// In `Off` mode the socket is root-only (0600). In `Tray` mode it's
+/// chowned to the `linprov` group and chmodded 0660 so a user-session
+/// `linprov notify` agent (running as a member of that group) can connect;
+/// if the group doesn't exist we warn and fall back to 0600 rather than
+/// fail to start.
+fn bind_control_socket(path: &Path, notify: NotifyMode) -> Result<UnixListener> {
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
         let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
     }
     let _ = fs::remove_file(path); // clear a stale socket from a prior run
     let listener = UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
-    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
-        .with_context(|| format!("chmod 0600 {}", path.display()))?;
+
+    let mut mode = 0o600;
+    if notify == NotifyMode::Tray {
+        match linprov_group_gid() {
+            Some(gid) => {
+                std::os::unix::fs::chown(path, None, Some(gid))
+                    .with_context(|| format!("chown {} to group linprov", path.display()))?;
+                mode = 0o660;
+            }
+            None => warn!(
+                "notifications=tray but no `linprov` group found; \
+                 keeping the control socket root-only (create the group and add \
+                 your user, then restart). See README."
+            ),
+        }
+    }
+    fs::set_permissions(path, fs::Permissions::from_mode(mode))
+        .with_context(|| format!("chmod {mode:o} {}", path.display()))?;
     Ok(listener)
 }
 
-/// Serve one control request: `allow <token>` / `once <token>` → apply the
-/// rule and reseed; reply `OK <rule>` or `ERR <msg>`. One line per
-/// connection, with a read timeout so a stuck client can't wedge the loop.
+/// gid of the `linprov` group, or `None` if it doesn't exist.
+fn linprov_group_gid() -> Option<u32> {
+    // SAFETY: getgrnam returns a pointer into a static buffer; we read the
+    // gid before any further libc call could clobber it.
+    let name = std::ffi::CString::new("linprov").ok()?;
+    let grp = unsafe { libc::getgrnam(name.as_ptr()) };
+    if grp.is_null() {
+        None
+    } else {
+        Some(unsafe { (*grp).gr_gid })
+    }
+}
+
+/// Serve one control request. `allow`/`once <token>` apply a rule inline
+/// and reply `OK <rule>` / `ERR <msg>`. `subscribe` upgrades the
+/// connection to a long-lived block-event stream (handled in a spawned
+/// task holding a broadcast receiver — it needs neither `Control` nor the
+/// `Ebpf`, so it doesn't pin the daemon's borrows). The initial verb read
+/// has a timeout so a stuck client can't wedge the loop.
 async fn handle_control_conn(
     mut stream: tokio::net::UnixStream,
     control: &mut Control,
     bpf: &mut Ebpf,
+    block_tx: &broadcast::Sender<BlockEvent>,
 ) {
     let mut buf = vec![0u8; 4096];
     let read = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await;
@@ -354,12 +411,42 @@ async fn handle_control_conn(
             return;
         }
     };
-    let req = String::from_utf8_lossy(&buf[..n]);
-    let reply = match process_control_request(req.trim(), control, bpf) {
+    let req = String::from_utf8_lossy(&buf[..n]).trim().to_string();
+
+    if req == "subscribe" {
+        let rx = block_tx.subscribe();
+        tokio::spawn(stream_blocks(stream, rx));
+        return;
+    }
+
+    let reply = match process_control_request(&req, control, bpf) {
         Ok(rule) => format!("OK {rule}\n"),
         Err(e) => format!("ERR {e:#}\n"),
     };
     let _ = stream.write_all(reply.as_bytes()).await;
+}
+
+/// Stream block events to a `subscribe`d client until it disconnects.
+/// Writes each event's one-line wire form; a write error (peer gone) ends
+/// the task. On `Lagged` (a slow client) we skip dropped events and keep
+/// going; `Closed` (daemon shutting down) ends it.
+async fn stream_blocks(
+    mut stream: tokio::net::UnixStream,
+    mut rx: broadcast::Receiver<BlockEvent>,
+) {
+    let _ = stream.write_all(b"OK subscribed\n").await;
+    loop {
+        match rx.recv().await {
+            Ok(ev) => {
+                let line = format!("{}\n", ev.to_wire());
+                if stream.write_all(line.as_bytes()).await.is_err() {
+                    break; // subscriber went away
+                }
+            }
+            Err(broadcast::error::RecvError::Lagged(_)) => continue,
+            Err(broadcast::error::RecvError::Closed) => break,
+        }
+    }
 }
 
 /// Parse and apply one control request line. `allow <token>` persists to

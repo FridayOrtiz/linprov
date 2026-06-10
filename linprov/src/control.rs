@@ -21,6 +21,34 @@ use crate::allowlist::{RuleSpec, Rules};
 /// allow it" without unbounded growth on a noisy enforce box.
 const MAX_BLOCKS: usize = 512;
 
+/// A blocked exec, broadcast to control-socket `subscribe`rs (the
+/// `linprov notify` tray agent). Tab-serialized on the wire as
+/// `BLOCK\t<token>\t<kind>\t<target>\t<creator>`.
+#[derive(Clone, Debug)]
+pub struct BlockEvent {
+    /// `"exec"` (ELF/shebang, bprm) or `"script"` (interpreter-loaded).
+    pub kind: &'static str,
+    /// The `[allow: <token>]` handle — feeds `allow`/`once`.
+    pub token: String,
+    /// The blocked path (exec target / script).
+    pub target: String,
+    /// Resolved creator exe path, or the creator `comm` if the path is
+    /// unknown — for display in the tray/notification.
+    pub creator: String,
+}
+
+impl BlockEvent {
+    /// One-line wire form for the subscribe stream. Fields are
+    /// tab-separated and assumed newline/tab-free (paths from `d_path`,
+    /// a hex token, a short kind).
+    pub fn to_wire(&self) -> String {
+        format!(
+            "BLOCK\t{}\t{}\t{}\t{}",
+            self.token, self.kind, self.target, self.creator
+        )
+    }
+}
+
 /// Bounded `token → candidate-rule-line` table of recent blocked execs.
 #[derive(Default)]
 pub struct BlocksTable {
