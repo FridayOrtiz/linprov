@@ -119,15 +119,69 @@ picking up the repo knows where it's going.
   resulting allowlist for review before flipping to `enforce`.
 - **Hot reload.** *Landed.* `SIGHUP` re-parses the allowlist file and
   re-seeds the BPF `ALLOW_RULES` / `ALLOW_RULE_COUNT` maps in place — no
-  daemon restart, no LSM re-attach. A failed reload (unreadable file,
-  over `MAX_RULES`) leaves the live rules untouched and logs a warning;
-  the rule-slot tail is cleared on each reload so shrinking the rule set
-  can't leave stale entries active. Only the allowlist is reloaded — mode,
+  daemon restart, no LSM re-attach. An unreadable/unparseable file leaves
+  the live rules untouched (the error propagates before the map is
+  written); an over-`MAX_RULES` file warns and applies the first
+  `MAX_RULES`. Shrinking the rule set just lowers `ALLOW_RULE_COUNT` — the
+  BPF side reads only that many slots, so stale tail slots are never
+  consulted (no clear needed). Only the allowlist is reloaded — mode,
   interpreter set, and other launch config stay as started.
-- **Ad-hoc allow at block time.** Not yet implemented; the reload
-  primitive it needs now exists (SIGHUP, above). The design: have every
-  `BLOCKED-EXEC` / `BLOCKED-SCRIPT` log line emit a short stable token,
-  then a `linprov allow <token>` subcommand that appends the rule which
-  would have permitted that exec to the allowlist file and SIGHUPs the
-  daemon. (Today the blocked lines log full context but no token, and
-  there is no `allow` subcommand.)
+- **Ad-hoc allow at block time.** *Landed.* Every `BLOCKED-EXEC` /
+  `BLOCKED-SCRIPT` line ends with `[allow: <token>]`, a short stable hash
+  of the most-specific rule that would have permitted that exec.
+  `linprov allow <token>` asks the daemon (over a root-only unix control
+  socket, `/run/linprov/control.sock`) to apply that rule and reseed the
+  live map. Plain `allow` appends it to the allowlist file (permanent);
+  `allow --once` adds it to the daemon's in-memory transient set instead —
+  active immediately and across SIGHUP reloads, never written to disk, and
+  gone on daemon restart. The daemon holds a bounded in-memory table of
+  recent block tokens (per-session: a token from before a restart won't
+  resolve — re-trigger the exec for a fresh one). Requires the daemon
+  running; if it's down, hand-editing the file + SIGHUP is the offline
+  path.
+
+## Desktop notifications (interactive approvals)
+
+*Proposed.* When an exec is blocked, optionally raise a desktop
+notification with action buttons — **[Allow Once]**, **[Allow Always]**,
+**[Close]** (and later **[Quarantine]**) — so a user on a graphical
+session can approve a block without dropping to a terminal. First target
+is `mako` on `sway`, but the mechanism is the generic freedesktop.org
+`org.freedesktop.Notifications` D-Bus spec (notification *actions* + the
+`ActionInvoked` signal), so any compliant notifier works.
+
+- **Off by default.** A config option gates it
+  (`notifications = "off" | "passive" | "interactive"`, default `off`):
+  `off` keeps today's headless behavior, `passive` notifies without
+  buttons, `interactive` adds the action buttons. Must be opt-in — a
+  headless/server box should never depend on a notifier.
+- **Reuses the allow plumbing.** Each blocked line already carries
+  `[allow: <token>]`; the notification's actions just carry that token and
+  drive the existing control-socket verbs: [Allow Once] →
+  `allow --once <token>` (transient), [Allow Always] → `allow <token>`
+  (persistent), [Close] → dismiss.
+- **Privilege boundary is the hard part.** The daemon runs as root on the
+  *system* bus; desktop notifications live on the logged-in user's
+  *session* bus (where `mako` runs), and a root system daemon can't
+  cleanly reach into a user session. The intended design is a small
+  **user-session agent** (shipped with linprov, started from the sway
+  config or a `systemd --user` unit) that (a) learns about blocks, (b)
+  pops the notification on the session bus, and (c) on a click calls back
+  to the daemon. That needs a user→daemon channel: either widen the
+  control socket from 0600-root to a `linprov` group the user belongs to,
+  or add a separate user-facing socket. The agent can learn about blocks
+  either by tailing the journal for `BLOCKED-*` lines (lowest-coupling
+  MVP — the token is right there) or via a new control-socket
+  "subscribe to block events" stream (cleaner push model).
+- **Enforcement stays synchronous.** The LSM hook denies the exec with
+  `-EPERM` *before* any notification round-trip — an LSM hook can't park
+  waiting on a human. So the prompt is post-hoc: clicking Allow permits
+  the *next* attempt (the user re-runs), not the one that just failed. A
+  "hold the exec until the user decides" gate isn't feasible from the
+  hook.
+- **[Quarantine] (later).** A fourth action that neutralizes the file
+  instead of allowing it — e.g. strip its exec bit and/or move it to a
+  quarantine directory, recording the origin so it can be restored.
+  Needs a new daemon-side quarantine action + policy (destination,
+  restore path); deferred until the notification agent + its
+  user→daemon channel exist.

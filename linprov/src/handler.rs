@@ -25,7 +25,8 @@ use linprov_common::{
 use log::{debug, info, warn};
 
 use crate::{
-    allowlist::{OriginContext, Soak},
+    allowlist::{rule_from_context, OriginContext, Soak, ALLOW_DIMS},
+    control::BlocksTable,
     hashdb::HashDb,
     inode_storage::InodeMarks,
     ModeArg,
@@ -37,7 +38,12 @@ pub struct Config<'a> {
     pub hashdb: &'a HashDb,
 }
 
-pub fn handle_event(cfg: &Config, inode_marks: &mut InodeMarks, raw: &[u8]) {
+pub fn handle_event(
+    cfg: &Config,
+    inode_marks: &mut InodeMarks,
+    blocks: &mut BlocksTable,
+    raw: &[u8],
+) {
     if raw.len() < std::mem::size_of::<Event>() {
         warn!(
             "short ring-buf record: got {} bytes, expected {}",
@@ -58,8 +64,8 @@ pub fn handle_event(cfg: &Config, inode_marks: &mut InodeMarks, raw: &[u8]) {
     match event.kind {
         EVENT_KIND_NETWORK_FILE_OPEN => on_file_marked(cfg, inode_marks, event, false),
         EVENT_KIND_DERIVED_FILE_OPEN => on_file_marked(cfg, inode_marks, event, true),
-        EVENT_KIND_EXECVE => on_execve_marked(cfg, event),
-        EVENT_KIND_SCRIPT_EXEC => on_script_exec(cfg, event),
+        EVENT_KIND_EXECVE => on_execve_marked(cfg, blocks, event),
+        EVENT_KIND_SCRIPT_EXEC => on_script_exec(cfg, blocks, event),
         other => warn!("unknown event kind: {other}"),
     }
 }
@@ -206,7 +212,7 @@ fn is_pseudo_fs(target: &std::path::Path) -> bool {
         || s.starts_with("/run/")
 }
 
-fn on_execve_marked(cfg: &Config, event: &Event) {
+fn on_execve_marked(cfg: &Config, blocks: &mut BlocksTable, event: &Event) {
     let target_path = c_str_to_string(&event.filename);
     let exec_comm = comm_to_string(&event.comm);
     let creator_comm = comm_to_string(&event.origin.comm);
@@ -219,8 +225,17 @@ fn on_execve_marked(cfg: &Config, event: &Event) {
     let landing_basename = cfg.hashdb.resolve(event.origin.landing_basename_hash);
 
     if event.status != 0 {
+        let token = record_block_token(
+            blocks,
+            event,
+            &target_path,
+            &landing_folder,
+            &landing_basename,
+            &creator_path,
+            &creator_comm,
+        );
         warn!(
-            "BLOCKED-EXEC target={} landing_folder={} landing_file={} pid={} comm={} origin={} (LSM verdict {})",
+            "BLOCKED-EXEC target={} landing_folder={} landing_file={} pid={} comm={} origin={} (LSM verdict {}) [allow: {token}]",
             target_path,
             resolved(&landing_folder, event.origin.landing_folder_hash),
             resolved(&landing_basename, event.origin.landing_basename_hash),
@@ -262,7 +277,7 @@ fn on_execve_marked(cfg: &Config, event: &Event) {
 /// soak rule emission keyed on the script path, so a
 /// `target_filename=<script>` / `target_folder=<dir>` rule permits the
 /// script under any interpreter and under `./script` (shebang) alike.
-fn on_script_exec(cfg: &Config, event: &Event) {
+fn on_script_exec(cfg: &Config, blocks: &mut BlocksTable, event: &Event) {
     let script_path = c_str_to_string(&event.filename);
     let interp_comm = comm_to_string(&event.comm);
     let creator_comm = comm_to_string(&event.origin.comm);
@@ -273,8 +288,17 @@ fn on_script_exec(cfg: &Config, event: &Event) {
     let script_name = basename_of(&script_path).unwrap_or(&script_path);
 
     if event.status != 0 {
+        let token = record_block_token(
+            blocks,
+            event,
+            &script_path,
+            &landing_folder,
+            &landing_basename,
+            &creator_path,
+            &creator_comm,
+        );
         warn!(
-            "BLOCKED-SCRIPT script={} name={} interp={} landing_folder={} landing_file={} pid={} origin={} (LSM verdict {})",
+            "BLOCKED-SCRIPT script={} name={} interp={} landing_folder={} landing_file={} pid={} origin={} (LSM verdict {}) [allow: {token}]",
             script_path,
             script_name,
             interp_comm,
@@ -307,6 +331,33 @@ fn on_script_exec(cfg: &Config, event: &Event) {
         &creator_path,
         &creator_comm,
     );
+}
+
+/// Build the candidate "allow" rule for a blocked exec (the most-specific
+/// rule that would have permitted it — see `ALLOW_DIMS`), record it in the
+/// blocks table, and return its stable token. The token goes in the
+/// `BLOCKED-*` log line so an operator can `linprov allow <token>`.
+#[allow(clippy::too_many_arguments)]
+fn record_block_token(
+    blocks: &mut BlocksTable,
+    event: &Event,
+    target: &str,
+    landing_folder: &Option<String>,
+    landing_basename: &Option<String>,
+    creator_path: &Option<String>,
+    creator_comm: &str,
+) -> String {
+    let exec_uid = get_uid_for_pid(event.pid).unwrap_or(0);
+    let ctx = OriginContext {
+        target_filename: target,
+        landing_folder: landing_folder.as_deref(),
+        landing_basename: landing_basename.as_deref(),
+        creator_path: creator_path.as_deref(),
+        creator_comm,
+        creator_uid: event.origin.creator_uid,
+        execution_uid: exec_uid,
+    };
+    blocks.record(rule_from_context(&ctx, ALLOW_DIMS).to_line())
 }
 
 /// In soak mode, emit one allowlist rule for this event keyed on `target`

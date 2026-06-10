@@ -227,8 +227,28 @@ Sample log lines for observe / enforce:
 PROVENANCE-EXEC target=/usr/local/bin/foo landing=/tmp/foo pid=12345 \
   comm=zsh origin={v:3,…,comm:curl,path:/usr/bin/curl}
 BLOCKED-EXEC target=/tmp/sketchy landing=/tmp/sketchy pid=12346 comm=zsh \
-  origin={v:3,…,comm:curl,path:/usr/bin/curl} (LSM verdict -1)
+  origin={v:3,…,comm:curl,path:/usr/bin/curl} (LSM verdict -1) [allow: 9f3a1c07]
 ```
+
+### Approving a blocked exec — `linprov allow`
+
+Each `BLOCKED-EXEC` / `BLOCKED-SCRIPT` line ends with `[allow: <token>]` —
+a short stable handle for the most-specific rule that would have permitted
+that exec. To permit it without hand-editing the allowlist:
+
+```
+sudo linprov allow 9f3a1c07          # append the rule to list.allow (permanent) + apply live
+sudo linprov allow --once 9f3a1c07   # apply in memory only — not written to the file
+```
+
+`allow` talks to the running daemon over a root-only control socket
+(`/run/linprov/control.sock`) and re-seeds the in-kernel rules immediately —
+no restart. `--once` rules live in the daemon's memory: active right away
+and across `SIGHUP` reloads, but never persisted, so they vanish on daemon
+restart (handy for a one-off you don't want to whitelist forever). Tokens
+are per-daemon-session — if the daemon restarted since the block, re-run the
+command to get a fresh token. `allow` needs the daemon running (and root);
+with it down, edit `list.allow` and `SIGHUP` instead.
 
 ## Allowlist format
 

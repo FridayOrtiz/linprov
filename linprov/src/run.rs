@@ -3,8 +3,9 @@
 //! buffer, and (depending on mode) maintains the allowlist.
 
 use std::{
-    fs::OpenOptions,
+    fs::{self, OpenOptions},
     os::fd::AsRawFd,
+    os::unix::fs::PermissionsExt,
     path::{Path, PathBuf},
 };
 
@@ -20,16 +21,19 @@ use env_logger::Target;
 use linprov_common::{fnv_hash_bytes, AllowRule, COMM_LEN, MAX_RULES};
 use log::{info, warn};
 use tokio::{
-    io::unix::AsyncFd,
+    io::{unix::AsyncFd, AsyncReadExt, AsyncWriteExt},
+    net::UnixListener,
     signal,
     signal::unix::{signal as unix_signal, SignalKind},
 };
 
 use crate::{
-    allowlist::{Dim, Rules, Soak},
+    allowlist::{Dim, RuleSpec, Rules, Soak},
     config::{
         CliOverrides, EffectiveConfig, FileConfig, DEFAULT_ALLOWLIST_PATH, DEFAULT_CONFIG_PATH,
+        DEFAULT_CONTROL_SOCKET_PATH,
     },
+    control::Control,
     handler,
     hashdb::HashDb,
     inode_storage::InodeMarks,
@@ -149,15 +153,11 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
     } else {
         Rules::default()
     };
-    // Over-capacity is a warning, not a fatal error: seeding loads the
-    // first MAX_RULES and ignores the rest. A long soak run can grow the
-    // file past the ceiling; the daemon must still start (and keep
+    // Over-capacity is a warning, not a fatal error (handled in seed_rules):
+    // the first MAX_RULES load and the rest are ignored. A long soak run can
+    // grow the file past the ceiling; the daemon must still start (and keep
     // enforcing what fits) rather than crash-loop.
-    if let Err(e) = rules.check_capacity() {
-        warn!("{e}");
-    }
-
-    seed_allowlist_rules(&mut bpf, &rules)?;
+    seed_rules(&mut bpf, &rules.rules)?;
     seed_interpreters(&mut bpf, &cfg.interpreters)?;
 
     {
@@ -210,12 +210,31 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
         hashdb: &hashdb,
     };
 
+    // Rule-mutation state: the in-memory transient (`allow --once`) rules
+    // and the recent-blocks token table. The BPF map is reseeded from
+    // `control.combined()` = file rules ∪ transient on every live change.
+    let mut control = Control::new(cfg.allowlist.clone());
+
     // SIGHUP → reload the allowlist file and re-seed the BPF rules map,
     // without restarting the daemon or re-attaching the LSM hooks. Lets an
-    // operator edit `list.allow` (or `linprov allow`, later) and apply it
-    // live. Only the allowlist is reloaded — mode, interpreters, and other
-    // launch config stay as started.
+    // operator edit `list.allow` (or `linprov allow`) and apply it live.
+    // Only the allowlist is reloaded — mode, interpreters, and other launch
+    // config stay as started.
     let mut sighup = unix_signal(SignalKind::hangup()).context("installing SIGHUP handler")?;
+
+    // Control socket for `linprov allow [--once] <token>`. Best-effort: if
+    // we can't bind (e.g. /run not writable), log and run without it rather
+    // than fail to start — enforcement doesn't depend on it.
+    let listener = match bind_control_socket(Path::new(DEFAULT_CONTROL_SOCKET_PATH)) {
+        Ok(l) => {
+            info!("control socket listening at {DEFAULT_CONTROL_SOCKET_PATH}");
+            Some(l)
+        }
+        Err(e) => {
+            warn!("control socket disabled ({DEFAULT_CONTROL_SOCKET_PATH}): {e:#}");
+            None
+        }
+    };
 
     info!(
         "linprov running ({:?}). press Ctrl-C to exit, SIGHUP to reload the allowlist.{}",
@@ -248,12 +267,23 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
                         .map(|p| p.display().to_string())
                         .unwrap_or_else(|| "<none>".to_string())
                 );
-                // On failure (unreadable file, over-capacity), the BPF map is
-                // left untouched — Rules::load / check_capacity fail before
-                // seed_allowlist_rules writes anything — so the currently
-                // active rules keep enforcing.
-                if let Err(e) = reload_allowlist(&mut bpf, cfg.allowlist.as_deref()) {
+                // Reseed from file ∪ transient. On failure (unreadable file)
+                // the helper errors before writing the map, so the currently
+                // active rules keep enforcing. In-memory transient rules are
+                // preserved across the reload.
+                if let Err(e) = reseed_from_control(&mut bpf, &control) {
                     warn!("allowlist reload failed, keeping current rules: {e:#}");
+                }
+            }
+
+            // `linprov allow` connection. `accept_opt` resolves to a pending
+            // future when the socket is disabled, so the branch never fires.
+            conn = accept_opt(listener.as_ref()) => {
+                match conn {
+                    Ok((stream, _)) => {
+                        handle_control_conn(stream, &mut control, &mut bpf).await;
+                    }
+                    Err(e) => warn!("control socket accept failed: {e}"),
                 }
             }
 
@@ -261,14 +291,104 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
                 let mut guard = res.context("polling ring buffer")?;
                 let ring = &mut guard.get_inner_mut().0;
                 while let Some(item) = ring.next() {
-                    handler::handle_event(&handler_cfg, &mut inode_marks, item.as_ref());
+                    handler::handle_event(
+                        &handler_cfg,
+                        &mut inode_marks,
+                        &mut control.blocks,
+                        item.as_ref(),
+                    );
                 }
                 guard.clear_ready();
             }
         }
     }
 
+    // Best-effort: drop the socket file so a future daemon binds cleanly.
+    let _ = fs::remove_file(DEFAULT_CONTROL_SOCKET_PATH);
     Ok(())
+}
+
+/// Accept on the control socket if enabled; otherwise never resolve (so the
+/// `select!` branch stays dormant when the socket failed to bind).
+async fn accept_opt(
+    listener: Option<&UnixListener>,
+) -> std::io::Result<(tokio::net::UnixStream, tokio::net::unix::SocketAddr)> {
+    match listener {
+        Some(l) => l.accept().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Create `/run/linprov` (0700), remove any stale socket, bind, and lock
+/// the socket to 0600 (root-only — `linprov allow` must run as root).
+fn bind_control_socket(path: &Path) -> Result<UnixListener> {
+    if let Some(dir) = path.parent() {
+        fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+    }
+    let _ = fs::remove_file(path); // clear a stale socket from a prior run
+    let listener = UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
+    fs::set_permissions(path, fs::Permissions::from_mode(0o600))
+        .with_context(|| format!("chmod 0600 {}", path.display()))?;
+    Ok(listener)
+}
+
+/// Serve one control request: `allow <token>` / `once <token>` → apply the
+/// rule and reseed; reply `OK <rule>` or `ERR <msg>`. One line per
+/// connection, with a read timeout so a stuck client can't wedge the loop.
+async fn handle_control_conn(
+    mut stream: tokio::net::UnixStream,
+    control: &mut Control,
+    bpf: &mut Ebpf,
+) {
+    let mut buf = vec![0u8; 4096];
+    let read = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await;
+    let n = match read {
+        Ok(Ok(n)) => n,
+        Ok(Err(e)) => {
+            warn!("control read failed: {e}");
+            return;
+        }
+        Err(_) => {
+            let _ = stream.write_all(b"ERR read timed out\n").await;
+            return;
+        }
+    };
+    let req = String::from_utf8_lossy(&buf[..n]);
+    let reply = match process_control_request(req.trim(), control, bpf) {
+        Ok(rule) => format!("OK {rule}\n"),
+        Err(e) => format!("ERR {e:#}\n"),
+    };
+    let _ = stream.write_all(reply.as_bytes()).await;
+}
+
+/// Parse and apply one control request line. `allow <token>` persists to
+/// the allowlist file; `once <token>` adds an in-memory transient rule.
+/// Both reseed the BPF map from `control.combined()`.
+fn process_control_request(req: &str, control: &mut Control, bpf: &mut Ebpf) -> Result<String> {
+    let mut parts = req.split_whitespace();
+    let (verb, token) = (parts.next(), parts.next());
+    let once = match verb {
+        Some("once") => true,
+        Some("allow") => false,
+        _ => return Err(anyhow!("bad request `{req}` (expected `allow|once <token>`)")),
+    };
+    let token = token.ok_or_else(|| anyhow!("missing token"))?;
+    let rule = control.apply(token, once)?;
+    reseed_from_control(bpf, control)?;
+    info!(
+        "allow{} applied (token {token}): {rule}",
+        if once { " --once" } else { "" }
+    );
+    Ok(rule)
+}
+
+/// Reseed the BPF rules map from `control.combined()` (file ∪ transient).
+/// Over-capacity warns and truncates (same as startup); a file read error
+/// propagates without touching the map.
+fn reseed_from_control(bpf: &mut Ebpf, control: &Control) -> Result<()> {
+    let rules = control.combined()?;
+    seed_rules(bpf, &rules)
 }
 
 fn init_logger(level: &str, log_file: Option<&Path>) -> Result<()> {
@@ -286,22 +406,25 @@ fn init_logger(level: &str, log_file: Option<&Path>) -> Result<()> {
     Ok(())
 }
 
-fn seed_allowlist_rules(bpf: &mut Ebpf, rules: &Rules) -> Result<()> {
-    // Two scoped borrows because `bpf.map_mut` re-borrows the Ebpf and
-    // we need it for both maps.
+/// Seed the BPF `ALLOW_RULES` / `ALLOW_RULE_COUNT` maps from `rules` (the
+/// combined file ∪ transient set). Over-capacity is a warning, not an
+/// error: the first `MAX_RULES` are written and the rest ignored, so a
+/// daemon never crash-loops on a too-big allowlist. The BPF side reads
+/// exactly `ALLOW_RULE_COUNT` slots, so a shrunk set leaves stale tail
+/// slots simply unread — no O(MAX_RULES) clear needed.
+fn seed_rules(bpf: &mut Ebpf, rules: &[RuleSpec]) -> Result<()> {
+    let total = rules.len();
+    let n = total.min(MAX_RULES);
+    if total > MAX_RULES {
+        warn!("{total} allowlist rules exceeds the BPF map capacity ({MAX_RULES}); applying the first {n}");
+    }
     {
         let mut rule_map: Array<_, AllowRuleWire> = Array::try_from(
             bpf.map_mut("ALLOW_RULES")
                 .context("ALLOW_RULES map missing")?,
         )
         .context("opening ALLOW_RULES")?;
-        // Only the first `min(len, MAX_RULES)` rules are seeded; the BPF
-        // side reads exactly `ALLOW_RULE_COUNT` slots (set below), so on a
-        // reload that shrinks the rule set the now-stale tail slots are
-        // simply never read — no need to clear them (which would be an
-        // O(MAX_RULES) sweep, wasteful now that MAX_RULES is large).
-        let n = rules.rules.len().min(MAX_RULES);
-        for (i, spec) in rules.rules.iter().take(n).enumerate() {
+        for (i, spec) in rules.iter().take(n).enumerate() {
             let packed = AllowRuleWire(spec.pack());
             rule_map
                 .set(i as u32, packed, 0)
@@ -314,36 +437,13 @@ fn seed_allowlist_rules(bpf: &mut Ebpf, rules: &Rules) -> Result<()> {
             .context("ALLOW_RULE_COUNT map missing")?,
     )
     .context("opening ALLOW_RULE_COUNT")?;
-    let n = rules.rules.len().min(MAX_RULES) as u32;
     count_map
-        .set(0, n, 0)
+        .set(0, n as u32, 0)
         .context("setting ALLOW_RULE_COUNT[0]")?;
 
-    // "{n} of {total}" makes capping visible at load: when the file fits,
-    // they're equal; when it's over capacity, `check_capacity` has already
-    // warned and this shows how many actually took effect.
-    info!("loaded {n} of {} allowlist rules", rules.len());
+    // "{n} of {total}" makes capping visible: equal when it fits.
+    info!("loaded {n} of {total} allowlist rules");
     Ok(())
-}
-
-/// Reload the allowlist file and re-seed the BPF rules map in place —
-/// the SIGHUP handler. Parses fresh `Rules` from `allowlist` (or an empty
-/// set if unconfigured), then re-seeds `ALLOW_RULES` / `ALLOW_RULE_COUNT`.
-/// An over-capacity file only warns (the first `MAX_RULES` are applied).
-/// If the file can't be read/parsed, returns the error WITHOUT having
-/// touched the map, so the live rules keep enforcing.
-fn reload_allowlist(bpf: &mut Ebpf, allowlist: Option<&Path>) -> Result<()> {
-    let rules = match allowlist {
-        Some(path) => Rules::load(path)?,
-        None => Rules::default(),
-    };
-    // Same as startup: over-capacity warns and truncates rather than
-    // rejecting the reload, so a SIGHUP after the file outgrew the ceiling
-    // still applies what fits instead of silently keeping stale rules.
-    if let Err(e) = rules.check_capacity() {
-        warn!("{e}");
-    }
-    seed_allowlist_rules(bpf, &rules)
 }
 
 /// Seed the `INTERPRETERS` BPF map from the configured interpreter list.

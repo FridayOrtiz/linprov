@@ -8,8 +8,10 @@
 use anyhow::Result;
 use clap::{Parser, Subcommand};
 
+mod allow;
 mod allowlist;
 mod config;
+mod control;
 mod handler;
 mod hashdb;
 mod inode_storage;
@@ -44,6 +46,10 @@ enum Cmd {
     /// After `cargo install --force linprov` lays down a new binary,
     /// reload systemd and restart linprov.service.
     Upgrade(upgrade::UpgradeArgs),
+    /// Permit a blocked exec by the token from its `BLOCKED-EXEC` /
+    /// `BLOCKED-SCRIPT` log line. Talks to the running daemon's control
+    /// socket; `--once` applies it in memory only (not persisted).
+    Allow(allow::AllowArgs),
 }
 
 fn main() -> Result<()> {
@@ -58,5 +64,6 @@ fn main() -> Result<()> {
         Cmd::Run(args) => run::execute(args),
         Cmd::Setup(args) => setup::run(args),
         Cmd::Upgrade(args) => upgrade::run(args),
+        Cmd::Allow(args) => allow::run(args),
     }
 }

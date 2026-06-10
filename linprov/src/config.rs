@@ -34,6 +34,13 @@ pub const DEFAULT_SYSTEMD_UNIT_PATH: &str = "/etc/systemd/system/linprov.service
 /// Default name of the systemd unit (without the file extension).
 pub const DEFAULT_SYSTEMD_UNIT_NAME: &str = "linprov.service";
 
+/// Root-only unix control socket the daemon listens on and `linprov allow`
+/// connects to. Lives in `/run` (tmpfs) so it's recreated each boot; the
+/// daemon manages it (creates the dir, removes a stale socket on bind, and
+/// unlinks on shutdown). `setup` adds `RuntimeDirectory=linprov` so systemd
+/// owns the directory's lifecycle.
+pub const DEFAULT_CONTROL_SOCKET_PATH: &str = "/run/linprov/control.sock";
+
 /// Default plaintext hash → path audit db. Maps every FNV hash the
 /// daemon stores in a record back to its path, for log resolution,
 /// soak rule emission, and `grep`-based auditing. `/var/lib` is the

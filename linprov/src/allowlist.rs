@@ -338,26 +338,6 @@ impl Rules {
         true
     }
 
-    pub fn len(&self) -> usize {
-        self.rules.len()
-    }
-
-    /// Whether the rule set fits the BPF map. Returns `Err` describing the
-    /// overflow if not — but callers treat this as a **warning**, not a
-    /// fatal error: seeding loads the first [`MAX_RULES`] and ignores the
-    /// rest, so an over-capacity file degrades gracefully instead of
-    /// crash-looping the daemon (a long soak run can otherwise grow the
-    /// file past the ceiling and brick the next restart).
-    pub fn check_capacity(&self) -> Result<()> {
-        if self.rules.len() > MAX_RULES {
-            return Err(anyhow!(
-                "{} allowlist rules exceeds the BPF map capacity ({MAX_RULES}); \
-                 only the first {MAX_RULES} will be enforced",
-                self.rules.len()
-            ));
-        }
-        Ok(())
-    }
 }
 
 /// Soak-mode state: which dims to record, the append handle, and the
@@ -386,29 +366,7 @@ impl Soak {
     /// append it to the file if not previously seen. Returns the rule
     /// line iff actually written.
     pub fn record(&self, ctx: &OriginContext<'_>) -> Result<Option<String>> {
-        let mut spec = RuleSpec::default();
-        for d in &self.dims {
-            let val: Option<String> = match d {
-                // Target dims come from the live exec path — always
-                // present, any length.
-                Dim::TargetFilename => non_empty(ctx.target_filename),
-                Dim::TargetFolder => folder_of(ctx.target_filename),
-                // Landing + creator dims are resolved from the audit db
-                // (the record only carries hashes). `None` means the db
-                // couldn't resolve the hash — skip that dim rather than
-                // emit a rule that can't be matched.
-                Dim::LandingFilename => ctx.landing_basename.map(str::to_string),
-                Dim::LandingFolder => ctx.landing_folder.map(str::to_string),
-                Dim::CreatorProcess => ctx.creator_path.map(str::to_string),
-                Dim::CreatorComm => non_empty(ctx.creator_comm),
-                Dim::CreatorUid => Some(ctx.creator_uid.to_string()),
-                Dim::ExecutionUid => Some(ctx.execution_uid.to_string()),
-            };
-            let Some(val) = val else { continue };
-            if let Err(e) = spec.set(*d, &val) {
-                log::warn!("soak: skipping invalid {} value `{val}`: {e}", d.as_key());
-            }
-        }
+        let spec = rule_from_context(ctx, &self.dims);
         if spec.flags == 0 {
             return Ok(None);
         }
@@ -434,6 +392,50 @@ impl Soak {
         w.sync_data().ok();
         Ok(Some(line))
     }
+}
+
+/// Dim set for an ad-hoc `allow`: the most specific the record supports,
+/// so permitting one blocked exec doesn't broadly widen the policy.
+/// `rule_from_context` omits any landing / `creator_process` dim the audit
+/// db can't resolve, leaving `target_filename` + the always-present
+/// creator/execution identity.
+pub const ALLOW_DIMS: &[Dim] = &[
+    Dim::TargetFilename,
+    Dim::CreatorProcess,
+    Dim::CreatorComm,
+    Dim::CreatorUid,
+    Dim::ExecutionUid,
+    Dim::LandingFolder,
+    Dim::LandingFilename,
+];
+
+/// Build a [`RuleSpec`] from an exec/block event's `ctx`, including each
+/// dim in `dims` whose value is available. Landing / `creator_process`
+/// dims resolve to `None` when the audit db can't map the record's hash
+/// back to a path, and are skipped (a rule on an unresolved hash couldn't
+/// match anyway). Shared by soak rule emission and the ad-hoc `allow` path.
+pub fn rule_from_context(ctx: &OriginContext<'_>, dims: &[Dim]) -> RuleSpec {
+    let mut spec = RuleSpec::default();
+    for d in dims {
+        let val: Option<String> = match d {
+            // Target dims come from the live exec path — always present.
+            Dim::TargetFilename => non_empty(ctx.target_filename),
+            Dim::TargetFolder => folder_of(ctx.target_filename),
+            // Landing + creator dims are resolved from the audit db (the
+            // record only carries hashes); `None` → skip the dim.
+            Dim::LandingFilename => ctx.landing_basename.map(str::to_string),
+            Dim::LandingFolder => ctx.landing_folder.map(str::to_string),
+            Dim::CreatorProcess => ctx.creator_path.map(str::to_string),
+            Dim::CreatorComm => non_empty(ctx.creator_comm),
+            Dim::CreatorUid => Some(ctx.creator_uid.to_string()),
+            Dim::ExecutionUid => Some(ctx.execution_uid.to_string()),
+        };
+        let Some(val) = val else { continue };
+        if let Err(e) = spec.set(*d, &val) {
+            log::warn!("skipping invalid {} value `{val}`: {e}", d.as_key());
+        }
+    }
+    spec
 }
 
 fn non_empty(s: &str) -> Option<String> {
@@ -626,7 +628,7 @@ mod tests {
         let mut rules = Rules::default();
         assert!(rules.insert(RuleSpec::parse("creator_uid=1000").unwrap()));
         assert!(!rules.insert(RuleSpec::parse("creator_uid=1000").unwrap()));
-        assert_eq!(rules.len(), 1);
+        assert_eq!(rules.rules.len(), 1);
     }
 
     #[test]
@@ -639,17 +641,26 @@ mod tests {
         writeln!(tmp, "creator_uid=1000;creator_comm=curl").unwrap();
         tmp.flush().unwrap();
         let rules = Rules::load(tmp.path()).unwrap();
-        assert_eq!(rules.len(), 2);
+        assert_eq!(rules.rules.len(), 2);
     }
 
     #[test]
-    fn capacity_check_fires_above_max_rules() {
-        let mut rules = Rules::default();
-        for i in 0..(MAX_RULES + 1) {
-            // Use unique creator_uid values so dedup doesn't collapse them.
-            let spec = RuleSpec::parse(&format!("creator_uid={i}")).unwrap();
-            rules.insert(spec);
-        }
-        assert!(rules.check_capacity().is_err());
+    fn rule_from_context_uses_resolved_dims_only() {
+        // Unresolved landing/creator_process dims (None) are skipped; the
+        // always-present target/creator identity dims remain.
+        let ctx = OriginContext {
+            target_filename: "/tmp/foo",
+            landing_folder: None,
+            landing_basename: None,
+            creator_path: None,
+            creator_comm: "curl",
+            creator_uid: 1000,
+            execution_uid: 1000,
+        };
+        let spec = rule_from_context(&ctx, ALLOW_DIMS);
+        assert_eq!(spec.target_filename.as_deref(), Some("/tmp/foo"));
+        assert_eq!(spec.creator_comm.as_deref(), Some("curl"));
+        assert_eq!(spec.flags & dim::CREATOR_PROCESS, 0); // unresolved → omitted
+        assert_eq!(spec.flags & dim::LANDING_FOLDER, 0);
     }
 }
