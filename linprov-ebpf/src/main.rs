@@ -514,7 +514,7 @@ pub fn file_open(ctx: LsmContext) -> i32 {
         // on the first marked read per interpreter invocation — the script
         // itself — not on every data file it subsequently touches.
         let comm_hash = fnv_comm(&current_comm());
-        if unsafe { INTERPRETERS.get(&comm_hash) }.is_some()
+        if unsafe { INTERPRETERS.get(comm_hash) }.is_some()
             && unsafe { APPROVED_INTERP.get(pid) }.is_none()
         {
             let path_ptr = unsafe { &(*file_ptr).f_path } as *const KernelPath as *mut bpf_path;
@@ -840,8 +840,8 @@ unsafe fn target_folder_match(ctx: &AllowCtx, needle: u64) -> bool {
         None => return false,
     };
     let mut found = false;
-    for j in 0..MAX_FOLDER_ANCESTORS {
-        if anc[j] == needle {
+    for &a in anc.iter() {
+        if a == needle {
             found = true;
         }
     }
