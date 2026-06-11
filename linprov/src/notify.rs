@@ -238,7 +238,10 @@ pub fn run(args: NotifyArgs) -> Result<()> {
     let worker_socket = args.socket.clone();
     std::thread::spawn(move || action_worker(rx, worker_socket));
 
-    info!("linprov tray agent started; subscribing to {}", args.socket.display());
+    info!(
+        "linprov tray agent started; subscribing to {}",
+        args.socket.display()
+    );
     // This thread owns the subscribe stream (reconnects forever).
     subscribe_loop(&args.socket, &handle);
     Ok(())
@@ -258,7 +261,9 @@ fn subscribe_loop(socket: &Path, handle: &ksni::blocking::Handle<LinprovTray>) {
 fn subscribe_once(socket: &Path, handle: &ksni::blocking::Handle<LinprovTray>) -> Result<()> {
     let mut stream = UnixStream::connect(socket)
         .with_context(|| format!("connecting to {} (is the daemon running with notifications=tray, and are you in the linprov group?)", socket.display()))?;
-    stream.write_all(b"subscribe\n").context("sending subscribe")?;
+    stream
+        .write_all(b"subscribe\n")
+        .context("sending subscribe")?;
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         let line = line.context("reading block stream")?;

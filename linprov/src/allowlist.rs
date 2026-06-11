@@ -337,7 +337,6 @@ impl Rules {
         self.rules.push(spec);
         true
     }
-
 }
 
 /// Soak-mode state: which dims to record, the append handle, and the

@@ -268,7 +268,9 @@ fn ensure_linprov_group() {
     match Command::new("groupadd").args(["-f", "linprov"]).status() {
         Ok(s) if s.success() => info!("ensured `linprov` group exists"),
         Ok(s) => warn!("groupadd linprov exited {s}; create it by hand if you want the tray agent"),
-        Err(e) => warn!("couldn't run groupadd ({e}); create the `linprov` group by hand for the tray agent"),
+        Err(e) => warn!(
+            "couldn't run groupadd ({e}); create the `linprov` group by hand for the tray agent"
+        ),
     }
 }
 

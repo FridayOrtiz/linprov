@@ -239,20 +239,20 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
     // Control socket for `linprov allow [--once] <token>`. Best-effort: if
     // we can't bind (e.g. /run not writable), log and run without it rather
     // than fail to start — enforcement doesn't depend on it.
-    let listener = match bind_control_socket(Path::new(DEFAULT_CONTROL_SOCKET_PATH), cfg.notifications)
-    {
-        Ok(l) => {
-            info!(
+    let listener =
+        match bind_control_socket(Path::new(DEFAULT_CONTROL_SOCKET_PATH), cfg.notifications) {
+            Ok(l) => {
+                info!(
                 "control socket listening at {DEFAULT_CONTROL_SOCKET_PATH} (notifications={:?})",
                 cfg.notifications
             );
-            Some(l)
-        }
-        Err(e) => {
-            warn!("control socket disabled ({DEFAULT_CONTROL_SOCKET_PATH}): {e:#}");
-            None
-        }
-    };
+                Some(l)
+            }
+            Err(e) => {
+                warn!("control socket disabled ({DEFAULT_CONTROL_SOCKET_PATH}): {e:#}");
+                None
+            }
+        };
 
     info!(
         "linprov running ({:?}). press Ctrl-C to exit, SIGHUP to reload the allowlist.{}",
@@ -376,7 +376,8 @@ fn bind_control_socket(path: &Path, notify: NotifyMode) -> Result<UnixListener> 
     }
 
     let _ = fs::remove_file(path); // clear a stale socket from a prior run
-    let listener = UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
+    let listener =
+        UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
 
     let sock_mode = if let Some(g) = gid {
         std::os::unix::fs::chown(path, None, Some(g))
@@ -475,7 +476,11 @@ fn process_control_request(req: &str, control: &mut Control, bpf: &mut Ebpf) -> 
     let once = match verb {
         Some("once") => true,
         Some("allow") => false,
-        _ => return Err(anyhow!("bad request `{req}` (expected `allow|once <token>`)")),
+        _ => {
+            return Err(anyhow!(
+                "bad request `{req}` (expected `allow|once <token>`)"
+            ))
+        }
     };
     let token = token.ok_or_else(|| anyhow!("missing token"))?;
     let rule = control.apply(token, once)?;
@@ -579,7 +584,10 @@ fn seed_interpreters(bpf: &mut Ebpf, interpreters: &[String]) -> Result<()> {
     if n == 0 {
         info!("script enforcement disabled (no interpreters configured)");
     } else {
-        info!("script enforcement on for {n} interpreters: {}", interpreters.join(","));
+        info!(
+            "script enforcement on for {n} interpreters: {}",
+            interpreters.join(",")
+        );
     }
     Ok(())
 }

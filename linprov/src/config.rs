@@ -154,10 +154,7 @@ impl EffectiveConfig {
                 .interpreters
                 .or(file.interpreters)
                 .unwrap_or_else(default_interpreters),
-            notifications: cli
-                .notifications
-                .or(file.notifications)
-                .unwrap_or_default(),
+            notifications: cli.notifications.or(file.notifications).unwrap_or_default(),
         }
     }
 }

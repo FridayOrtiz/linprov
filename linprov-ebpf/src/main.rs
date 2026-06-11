@@ -886,7 +886,8 @@ unsafe extern "C" fn allow_step(i: u32, ctx: *mut c_void) -> i64 {
     {
         return 0;
     }
-    if (f & dim::LANDING_FILENAME) != 0 && origin.landing_basename_hash != rule.landing_filename_hash
+    if (f & dim::LANDING_FILENAME) != 0
+        && origin.landing_basename_hash != rule.landing_filename_hash
     {
         return 0;
     }
