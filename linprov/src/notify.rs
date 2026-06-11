@@ -123,9 +123,11 @@ impl ksni::Tray for LinprovTray {
         "linprov".into()
     }
     fn icon_name(&self) -> String {
-        // Fallback for hosts that ignore pixmaps; the embedded icon below
-        // is the real one.
-        "security-high".into()
+        // Intentionally empty: a non-empty themed name (e.g. "security-high")
+        // wins over `icon_pixmap` in most StatusNotifierHosts (waybar) and
+        // renders the *theme's* generic icon — a shield — not ours. Leaving
+        // it blank forces the host to use the embedded spider-web pixmap.
+        String::new()
     }
     fn icon_pixmap(&self) -> Vec<ksni::Icon> {
         // Calm web when idle; red-node web when blocks are pending.
