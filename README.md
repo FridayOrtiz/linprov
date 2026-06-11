@@ -109,6 +109,16 @@ sudo $(which linprov) setup    # first time only; sudo can't find ~/.cargo/bin
 After this, the binary's at `/usr/local/bin/linprov` (on root's
 `secure_path`), so `sudo linprov ...` works from anywhere.
 
+On a terminal, `setup` then walks you through the rest interactively: it
+explains the observe → soak → enforce flow, and — if it detects a graphical
+session — offers to set up the **desktop tray UI** for you (enable
+`notifications = "tray"`, add you to the `linprov` group, and install a
+`systemd --user` service that autostarts `linprov notify`). Every change is
+gated on a y/n prompt; decline any and it just prints the command instead. It
+finishes by offering to drop you straight into a soak. Pass `--yes`/`-y` (or
+pipe/redirect stdin, as CI does) to skip the walkthrough and get the classic
+write-files-and-print-next-steps behavior.
+
 ### 2. Soak interactively to build an allowlist
 
 Run the daemon in the foreground while you use your machine
@@ -256,22 +266,51 @@ For a graphical workflow, `linprov notify` is a user-session tray agent: it
 shows a StatusNotifierItem icon whose menu lists recent blocked execs, each
 with **Allow once / Allow always / Close**, and fires a passive desktop
 notification as an alert. Menu clicks drive the same control-socket verbs as
-`linprov allow`.
+[`linprov allow`](#approving-a-blocked-exec--linprov-allow) — Allow once →
+`once <token>` (in-memory), Allow always → `allow <token>` (persisted).
 
 Because the daemon is root (system bus) and the tray is on your session bus,
 the agent runs as your user and reaches the daemon through a group-readable
-socket. One-time setup:
+socket.
+
+**Easiest setup: run `linprov setup` on the desktop and accept the tray
+prompts.** It enables `notifications = "tray"`, adds you to the `linprov`
+group, and installs + enables the `systemd --user` service below.
+
+To wire it up by hand:
 
 ```bash
-# 1. daemon side: expose the socket to a group
+# 1. daemon side: expose the socket to the group
 sudo groupadd -f linprov                 # `linprov setup` also does this
 # set `notifications = "tray"` in /etc/linprov/config.toml, then:
-sudo systemctl restart linprov
+sudo systemctl restart linprov           # `notifications` is launch config (not SIGHUP-reloadable)
 
-# 2. your side: join the group (re-login after), then run the agent
+# 2. join the group (re-login, or `newgrp linprov`, for it to take effect)
 sudo usermod -aG linprov "$USER"
-exec linprov notify                      # add to your sway config
+
+# 3. autostart the agent with a systemd --user service
+mkdir -p ~/.config/systemd/user
+cat > ~/.config/systemd/user/linprov-notify.service <<'EOF'
+[Unit]
+Description=linprov desktop tray agent
+PartOf=graphical-session.target
+After=graphical-session.target
+[Service]
+ExecStart=/usr/local/bin/linprov notify
+Restart=on-failure
+RestartSec=2
+[Install]
+WantedBy=graphical-session.target
+EOF
+systemctl --user daemon-reload
+systemctl --user enable --now linprov-notify.service
 ```
+
+The service tracks `graphical-session.target`, so it starts and stops with your
+desktop session — most desktops activate that target; a bare sway session may
+need it wired (or just `exec linprov notify` in your sway config instead — the
+agent retries tray registration, so it survives launching before waybar's tray
+is up).
 
 Requires a StatusNotifierHost — on sway, enable waybar's `tray` module.
 Enforcement is synchronous, so the prompt is post-hoc: the blocked exec

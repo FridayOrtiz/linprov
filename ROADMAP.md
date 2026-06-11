@@ -118,11 +118,16 @@ picking up the repo knows where it's going.
 
 ## Operability
 
-- **Guided soak interval inside `linprov setup`.** Today `setup` is
-  the install-time path: feature-check, drop a systemd unit, write
-  defaults. A follow-up: an interactive flow that enables the unit in
-  `soak` mode, watches for N hours / executions, and proposes the
-  resulting allowlist for review before flipping to `enforce`.
+- **Interactive `linprov setup`.** *Landed.* On a TTY, `setup` walks
+  through the observe → soak → enforce model and, on a detected graphical
+  session, offers to set up the desktop tray UI end-to-end: enable
+  `notifications = "tray"`, add the invoking user to the `linprov` group,
+  and install + enable a `systemd --user` service that autostarts
+  `linprov notify`. Every change is gated on a y/n prompt; `--yes` (or a
+  non-TTY stdin) keeps the old non-interactive behavior. Still a follow-up:
+  a **guided soak interval** — `setup` could supervise a timed / N-execution
+  soak and propose the resulting allowlist for review before flipping to
+  `enforce`, rather than leaving the soak duration to the user.
 - **Hot reload.** *Landed.* `SIGHUP` re-parses the allowlist file and
   re-seeds the BPF `ALLOW_RULES` / `ALLOW_RULE_COUNT` maps in place — no
   daemon restart, no LSM re-attach. An unreadable/unparseable file leaves

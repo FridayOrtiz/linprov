@@ -113,6 +113,43 @@ pub fn cargo_install_source() -> Option<PathBuf> {
     scan_human_homes_for_cargo_bin()
 }
 
+/// The real (non-root) user behind `sudo`/`doas`/`pkexec`/`su`, with
+/// name + uid + primary gid + home resolved in one `getpwnam` pass.
+/// `None` if we can't pin down a non-root invoker (genuinely running as
+/// root with no `$SUDO_USER`, etc.). `setup` uses this to wire up the
+/// per-user tray agent (`usermod`, `~/.config/systemd/user`, dropping to
+/// the user for `systemctl --user`).
+pub struct InvokingUser {
+    pub name: String,
+    pub uid: u32,
+    pub gid: u32,
+    pub home: PathBuf,
+}
+
+pub fn invoking_user() -> Option<InvokingUser> {
+    candidate_users().into_iter().find_map(|u| lookup_user(&u))
+}
+
+/// Resolve a username to its full passwd row (uid/gid/home).
+fn lookup_user(name: &str) -> Option<InvokingUser> {
+    let cname = CString::new(name).ok()?;
+    // SAFETY: `getpwnam` returns a pointer to a static buffer; we copy
+    // every field out before returning, and callers are single-threaded.
+    let pw = unsafe { libc::getpwnam(cname.as_ptr()) };
+    if pw.is_null() {
+        return None;
+    }
+    let uid = unsafe { (*pw).pw_uid } as u32;
+    let gid = unsafe { (*pw).pw_gid } as u32;
+    let home = pw_home(pw)?;
+    Some(InvokingUser {
+        name: name.to_string(),
+        uid,
+        gid,
+        home,
+    })
+}
+
 /// Username candidates from env vars + `logname`. Skips "root" since
 /// we want the *invoker*, not the elevated identity.
 fn candidate_users() -> Vec<String> {

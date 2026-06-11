@@ -42,7 +42,9 @@ enum Cmd {
     /// Run the daemon (used by the systemd unit).
     Run(run::RunArgs),
     /// First-time install: feature-check the host, write a default
-    /// config + empty allowlist, drop a systemd unit.
+    /// config + empty allowlist, drop a systemd unit. On a TTY it then
+    /// walks you through soak/enforce and optionally sets up the desktop
+    /// tray UI; `--yes` keeps it non-interactive.
     Setup(setup::SetupArgs),
     /// After `cargo install --force linprov` lays down a new binary,
     /// reload systemd and restart linprov.service.

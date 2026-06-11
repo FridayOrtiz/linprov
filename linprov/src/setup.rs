@@ -1,12 +1,18 @@
 //! `linprov setup` — first-time install helper.
 //!
-//! Non-interactive: feature-detects the kernel/LSM/BTF, writes a
-//! default config + empty allowlist under `/etc/linprov/`, drops a
-//! systemd unit, then prints the next-step commands.
+//! Feature-detects the kernel/LSM/BTF, writes a default config + empty
+//! allowlist under `/etc/linprov/`, and drops a systemd unit. On a TTY
+//! it then walks the user through the observe → soak → enforce model
+//! and, on a graphical session, optionally wires up the desktop tray UI
+//! (`notifications = "tray"`, group membership, a `systemd --user`
+//! service). `--yes` / a non-TTY stdin skips the walkthrough and just
+//! prints the next-step commands.
 
 use std::{
     fs,
+    io::{IsTerminal, Write},
     os::unix::fs::PermissionsExt,
+    os::unix::process::CommandExt,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -62,6 +68,13 @@ pub struct SetupArgs {
     /// a config or systemd unit that's already there.
     #[arg(long)]
     force: bool,
+
+    /// Skip the interactive walkthrough: just write the files, ensure
+    /// the group, drop the systemd unit, and print next steps (the
+    /// classic non-interactive behavior). Implied automatically when
+    /// stdin/stdout aren't a TTY (pipes, CI).
+    #[arg(long, short = 'y')]
+    yes: bool,
 }
 
 pub fn run(args: SetupArgs) -> Result<()> {
@@ -109,12 +122,6 @@ pub fn run(args: SetupArgs) -> Result<()> {
         println!("  unit:      {}", args.systemd_unit.display());
     }
     println!();
-    println!(
-        "Recommended next steps — soak first, then enforce. Don't enable the\n\
-         systemd unit yet; you want to build up an allowlist before anything\n\
-         gets blocked."
-    );
-    println!();
     // After a self-install the binary lives in `/usr/local/bin/`,
     // which is on root's `secure_path`, so `sudo linprov` resolves
     // without an absolute path. Use that in the next-steps output.
@@ -123,6 +130,23 @@ pub fn run(args: SetupArgs) -> Result<()> {
     } else {
         "linprov".to_string()
     };
+    if interactive(args.yes) {
+        walkthrough(&args, &binary, &invoke)?;
+    } else {
+        print_next_steps(&args, &invoke);
+    }
+    Ok(())
+}
+
+/// The classic, non-interactive next-steps block (also used as the
+/// fallback when there's no TTY). Pure print — changes nothing.
+fn print_next_steps(args: &SetupArgs, invoke: &str) {
+    println!(
+        "Recommended next steps — soak first, then enforce. Don't enable the\n\
+         systemd unit yet; you want to build up an allowlist before anything\n\
+         gets blocked."
+    );
+    println!();
     println!("  # 1. Run a soak in the foreground. Use your machine normally —");
     println!(
         "  #    every marked execve appends a rule to {}.",
@@ -149,7 +173,317 @@ pub fn run(args: SetupArgs) -> Result<()> {
         println!("  # 4. Run the daemon (whatever supervises it on your system).");
         println!("  sudo {invoke} run --config {}", args.config.display());
     }
+}
+
+/// Interactive when both ends are a TTY and the user didn't pass
+/// `--yes`. `sudo` self-elevation (privilege::require_root) keeps the
+/// controlling terminal, so this stays true after the re-exec.
+fn interactive(yes: bool) -> bool {
+    !yes && std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
+}
+
+/// Parse a yes/no answer; empty (just Enter) or anything unrecognized
+/// takes `default_yes`.
+fn parse_yes_no(input: &str, default_yes: bool) -> bool {
+    match input.trim().to_ascii_lowercase().as_str() {
+        "y" | "yes" => true,
+        "n" | "no" => false,
+        _ => default_yes,
+    }
+}
+
+fn prompt_yes_no(question: &str, default_yes: bool) -> Result<bool> {
+    let hint = if default_yes { "[Y/n]" } else { "[y/N]" };
+    print!("{question} {hint} ");
+    std::io::stdout().flush().ok();
+    let mut line = String::new();
+    std::io::stdin()
+        .read_line(&mut line)
+        .context("reading your answer from stdin")?;
+    Ok(parse_yes_no(&line, default_yes))
+}
+
+/// The guided tail of `linprov setup`: explain the model, optionally
+/// wire up the desktop tray UI (config + group + per-user systemd
+/// service), then offer to drop straight into a soak. Every system
+/// change is gated on a y/n prompt; declining anything just prints the
+/// command instead.
+fn walkthrough(args: &SetupArgs, binary: &Path, invoke: &str) -> Result<()> {
+    println!("Let's finish setup — I'll ask before changing anything.\n");
+    println!("linprov has three modes: observe (log only), soak (log + learn an");
+    println!("allowlist), and enforce (block execs whose origin isn't allowed).");
+    println!("The usual path: soak while you work, review the rules, flip to enforce.\n");
+
+    // --- Desktop tray UI -------------------------------------------------
+    let user = install::invoking_user();
+    let desktop = user.as_ref().map(graphical_session).unwrap_or(false);
+    if desktop {
+        if prompt_yes_no(
+            "Set up the desktop tray UI now (a tray icon to Allow once / always)?",
+            true,
+        )? {
+            // desktop && user is Some
+            let user = user.as_ref().unwrap();
+            setup_tray_ui(args, binary, user)?;
+        }
+    } else {
+        println!("No graphical session detected — skipping the desktop tray UI.");
+        println!("(Set it up later on a desktop; see the README \"Desktop tray UI\".)\n");
+    }
+
+    // --- Enforce reminder + optional restart -----------------------------
+    print_enforce_reminder(args, invoke);
+    if systemd_unit_active()
+        && prompt_yes_no(
+            "\nlinprov.service is running. Restart it now so config changes take effect?",
+            false,
+        )?
+    {
+        restart_system_unit();
+    }
+
+    // --- Soak (last: it replaces this process) ---------------------------
+    println!();
+    if prompt_yes_no(
+        "Start a foreground soak now? (use your machine normally; ^C when done)",
+        false,
+    )? {
+        println!("\nStarting `{invoke} run --mode soak` — ^C to stop.\n");
+        // Replace this process with the soak daemon (we're already root).
+        let err = Command::new(binary).args(["run", "--mode", "soak"]).exec();
+        return Err(anyhow!("couldn't start the soak daemon ({err})"));
+    }
+    println!("\nWhen you're ready to soak:  sudo {invoke} run --mode soak");
     Ok(())
+}
+
+/// Wire up the tray agent for `user`: enable `notifications = "tray"`,
+/// add them to the `linprov` group, and install + enable a per-user
+/// systemd service. Each step is individually confirmed.
+fn setup_tray_ui(args: &SetupArgs, binary: &Path, user: &install::InvokingUser) -> Result<()> {
+    if prompt_yes_no(
+        &format!(
+            "  → set notifications = \"tray\" in {}?",
+            args.config.display()
+        ),
+        true,
+    )? {
+        set_config_notifications_tray(&args.config)?;
+        info!("enabled tray notifications in {}", args.config.display());
+    }
+
+    if prompt_yes_no(
+        &format!(
+            "  → add `{}` to the `linprov` group (usermod -aG linprov {})?",
+            user.name, user.name
+        ),
+        true,
+    )? {
+        add_user_to_group(&user.name)?;
+        println!("    added — takes effect on your next login (or `newgrp linprov`).");
+    }
+
+    if prompt_yes_no(
+        "  → install + enable a systemd --user service so the tray autostarts?",
+        true,
+    )? {
+        let unit = write_user_notify_unit(user, binary)?;
+        info!("wrote {}", unit.display());
+        enable_user_unit(user);
+    }
+
+    println!();
+    println!("Using it:");
+    println!("  • The tray icon lists recent blocked execs; each offers Allow once /");
+    println!("    Allow always / Close.");
+    println!("  • Or from the shell, with the token in each BLOCKED-* log line:");
+    println!(
+        "      sudo {0} allow <token>         # permanent (appends to the allowlist)",
+        invoke_for(args, binary)
+    );
+    println!(
+        "      sudo {0} allow --once <token>  # this session only (in memory)",
+        invoke_for(args, binary)
+    );
+    println!("  • Needs a StatusNotifierHost — on sway, waybar's `tray` module.");
+    println!();
+    Ok(())
+}
+
+/// `linprov` (post-install, on root's `secure_path`) or the explicit
+/// binary path when `--no-install` left it elsewhere.
+fn invoke_for(args: &SetupArgs, binary: &Path) -> String {
+    if args.no_install {
+        binary.display().to_string()
+    } else {
+        "linprov".to_string()
+    }
+}
+
+/// A graphical session for `user`? `sudo` usually strips
+/// `WAYLAND_DISPLAY`/`DISPLAY` from our env, so look at the user's
+/// runtime dir for a compositor socket instead, with an env fallback.
+fn graphical_session(user: &install::InvokingUser) -> bool {
+    let run = PathBuf::from(format!("/run/user/{}", user.uid));
+    if let Ok(entries) = fs::read_dir(&run) {
+        for e in entries.flatten() {
+            if e.file_name().to_string_lossy().starts_with("wayland-") {
+                return true;
+            }
+        }
+    }
+    std::env::var_os("WAYLAND_DISPLAY").is_some() || std::env::var_os("DISPLAY").is_some()
+}
+
+/// Ensure the config has an active `notifications = "tray"` line —
+/// replacing the commented hint (or a prior value), appending if absent.
+/// Idempotent.
+fn set_config_notifications_tray(path: &Path) -> Result<()> {
+    let text = fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
+    fs::write(path, ensure_tray_line(&text)).with_context(|| format!("writing {}", path.display()))
+}
+
+/// Pure transform behind [`set_config_notifications_tray`]: rewrite the
+/// first `notifications`-mentioning line (commented or not) to an active
+/// `notifications = "tray"`, or append one if there's none.
+fn ensure_tray_line(text: &str) -> String {
+    let mut out = String::with_capacity(text.len() + 24);
+    let mut done = false;
+    for line in text.lines() {
+        let bare = line.trim_start().trim_start_matches('#').trim_start();
+        if !done && bare.starts_with("notifications") {
+            out.push_str("notifications = \"tray\"\n");
+            done = true;
+        } else {
+            out.push_str(line);
+            out.push('\n');
+        }
+    }
+    if !done {
+        if !out.is_empty() && !out.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push_str("notifications = \"tray\"\n");
+    }
+    out
+}
+
+fn add_user_to_group(user: &str) -> Result<()> {
+    let status = Command::new("usermod")
+        .args(["-aG", "linprov", user])
+        .status()
+        .context("running usermod")?;
+    if !status.success() {
+        return Err(anyhow!("usermod -aG linprov {user} exited {status}"));
+    }
+    Ok(())
+}
+
+/// Write `~/.config/systemd/user/linprov-notify.service` for `user`,
+/// owned by them (we run as root). `PartOf`/`WantedBy`
+/// graphical-session.target so it tracks the desktop session.
+fn write_user_notify_unit(user: &install::InvokingUser, binary: &Path) -> Result<PathBuf> {
+    let cfg = user.home.join(".config");
+    let sd = cfg.join("systemd");
+    let dir = sd.join("user");
+    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    let unit = dir.join("linprov-notify.service");
+    let body = format!(
+        "[Unit]\n\
+         Description=linprov desktop tray agent\n\
+         Documentation=https://github.com/FridayOrtiz/linprov\n\
+         PartOf=graphical-session.target\n\
+         After=graphical-session.target\n\
+         \n\
+         [Service]\n\
+         Type=simple\n\
+         ExecStart={} notify\n\
+         Restart=on-failure\n\
+         RestartSec=2\n\
+         \n\
+         [Install]\n\
+         WantedBy=graphical-session.target\n",
+        binary.display(),
+    );
+    fs::write(&unit, body).with_context(|| format!("writing {}", unit.display()))?;
+    // Hand ownership of anything we just created back to the user. Each
+    // chown is node-level (not recursive); re-chowning an already
+    // user-owned dir to the same user is a harmless no-op.
+    for p in [unit.as_path(), dir.as_path(), sd.as_path(), cfg.as_path()] {
+        chown_to_user(p, user);
+    }
+    Ok(unit)
+}
+
+fn chown_to_user(path: &Path, user: &install::InvokingUser) {
+    let _ = std::os::unix::fs::chown(path, Some(user.uid), Some(user.gid));
+}
+
+/// `systemctl --user daemon-reload` + `enable --now`, run *as the user*
+/// (we're root) by dropping uid/gid and pointing at their session bus.
+/// `--now` starts it immediately if the session is live; otherwise the
+/// `enable` persists for the next graphical login.
+fn enable_user_unit(user: &install::InvokingUser) {
+    let runtime = format!("/run/user/{}", user.uid);
+    let bus = format!("unix:path={runtime}/bus");
+    let run = |sub: &[&str]| -> std::io::Result<std::process::ExitStatus> {
+        Command::new("systemctl")
+            .arg("--user")
+            .args(sub)
+            .uid(user.uid)
+            .gid(user.gid)
+            .env("XDG_RUNTIME_DIR", &runtime)
+            .env("DBUS_SESSION_BUS_ADDRESS", &bus)
+            .env("HOME", &user.home)
+            .status()
+    };
+    let _ = run(&["daemon-reload"]);
+    match run(&["enable", "--now", "linprov-notify.service"]) {
+        Ok(s) if s.success() => info!("enabled + started linprov-notify.service (systemd --user)"),
+        _ => warn!(
+            "couldn't enable/start the user service right now (no live session, \
+             e.g. over SSH?); it'll start on your next graphical login. \
+             Check with `systemctl --user status linprov-notify`. Note: the \
+             service tracks graphical-session.target — your session must \
+             activate it (most desktops do; bare sway may need it wired)."
+        ),
+    }
+}
+
+fn systemd_unit_active() -> bool {
+    Command::new("systemctl")
+        .args(["is-active", "--quiet", "linprov.service"])
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
+}
+
+fn restart_system_unit() {
+    match Command::new("systemctl")
+        .args(["restart", "linprov.service"])
+        .status()
+    {
+        Ok(s) if s.success() => info!("restarted linprov.service"),
+        Ok(s) => warn!("systemctl restart linprov.service exited {s}"),
+        Err(e) => warn!("couldn't restart linprov.service ({e})"),
+    }
+}
+
+fn print_enforce_reminder(args: &SetupArgs, invoke: &str) {
+    println!("When your allowlist looks good:");
+    println!("  1. review:   cat {}", args.allowlist.display());
+    println!(
+        "  2. enforce:  set mode = \"enforce\" in {}",
+        args.config.display()
+    );
+    if !args.no_systemd {
+        println!("  3. enable:   sudo systemctl enable --now linprov.service");
+    } else {
+        println!(
+            "  3. run:      sudo {invoke} run --config {}",
+            args.config.display()
+        );
+    }
 }
 
 /// Kernel / BPF LSM / BTF checks. Don't fail — just warn — so a user
@@ -231,10 +565,12 @@ soak = ["creator_process"]
 
 # Desktop tray agent. "off" (default) keeps the control socket root-only.
 # "tray" chmods it 0660 group `linprov` so a user-session `linprov notify`
-# tray agent can subscribe to blocks and apply allows. Add your user to the
-# group first (`sudo usermod -aG linprov $USER`, re-login) and run the agent
-# from your session (`exec linprov notify` in your sway config; needs a tray
-# host like waybar's tray module).
+# tray agent can subscribe to blocks and apply allows. Easiest path: re-run
+# `linprov setup` on a desktop and accept the tray prompts — it sets this,
+# adds you to the `linprov` group, and installs a `systemd --user` service
+# that autostarts the agent. By hand: add your user to the group
+# (`sudo usermod -aG linprov $USER`, re-login) and run `linprov notify` from
+# your session (needs a tray host like waybar's tray module).
 # notifications = "tray"
 
 # Script interpreters (by `comm`) whose reads of a marked file are
@@ -351,4 +687,56 @@ fn ensure_parent(path: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{ensure_tray_line, parse_yes_no};
+
+    #[test]
+    fn yes_no_parsing() {
+        for s in ["y", "Y", "yes", "YES", " yes \n"] {
+            assert!(parse_yes_no(s, false), "{s:?} should be yes");
+        }
+        for s in ["n", "N", "no", "NO", " no \n"] {
+            assert!(!parse_yes_no(s, true), "{s:?} should be no");
+        }
+        // Empty / unrecognized falls back to the default.
+        assert!(parse_yes_no("", true));
+        assert!(!parse_yes_no("", false));
+        assert!(parse_yes_no("maybe", true));
+        assert!(!parse_yes_no("maybe", false));
+    }
+
+    #[test]
+    fn tray_line_replaces_commented_hint() {
+        let cfg = "mode = \"observe\"\n# notifications = \"tray\"\nlog_level = \"info\"\n";
+        let out = ensure_tray_line(cfg);
+        assert!(out.contains("notifications = \"tray\"\n"));
+        assert!(!out.contains("# notifications"));
+        assert!(out.contains("mode = \"observe\""));
+        assert!(out.contains("log_level = \"info\""));
+        // Exactly one notifications line.
+        assert_eq!(out.matches("notifications").count(), 1);
+    }
+
+    #[test]
+    fn tray_line_replaces_prior_value() {
+        let out = ensure_tray_line("notifications = \"off\"\n");
+        assert_eq!(out, "notifications = \"tray\"\n");
+    }
+
+    #[test]
+    fn tray_line_appended_when_absent() {
+        let out = ensure_tray_line("mode = \"observe\"\n");
+        assert_eq!(out, "mode = \"observe\"\nnotifications = \"tray\"\n");
+    }
+
+    #[test]
+    fn tray_line_is_idempotent() {
+        let once = ensure_tray_line("# notifications = \"tray\"\n");
+        let twice = ensure_tray_line(&once);
+        assert_eq!(once, twice);
+        assert_eq!(twice.matches("notifications").count(), 1);
+    }
 }
