@@ -1,32 +1,33 @@
 # Roadmap
 
-Things deliberately not in `main` yet — recorded here so anyone
-picking up the repo knows where it's going.
+Where linprov is and where it's going. Entries are tagged **_Landed_**
+(already in `main`) or describe work still planned — so anyone picking up
+the repo can tell at a glance what exists versus what's aspirational.
 
 ## Provenance scope
 
-- **Archive-aware provenance.** *Landed (same-boot).* A process that
-  **reads** a marked inode is tainted (`PROP_PIDS`); files it later
-  **writes** inherit the source's `OriginRecord` with their own landing
+- **Archive-aware provenance.** *Landed (same-boot **and** cross-boot).* A
+  process that **reads** a marked inode is tainted (`PROP_PIDS`); files it
+  later **writes** inherit the source's `OriginRecord` with their own landing
   hashes. So `tar xf` / `unzip` of a marked archive marks the extracted
   files, and `cp` of a marked file propagates too. Implemented in
   `file_open` (read branch taints, write branch inherits) — no separate
-  `inode_create` hook needed. Remaining work:
+  `inode_create` hook needed.
   - **Cross-boot.** *Landed* (alongside script support). The `file_open`
-    read branch now falls back to the `bpf_get_file_xattr` kfunc when
+    read branch falls back to the `bpf_get_file_xattr` kfunc when
     `INODE_MARKS` misses, and **promotes** the on-disk record back into
     `INODE_MARKS` — so an archive whose mark survives only as an xattr
-    (downloaded a previous boot, inode-storage evicted) propagates, and
-    the kfunc cost is paid once per inode per boot rather than on every
-    read. The trade-off the earlier note worried about is real but
-    bounded: the very first read of each previously-unseen inode now does
-    one (usually `-ENODATA`) xattr probe.
-  - **`creator_path_hash` race.** Userspace back-fills the augmented record
-    (with the resolved creator exe-path hash) into `INODE_MARKS` after
-    marking, so inheritance normally carries the full creator identity. But
-    if extraction beats that async back-fill, the derived file inherits
-    `creator_path_hash == 0` (creator `comm`/uid/pid/ts still propagate) —
-    same best-effort timing as the xattr.
+    (downloaded a previous boot, inode-storage evicted) still propagates,
+    and the kfunc cost is paid once per inode per boot rather than on every
+    read. Cost: the first read of each previously-unseen inode does one
+    (usually `-ENODATA`) xattr probe.
+  - **Caveat — `creator_path_hash` race.** Userspace back-fills the
+    augmented record (with the resolved creator exe-path hash) into
+    `INODE_MARKS` after marking, so inheritance normally carries the full
+    creator identity. But if extraction beats that async back-fill, the
+    derived file inherits `creator_path_hash == 0` (creator `comm`/uid/pid/ts
+    still propagate) — same best-effort timing as the xattr. A known
+    limitation, not pending work.
 - **Script support.** *Landed.* Shebang scripts (`./foo.sh`) were
   always enforced — the kernel runs `bprm_check_security` on the script
   file itself (depth 0 of `exec_binprm`, before binfmt_script swaps in
