@@ -519,7 +519,13 @@ fn preflight() {
 }
 
 fn write_config(path: &Path, allowlist: &Path, force: bool) -> Result<()> {
-    refuse_clobber(path, force, "config")?;
+    // Idempotent: re-running `setup` on an existing install leaves your
+    // config untouched (and still reaches the interactive walkthrough,
+    // which can patch it in place). `--force` regenerates from template.
+    if path.exists() && !force {
+        info!("config already exists at {}, leaving alone", path.display());
+        return Ok(());
+    }
     ensure_parent(path)?;
 
     let body = format!(
@@ -629,7 +635,15 @@ fn write_empty_allowlist(path: &Path, force: bool) -> Result<()> {
 }
 
 fn write_systemd_unit(unit_path: &Path, binary: &Path, config: &Path, force: bool) -> Result<()> {
-    refuse_clobber(unit_path, force, "systemd unit")?;
+    // Idempotent like write_config: leave an existing unit alone unless
+    // `--force` (so re-running `setup` doesn't clobber local edits).
+    if unit_path.exists() && !force {
+        info!(
+            "systemd unit already exists at {}, leaving alone",
+            unit_path.display()
+        );
+        return Ok(());
+    }
     ensure_parent(unit_path)?;
     let body = format!(
         r#"[Unit]
@@ -666,16 +680,6 @@ WantedBy=multi-user.target
     // Be tidy: unit files are world-readable.
     let _ = fs::set_permissions(unit_path, fs::Permissions::from_mode(0o644));
     info!("wrote systemd unit: {}", unit_path.display());
-    Ok(())
-}
-
-fn refuse_clobber(path: &Path, force: bool, label: &str) -> Result<()> {
-    if path.exists() && !force {
-        return Err(anyhow!(
-            "{label} already exists at `{}`. Pass --force to overwrite.",
-            path.display()
-        ));
-    }
     Ok(())
 }
 
