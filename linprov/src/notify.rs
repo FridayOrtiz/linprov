@@ -208,12 +208,31 @@ impl ksni::Tray for LinprovTray {
 
 pub fn run(args: NotifyArgs) -> Result<()> {
     let (tx, rx) = mpsc::channel::<Action>();
-    let handle = LinprovTray {
-        recent: Vec::new(),
-        tx,
-    }
-    .spawn()
-    .map_err(|e| anyhow!("starting the tray failed ({e}); is a StatusNotifierHost running (e.g. waybar's tray module)?"))?;
+
+    // Register the tray, retrying with backoff. Launched from a session
+    // startup hook (sway `exec linprov notify`), this can fire before the
+    // StatusNotifierHost (waybar's tray) is up — exiting on that race is
+    // why the icon never appeared. Keep trying so the agent survives a
+    // cold start and the icon lands once the host is ready.
+    let mut backoff = Duration::from_millis(500);
+    let handle = loop {
+        let tray = LinprovTray {
+            recent: Vec::new(),
+            tx: tx.clone(),
+        };
+        match tray.spawn() {
+            Ok(h) => break h,
+            Err(e) => {
+                warn!(
+                    "tray registration failed ({e}); is a StatusNotifierHost \
+                     running (e.g. waybar's tray module)? retrying in {:.0}s",
+                    backoff.as_secs_f32()
+                );
+                std::thread::sleep(backoff);
+                backoff = (backoff * 2).min(Duration::from_secs(30));
+            }
+        }
+    };
 
     // Worker: applies menu clicks against the control socket.
     let worker_socket = args.socket.clone();
