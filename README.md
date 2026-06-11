@@ -5,6 +5,30 @@ touched the network gets tagged with a provenance xattr; every `execve` of
 a tagged file is logged, and — optionally — blocked unless the path is on
 an explicit allowlist.
 
+## Quickstart
+
+Needs a Linux **6.5+** kernel with BPF LSM enabled and vmlinux BTF — see
+[Requirements](#requirements) to turn BPF LSM on if it isn't.
+
+```sh
+cat /sys/kernel/security/lsm     # 1. check deps — must contain `bpf`
+
+cargo install bpf-linker         # 2. install (build dep + the daemon;
+cargo install linprov            #    pulls the aya-friday-* fork automatically)
+sudo $(which linprov) setup      # 3. setup — interactive; installs to /usr/local/bin
+
+sudo linprov run --mode soak     # 4. soak — use the machine normally, ^C when done
+$EDITOR /etc/linprov/list.allow  # 5. review the learned rules
+
+# 6. enforce — set mode = "enforce" in /etc/linprov/config.toml, then:
+sudo systemctl enable --now linprov.service
+```
+
+`setup` is interactive on a terminal (guided soak → enforce, plus an optional
+desktop [tray UI](#tray-agent--linprov-notify-swaywayland)). The sections below
+cover each step, the [allowlist format](#allowlist-format), and approvals
+([`linprov allow`](#approving-a-blocked-exec--linprov-allow)) in full.
+
 ## How it works
 
 Three sleepable BPF LSM hooks plus one cleanup tracepoint:
