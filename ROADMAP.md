@@ -48,9 +48,8 @@ only the road ahead.
 
 ## Desktop tray agent
 
-- **[Quarantine] menu action.** *Partially landed* — the tray menu
-  reserves the slot, but the action isn't wired up. A fourth choice that
-  neutralizes the file instead of allowing it: move it to a quarantine
-  directory (stops exec *and* interpreter-read) and record the origin so
-  it can be restored. Needs a new daemon `quarantine <token>`
-  control-socket verb + policy (destination, restore path).
+- **[Quarantine] menu action.** A fourth tray choice that neutralizes the
+  file instead of allowing it: move it to a quarantine directory (stops
+  exec *and* interpreter-read) and record the origin so it can be restored.
+  Needs a new daemon `quarantine <token>` control-socket verb + policy
+  (destination, restore path). The tray menu already leaves room for it.
