@@ -338,38 +338,55 @@ async fn accept_opt(
     }
 }
 
-/// Create `/run/linprov` (0700), remove any stale socket, and bind.
+/// Create `/run/linprov`, remove any stale socket, and bind.
 ///
-/// In `Off` mode the socket is root-only (0600). In `Tray` mode it's
-/// chowned to the `linprov` group and chmodded 0660 so a user-session
-/// `linprov notify` agent (running as a member of that group) can connect;
-/// if the group doesn't exist we warn and fall back to 0600 rather than
-/// fail to start.
+/// In `Off` mode both the dir and socket are root-only (0700 / 0600). In
+/// `Tray` mode they're chowned to the `linprov` group and group-accessible
+/// (dir 0750, socket 0660) so a user-session `linprov notify` agent can
+/// connect — crucially the *directory* needs group search/`x`, since a
+/// 0660 socket inside a 0700 dir is unreachable. If the group doesn't
+/// exist we warn and stay root-only rather than fail to start.
 fn bind_control_socket(path: &Path, notify: NotifyMode) -> Result<UnixListener> {
+    let gid = if notify == NotifyMode::Tray {
+        match linprov_group_gid() {
+            Some(g) => Some(g),
+            None => {
+                warn!(
+                    "notifications=tray but no `linprov` group found; keeping the \
+                     control socket root-only (create the group and add your user, \
+                     then restart). See README."
+                );
+                None
+            }
+        }
+    } else {
+        None
+    };
+
     if let Some(dir) = path.parent() {
         fs::create_dir_all(dir).with_context(|| format!("creating {}", dir.display()))?;
-        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        let dir_mode = if let Some(g) = gid {
+            std::os::unix::fs::chown(dir, None, Some(g))
+                .with_context(|| format!("chown {} to group linprov", dir.display()))?;
+            0o750 // group can traverse to reach the socket
+        } else {
+            0o700
+        };
+        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(dir_mode));
     }
+
     let _ = fs::remove_file(path); // clear a stale socket from a prior run
     let listener = UnixListener::bind(path).with_context(|| format!("binding {}", path.display()))?;
 
-    let mut mode = 0o600;
-    if notify == NotifyMode::Tray {
-        match linprov_group_gid() {
-            Some(gid) => {
-                std::os::unix::fs::chown(path, None, Some(gid))
-                    .with_context(|| format!("chown {} to group linprov", path.display()))?;
-                mode = 0o660;
-            }
-            None => warn!(
-                "notifications=tray but no `linprov` group found; \
-                 keeping the control socket root-only (create the group and add \
-                 your user, then restart). See README."
-            ),
-        }
-    }
-    fs::set_permissions(path, fs::Permissions::from_mode(mode))
-        .with_context(|| format!("chmod {mode:o} {}", path.display()))?;
+    let sock_mode = if let Some(g) = gid {
+        std::os::unix::fs::chown(path, None, Some(g))
+            .with_context(|| format!("chown {} to group linprov", path.display()))?;
+        0o660
+    } else {
+        0o600
+    };
+    fs::set_permissions(path, fs::Permissions::from_mode(sock_mode))
+        .with_context(|| format!("chmod {sock_mode:o} {}", path.display()))?;
     Ok(listener)
 }
 

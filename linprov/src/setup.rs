@@ -305,10 +305,12 @@ ExecStart={0} run --config {1}
 # `systemctl reload linprov` → SIGHUP → re-parse the allowlist and
 # re-seed the in-kernel rules live, without a restart.
 ExecReload=/bin/kill -HUP $MAINPID
-# systemd creates/owns /run/linprov (0700 root) for the `linprov allow`
-# control socket; cleaned up when the unit stops.
+# systemd creates/owns /run/linprov for the control socket (cleaned up
+# when the unit stops). The daemon chowns it to the `linprov` group and
+# tightens/loosens perms per `notifications`; 0750 here lets the group
+# traverse in `tray` mode (a 0660 socket in a 0700 dir is unreachable).
 RuntimeDirectory=linprov
-RuntimeDirectoryMode=0700
+RuntimeDirectoryMode=0750
 Restart=on-failure
 RestartSec=5s
 
