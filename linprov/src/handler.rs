@@ -30,7 +30,7 @@ use tokio::sync::broadcast;
 use crate::{
     allowlist::{rule_from_context, OriginContext, Soak, ALLOW_DIMS},
     control::{BlockEvent, BlocksTable},
-    escape::escape,
+    encoding::escape,
     hashdb::HashDb,
     inode_storage::InodeMarks,
     ModeArg,

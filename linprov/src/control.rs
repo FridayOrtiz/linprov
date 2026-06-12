@@ -18,7 +18,7 @@ use linprov_common::{fnv_hash, MAX_RULES};
 use crate::{
     allowlist::{RuleSpec, Rules},
     config::restrict_perms,
-    escape::escape,
+    encoding::escape,
 };
 
 /// Cap on remembered block tokens (LRU). Plenty for "see it in the log,

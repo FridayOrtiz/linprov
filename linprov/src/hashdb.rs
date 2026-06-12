@@ -8,21 +8,26 @@
 //!
 //! This db closes that gap. Every time the daemon marks a file it
 //! records the `hash → path` pairs it computed into a plaintext,
-//! tab-separated file:
+//! tab-separated file with three columns — `hash`, base64 (the
+//! authoritative, exactly-reversible form linprov decodes), and a
+//! best-effort human-readable rendering:
 //!
 //! ```text
-//! a1b2c3d4e5f60718\t/home/user/Downloads/
-//! 0f1e2d3c4b5a6978\tinstaller.sh
-//! 1122334455667788\t/usr/bin/curl
+//! a1b2c3d4e5f60718\tL2hvbWUvdXNlci9Eb3dubG9hZHMv\t/home/user/Downloads/
+//! 0f1e2d3c4b5a6978\taW5zdGFsbGVyLnNo\tinstaller.sh
+//! 1122334455667788\tL3Vzci9iaW4vY3VybA==\t/usr/bin/curl
 //! ```
 //!
-//! The file is append-only with in-memory dedup, lives at a stable
-//! path (`/var/lib/linprov/hashes.tsv` by default), and survives
-//! reboots — so blocked-execve logs and `soak` rule emission can both
-//! turn a record's hashes back into paths even for marks made in a
-//! previous boot. It's deliberately greppable: `grep Downloads
-//! hashes.tsv` shows every folder hash you've stored under Downloads,
-//! and `grep <hash> hashes.tsv` resolves a hash seen in a log line.
+//! The base64 column means a filename with an embedded newline/tab can't
+//! inject a forged row, while the human column keeps the file greppable.
+//! The file is append-only with in-memory dedup, lives at a stable path
+//! (`/var/lib/linprov/hashes.tsv` by default), and survives reboots — so
+//! blocked-execve logs and `soak` rule emission can both turn a record's
+//! hashes back into paths even for marks made in a previous boot. It stays
+//! deliberately greppable: `grep Downloads hashes.tsv` shows every folder
+//! hash you've stored under Downloads, and `grep <hash> hashes.tsv`
+//! resolves a hash seen in a log line. (Older two-column rows — `hash` plus
+//! the raw path — are still read.)
 //!
 //! Enforcement never reads this db — the BPF program matches on hashes
 //! alone. Losing or pruning the db only costs human readability, never
@@ -40,7 +45,7 @@ use anyhow::{Context, Result};
 use linprov_common::fnv_hash;
 use log::{debug, warn};
 
-use crate::escape::{escape, unescape};
+use crate::encoding::{b64, escape, unb64};
 
 /// Open (loading existing entries) and append-tracking handle.
 pub struct HashDb {
@@ -74,10 +79,20 @@ impl HashDb {
                         continue; // skip malformed / comment lines
                     };
                     if let Ok(hash) = u64::from_str_radix(hex.trim(), 16) {
-                        // Stored escaped; the in-memory map holds the raw path
-                        // (resolve() feeds soak rule emission, which re-hashes
-                        // it and must match the BPF-side hash of the raw bytes).
-                        map.insert(hash, unescape(path_str));
+                        // Authoritative form is base64 (col 2). The optional
+                        // human column (col 3) is display-only; we ignore it.
+                        // Legacy 2-column rows stored the raw path directly.
+                        let raw = match path_str.split_once('\t') {
+                            Some((b64_col, _human)) => match unb64(b64_col) {
+                                Some(p) => p,
+                                None => continue, // corrupt base64 — skip
+                            },
+                            None => path_str.to_string(), // legacy <hash>\t<raw>
+                        };
+                        // In-memory map holds the raw path: resolve() feeds soak
+                        // rule emission, which re-hashes it and must match the
+                        // BPF-side hash of the raw bytes.
+                        map.insert(hash, raw);
                     }
                 }
                 debug!(
@@ -116,10 +131,11 @@ impl HashDb {
         // both briefly preserves file-vs-map consistency and contention
         // is negligible (one append per newly-seen path).
         //
-        // Escape on the way to disk: a filename with an embedded newline or
-        // tab would otherwise inject a forged `hash\tpath` row into this TSV.
+        // Three tab-separated columns: hash, base64 (authoritative — exactly
+        // reversible, so a filename's embedded newline/tab can't inject a
+        // forged row), and a best-effort human column for `grep`/eyeballing.
         let mut w = self.writer.lock().expect("hashdb writer mutex poisoned");
-        if let Err(e) = writeln!(w, "{hash:016x}\t{}", escape(s)) {
+        if let Err(e) = writeln!(w, "{hash:016x}\t{}\t{}", b64(s), escape(s)) {
             warn!("hashdb: failed to append {hash:016x}: {e}");
         }
         hash
@@ -174,10 +190,10 @@ mod tests {
     }
 
     #[test]
-    fn injection_path_is_escaped_on_disk_but_resolves_raw() {
+    fn injection_path_stored_base64_resolves_raw() {
         // A filename carrying a newline + tab would otherwise forge a second
-        // `hash\tpath` row in this TSV (finding #4). It must stay one row,
-        // hash over the raw bytes, and resolve back to the raw path.
+        // row in this TSV (finding #4). The authoritative base64 column has
+        // no structural bytes, so it stays one row and decodes back exactly.
         let dir = tempdir().unwrap();
         let path = dir.path().join("hashes.tsv");
         let evil = "/tmp/a\tb\nDEADBEEFDEADBEEF\t/etc/shadow";
@@ -187,9 +203,25 @@ mod tests {
         };
         let body = std::fs::read_to_string(&path).unwrap();
         assert_eq!(body.lines().count(), 1, "expected one row, got:\n{body}");
+        // hash \t base64 \t human — exactly three columns.
+        let cols: Vec<&str> = body.trim_end().split('\t').collect();
+        assert_eq!(cols.len(), 3, "want 3 columns, got {cols:?}");
         assert_eq!(h, fnv_hash(evil));
-        // Reopen → unescape on load → exact raw path.
+        // Reopen → decode base64 → exact raw path.
         let db = HashDb::open(&path).unwrap();
         assert_eq!(db.resolve(h).as_deref(), Some(evil));
+    }
+
+    #[test]
+    fn legacy_two_column_rows_still_load() {
+        // A hashes.tsv written by an older linprov: <hash>\t<raw path>.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hashes.tsv");
+        let raw = "/home/u/Downloads/x";
+        let mut f = File::create(&path).unwrap();
+        writeln!(f, "{:016x}\t{}", fnv_hash(raw), raw).unwrap();
+        drop(f);
+        let db = HashDb::open(&path).unwrap();
+        assert_eq!(db.resolve(fnv_hash(raw)).as_deref(), Some(raw));
     }
 }
