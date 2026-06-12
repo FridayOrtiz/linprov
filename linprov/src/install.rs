@@ -9,7 +9,7 @@ use std::{
     env,
     ffi::{CStr, CString},
     fs,
-    os::unix::fs::PermissionsExt,
+    os::unix::fs::{MetadataExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -81,16 +81,22 @@ pub fn current_exe() -> Result<PathBuf> {
 /// (`sudo`, `doas`, `pkexec`, `su -`, or just logged in as root),
 /// while the binary the user just installed lives in their *user*
 /// home. We try a chain of heuristics to find that home, in order
-/// of decreasing confidence:
+/// of decreasing confidence — but only ever ones that tie back to a
+/// *confirmed invoker* or root, since the result is copied over the
+/// system binary and run as root:
 ///   1. `$SUDO_USER` / `$DOAS_USER` env vars
 ///   2. `$PKEXEC_UID` → username
 ///   3. `logname(1)` — reads the controlling terminal's login user
 ///      (works for `su` regardless of `-`)
 ///   4. The effective UID's own home dir — covers the "root logged
 ///      in directly and `cargo install`-ed as root" case
-///   5. Scanning /etc/passwd for human users (UID 1000–65533) with
-///      `~/.cargo/bin/linprov`; only matches if there's *exactly
-///      one*, otherwise we'd guess wrong on multi-user hosts
+///
+/// We deliberately do NOT scan arbitrary `/etc/passwd` homes for a
+/// `~/.cargo/bin/linprov`: a root-context upgrade (cron, root shell)
+/// with no confirmed invoker would then copy and run some unrelated
+/// local user's binary as root — a local privilege-escalation. The
+/// resolved path is still re-checked by [`ensure_trusted_source`]
+/// before install.
 ///
 /// Returns `None` if every candidate path is missing. Callers should
 /// fall through to a `--source <path>` override or surface a hard
@@ -110,7 +116,68 @@ pub fn cargo_install_source() -> Option<PathBuf> {
             return Some(p);
         }
     }
-    scan_human_homes_for_cargo_bin()
+    None
+}
+
+/// Refuse an upgrade source an untrusted party could have written.
+///
+/// The resolved binary is about to be copied over the system install path
+/// and run as root, so it must not be attacker-controlled. We require:
+///   * a regular file (after following symlinks),
+///   * not group- or world-writable (`mode & 0o022 == 0`), and
+///   * for an auto-detected source, owned by root or by a *confirmed*
+///     invoker (`$SUDO_USER` / `$DOAS_USER` / `$PKEXEC_UID` / `logname`, or
+///     the effective uid).
+///
+/// `explicit` (a `--source` the operator named) trusts the chosen owner but
+/// still must clear the regular-file + not-writable checks. Without this, a
+/// root-context `linprov upgrade` that auto-detected a non-root user's
+/// `~/.cargo/bin/linprov` would copy and run that user's binary as root.
+pub fn ensure_trusted_source(source: &Path, explicit: bool) -> Result<()> {
+    let meta = fs::metadata(source)
+        .with_context(|| format!("stat-ing upgrade source `{}`", source.display()))?;
+    if !meta.is_file() {
+        return Err(anyhow!(
+            "upgrade source `{}` is not a regular file; refusing to install it",
+            source.display()
+        ));
+    }
+    let mode = meta.mode();
+    if mode & 0o022 != 0 {
+        return Err(anyhow!(
+            "upgrade source `{}` is group- or world-writable (mode {:o}); refusing \
+             to install a binary an untrusted user could have modified. Fix its \
+             permissions or pass a trusted --source.",
+            source.display(),
+            mode & 0o7777,
+        ));
+    }
+    if explicit {
+        return Ok(()); // operator named it; its owner is their call
+    }
+    let owner = meta.uid();
+    if owner == 0 || trusted_owner_uids().contains(&owner) {
+        return Ok(());
+    }
+    Err(anyhow!(
+        "auto-detected upgrade source `{}` is owned by uid {owner}, who isn't root \
+         or the user who invoked this command — refusing to copy and run it as \
+         root. Re-run as the intended user (so $SUDO_USER is set) or pass an \
+         explicit --source you trust.",
+        source.display(),
+    ))
+}
+
+/// UIDs whose files we trust as an auto-detected upgrade source: root, the
+/// effective uid, and any confirmed invoker behind sudo/doas/pkexec/su.
+fn trusted_owner_uids() -> Vec<u32> {
+    let mut uids = vec![0u32, unsafe { libc::geteuid() } as u32];
+    for user in candidate_users() {
+        if let Some(u) = lookup_user(&user) {
+            uids.push(u.uid);
+        }
+    }
+    uids
 }
 
 /// The real (non-root) user behind `sudo`/`doas`/`pkexec`/`su`, with
@@ -198,34 +265,6 @@ fn run_logname() -> Option<String> {
         None
     } else {
         Some(t.to_string())
-    }
-}
-
-/// Last-resort scan: walk /etc/passwd, find human users (UID
-/// 1000–65533) with a `~/.cargo/bin/linprov`, return the path *only
-/// if there's exactly one candidate*. Multiple matches → bail, since
-/// we'd be guessing whose binary the user actually wants.
-fn scan_human_homes_for_cargo_bin() -> Option<PathBuf> {
-    let content = fs::read_to_string("/etc/passwd").ok()?;
-    let candidates: Vec<PathBuf> = content
-        .lines()
-        .filter_map(|line| {
-            let parts: Vec<&str> = line.split(':').collect();
-            if parts.len() < 6 {
-                return None;
-            }
-            let uid: u32 = parts[2].parse().ok()?;
-            if !(1000..65534).contains(&uid) {
-                return None;
-            }
-            let p = PathBuf::from(parts[5]).join(".cargo/bin/linprov");
-            p.exists().then_some(p)
-        })
-        .collect();
-    if candidates.len() == 1 {
-        candidates.into_iter().next()
-    } else {
-        None
     }
 }
 

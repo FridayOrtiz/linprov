@@ -14,6 +14,7 @@
 
 use std::{
     fs,
+    os::fd::AsRawFd,
     path::{Path, PathBuf},
 };
 
@@ -144,10 +145,29 @@ fn on_file_marked(cfg: &Config, inode_marks: &mut InodeMarks, event: &Event, der
         "marked"
     };
 
+    // Persist the mark through one no-follow O_PATH fd (see
+    // `open_mark_target`). The landing path is a kernel `bpf_d_path` snapshot,
+    // and a local user can swap it for a symlink between the event and now;
+    // re-walking that path with a symlink-following `xattr::set` would let
+    // them redirect this root-privileged write onto a file they don't own
+    // (e.g. a system binary), getting it marked and then blocked in enforce
+    // mode. Opening once O_PATH|O_NOFOLLOW, gating on a regular file, and
+    // writing both the xattr and the INODE_MARKS back-fill through that fd's
+    // inode closes that TOCTOU.
+    let Some(file) = open_mark_target(&target) else {
+        return; // vanished, symlink, or non-regular — open_mark_target logged why
+    };
+
     // Marking a written file is routine and high-volume; log it at DEBUG.
     // INFO is reserved for actual executions (the PROVENANCE-EXEC line in
     // `on_execve_marked`).
-    match xattr::set(&target, XATTR_NAME, &value) {
+    //
+    // Write via the /proc/self/fd magic symlink so setxattr lands on the
+    // inode the fd already names rather than re-resolving `target` (which
+    // can't be raced). fsetxattr rejects O_PATH fds directly, hence the
+    // proc path.
+    let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    match xattr::set(&fd_path, XATTR_NAME, &value) {
         Ok(()) => debug!(
             "{kind} {} (pid={} comm={} creator_uid={} creator_path={} ts_boot_ns={})",
             target.display(),
@@ -163,34 +183,64 @@ fn on_file_marked(cfg: &Config, inode_marks: &mut InodeMarks, event: &Event, der
     // Back-fill the in-kernel INODE_MARKS record with the augmented record so
     // the bprm fast path (which otherwise re-reads the xattr when
     // creator_path_hash == 0) and same-boot taint propagation both carry the
-    // full creator identity. Best-effort.
-    backfill_inode_mark(inode_marks, &target, &augmented);
+    // full creator identity. Same verified fd → same inode as the xattr
+    // above. Best-effort.
+    if let Err(e) = inode_marks.backfill(&file, &augmented) {
+        debug!("INODE_MARKS back-fill for {} failed: {e}", target.display());
+    }
 }
 
-/// Open `target` `O_PATH` (which does *not* fire `security_file_open`, so it
-/// can't re-taint the daemon) and update its `INODE_MARKS` record. Failures
-/// (file renamed/removed between the event and now, fs without inode storage
-/// support, etc.) are non-fatal — the durable xattr is already written.
-fn backfill_inode_mark(inode_marks: &mut InodeMarks, target: &Path, rec: &OriginRecord) {
+/// Open the marked file for the provenance writes (xattr + INODE_MARKS
+/// back-fill), returning the fd only if it's a regular file.
+///
+/// `O_PATH | O_NOFOLLOW`: the landing path is a kernel snapshot a local user
+/// can swap after the event. `O_NOFOLLOW` makes a symlink at the final
+/// component yield an fd to the *link itself* (S_ISLNK), which the
+/// regular-file gate below rejects — so the root daemon can't be redirected
+/// onto a file the user couldn't otherwise write. `O_PATH` keeps the open
+/// free of side effects and non-blocking, so a fifo/device swapped into the
+/// path can't stall the daemon (and O_PATH does not fire
+/// `security_file_open`, so it can't re-taint the daemon either). Callers
+/// write the xattr via `/proc/self/fd/N` and back-fill through this same fd,
+/// so both target the inode the fd names rather than re-resolving the path.
+///
+/// Failures (file renamed/removed between the event and now, a symlink or
+/// non-regular target, an fs without inode storage) are non-fatal: log and
+/// skip. The durable mark only matters for files that get exec'd / read,
+/// which are regular files.
+fn open_mark_target(target: &Path) -> Option<fs::File> {
     use std::os::unix::fs::OpenOptionsExt;
 
     // read(true) only satisfies std's "an access mode is required"; O_PATH
-    // overrides it in the kernel, yielding a path-only fd we use purely as
-    // the inode-storage key.
-    match fs::OpenOptions::new()
+    // overrides it in the kernel, yielding a path-only fd.
+    let file = match fs::OpenOptions::new()
         .read(true)
-        .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+        .custom_flags(libc::O_PATH | libc::O_NOFOLLOW | libc::O_CLOEXEC)
         .open(target)
     {
-        Ok(f) => {
-            if let Err(e) = inode_marks.backfill(&f, rec) {
-                debug!("INODE_MARKS back-fill for {} failed: {e}", target.display());
-            }
+        Ok(f) => f,
+        Err(e) => {
+            debug!(
+                "O_PATH open of {} to persist mark failed: {e}",
+                target.display()
+            );
+            return None;
         }
-        Err(e) => debug!(
-            "O_PATH open of {} for INODE_MARKS back-fill failed: {e}",
-            target.display()
-        ),
+    };
+
+    // Only regular files carry execution provenance. A symlink fd (from
+    // O_PATH|O_NOFOLLOW), directory, fifo, device, or socket is rejected —
+    // a swapped-in non-regular target is exactly the redirect we're closing.
+    match file.metadata() {
+        Ok(m) if m.file_type().is_file() => Some(file),
+        Ok(_) => {
+            debug!("skipping non-regular mark target {}", target.display());
+            None
+        }
+        Err(e) => {
+            debug!("fstat of {} failed: {e}", target.display());
+            None
+        }
     }
 }
 
@@ -489,6 +539,35 @@ fn basename_of(path: &str) -> Option<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_mark_target_accepts_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("reg");
+        std::fs::write(&f, b"x").unwrap();
+        assert!(open_mark_target(&f).is_some());
+    }
+
+    #[test]
+    fn open_mark_target_rejects_symlink() {
+        // The core of the TOCTOU fix (#1): a symlink swapped into the
+        // landing path must NOT be followed to its (possibly unowned)
+        // target — O_NOFOLLOW yields an fd to the link itself, which the
+        // regular-file gate rejects.
+        let dir = tempfile::tempdir().unwrap();
+        let victim = dir.path().join("victim");
+        std::fs::write(&victim, b"x").unwrap();
+        let link = dir.path().join("link");
+        std::os::unix::fs::symlink(&victim, &link).unwrap();
+        assert!(open_mark_target(&link).is_none());
+    }
+
+    #[test]
+    fn open_mark_target_rejects_directory_and_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(open_mark_target(dir.path()).is_none());
+        assert!(open_mark_target(Path::new("/nonexistent/linprov/x")).is_none());
+    }
 
     #[test]
     fn basename_split() {

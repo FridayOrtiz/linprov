@@ -101,18 +101,25 @@ pub fn run(args: UpgradeArgs) -> Result<()> {
 /// Pick the binary to copy *from*. Priority:
 ///   1. `--source <path>` (explicit override)
 ///   2. Heuristic chain in [`install::cargo_install_source`] —
-///      sudo / doas / pkexec / logname / euid home / unique-match
-///      scan
+///      sudo / doas / pkexec / logname / euid home
 ///   3. The currently-running binary
+///
+/// Every resolved source is vetted by [`install::ensure_trusted_source`]
+/// before it's returned (regular file, not group/world-writable, and — for
+/// auto-detected sources — owned by root or a confirmed invoker), so a
+/// root-context upgrade can't be steered into copying and running an
+/// untrusted user's binary as root.
 ///
 /// If none give us a path that differs from `install_path`, surface a
 /// hard error — silently bouncing the daemon when the user thinks
 /// they're upgrading is the worst outcome.
 fn resolve_source(explicit: Option<&Path>, install_path: &Path) -> Result<PathBuf> {
     if let Some(p) = explicit {
+        install::ensure_trusted_source(p, true)?;
         return Ok(p.to_path_buf());
     }
     if let Some(p) = install::cargo_install_source() {
+        install::ensure_trusted_source(&p, false)?;
         info!(
             "found a freshly-installed binary at `{}`; using it as the upgrade source",
             p.display()
@@ -130,6 +137,9 @@ fn resolve_source(explicit: Option<&Path>, install_path: &Path) -> Result<PathBu
             install_path.display()
         ));
     }
+    // The user invoked this very binary, so treat it like an explicit choice
+    // (owner not second-guessed) but still reject a group/world-writable one.
+    install::ensure_trusted_source(&current, true)?;
     Ok(current)
 }
 
