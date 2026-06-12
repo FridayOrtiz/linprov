@@ -40,6 +40,8 @@ use anyhow::{Context, Result};
 use linprov_common::fnv_hash;
 use log::{debug, warn};
 
+use crate::escape::{escape, unescape};
+
 /// Open (loading existing entries) and append-tracking handle.
 pub struct HashDb {
     map: Mutex<HashMap<u64, String>>,
@@ -72,7 +74,10 @@ impl HashDb {
                         continue; // skip malformed / comment lines
                     };
                     if let Ok(hash) = u64::from_str_radix(hex.trim(), 16) {
-                        map.insert(hash, path_str.to_string());
+                        // Stored escaped; the in-memory map holds the raw path
+                        // (resolve() feeds soak rule emission, which re-hashes
+                        // it and must match the BPF-side hash of the raw bytes).
+                        map.insert(hash, unescape(path_str));
                     }
                 }
                 debug!(
@@ -106,13 +111,16 @@ impl HashDb {
         if map.contains_key(&hash) {
             return hash;
         }
-        map.insert(hash, s.to_string());
+        map.insert(hash, s.to_string()); // map holds raw; hash is over raw
         // Drop the map lock before touching the file? Keep it: holding
         // both briefly preserves file-vs-map consistency and contention
         // is negligible (one append per newly-seen path).
+        //
+        // Escape on the way to disk: a filename with an embedded newline or
+        // tab would otherwise inject a forged `hash\tpath` row into this TSV.
         let mut w = self.writer.lock().expect("hashdb writer mutex poisoned");
-        if let Err(e) = writeln!(w, "{hash:016x}\t{s}") {
-            warn!("hashdb: failed to append {hash:016x} -> {s}: {e}");
+        if let Err(e) = writeln!(w, "{hash:016x}\t{}", escape(s)) {
+            warn!("hashdb: failed to append {hash:016x}: {e}");
         }
         hash
     }
@@ -163,5 +171,25 @@ mod tests {
         let db = HashDb::open(&path).unwrap();
         assert_eq!(db.resolve(fnv_hash("/a/b/")).as_deref(), Some("/a/b/"));
         assert_eq!(db.resolve(fnv_hash("foo.sh")).as_deref(), Some("foo.sh"));
+    }
+
+    #[test]
+    fn injection_path_is_escaped_on_disk_but_resolves_raw() {
+        // A filename carrying a newline + tab would otherwise forge a second
+        // `hash\tpath` row in this TSV (finding #4). It must stay one row,
+        // hash over the raw bytes, and resolve back to the raw path.
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("hashes.tsv");
+        let evil = "/tmp/a\tb\nDEADBEEFDEADBEEF\t/etc/shadow";
+        let h = {
+            let db = HashDb::open(&path).unwrap();
+            db.record(evil)
+        };
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body.lines().count(), 1, "expected one row, got:\n{body}");
+        assert_eq!(h, fnv_hash(evil));
+        // Reopen → unescape on load → exact raw path.
+        let db = HashDb::open(&path).unwrap();
+        assert_eq!(db.resolve(h).as_deref(), Some(evil));
     }
 }

@@ -22,6 +22,8 @@ use clap::ValueEnum;
 use linprov_common::{dim, fnv_hash, AllowRule, COMM_LEN, MAX_RULES};
 use serde::Deserialize;
 
+use crate::escape::{escape, unescape};
+
 /// Allowlist dimensions. Used for `--soak=<csv>`, for the
 /// `<dim>=<value>` entries in the allowlist file, and for the
 /// `soak = [...]` array in the TOML config file.
@@ -108,8 +110,13 @@ impl RuleSpec {
                 .ok_or_else(|| anyhow!("condition `{cond}` is missing `=`"))?;
             let k = k.trim();
             let v = v.trim();
+            // Decode escapes back to the raw value so `set`/`pack` hash the
+            // real bytes; the on-disk form stays escaped (see `to_line`). The
+            // error context keeps the escaped `v` so it can't smuggle control
+            // bytes into a log line.
+            let raw = unescape(v);
             let dim = Dim::parse(k).ok_or_else(|| anyhow!("unknown dimension `{k}`"))?;
-            spec.set(dim, v)
+            spec.set(dim, &raw)
                 .with_context(|| format!("condition `{k}={v}`"))?;
         }
         if spec.flags == 0 {
@@ -199,27 +206,32 @@ impl RuleSpec {
             if self.flags & bit == 0 {
                 continue;
             }
+            // Path-shaped values are escaped so a filename with a `;`, `#`,
+            // newline, etc. can't break the line format or inject a second
+            // rule (finding #4). `parse` unescapes back to the raw string, so
+            // `pack`/the BPF side still hash the raw bytes. The folder `*`
+            // modifier is appended *after* escaping (it's structure, not data).
             let v = match d {
-                Dim::TargetFilename => self.target_filename.clone(),
-                // Re-emit the trailing `*` for recursive folder rules so
-                // the canonical line round-trips (and dedups correctly).
-                Dim::TargetFolder => self.target_folder.clone().map(|f| {
+                Dim::TargetFilename => self.target_filename.as_deref().map(escape),
+                Dim::TargetFolder => self.target_folder.as_deref().map(|f| {
+                    let e = escape(f);
                     if self.flags & dim::TARGET_FOLDER_RECURSIVE != 0 {
-                        format!("{f}*")
+                        format!("{e}*")
                     } else {
-                        f
+                        e
                     }
                 }),
-                Dim::LandingFilename => self.landing_filename.clone(),
-                Dim::LandingFolder => self.landing_folder.clone().map(|f| {
+                Dim::LandingFilename => self.landing_filename.as_deref().map(escape),
+                Dim::LandingFolder => self.landing_folder.as_deref().map(|f| {
+                    let e = escape(f);
                     if self.flags & dim::LANDING_FOLDER_RECURSIVE != 0 {
-                        format!("{f}*")
+                        format!("{e}*")
                     } else {
-                        f
+                        e
                     }
                 }),
-                Dim::CreatorProcess => self.creator_process.clone(),
-                Dim::CreatorComm => self.creator_comm.clone(),
+                Dim::CreatorProcess => self.creator_process.as_deref().map(escape),
+                Dim::CreatorComm => self.creator_comm.as_deref().map(escape),
                 Dim::CreatorUid => self.creator_uid.map(|u| u.to_string()),
                 Dim::ExecutionUid => self.execution_uid.map(|u| u.to_string()),
             };
@@ -431,7 +443,7 @@ pub fn rule_from_context(ctx: &OriginContext<'_>, dims: &[Dim]) -> RuleSpec {
         };
         let Some(val) = val else { continue };
         if let Err(e) = spec.set(*d, &val) {
-            log::warn!("skipping invalid {} value `{val}`: {e}", d.as_key());
+            log::warn!("skipping invalid {} value `{}`: {e}", d.as_key(), escape(&val));
         }
     }
     spec
@@ -661,5 +673,26 @@ mod tests {
         assert_eq!(spec.creator_comm.as_deref(), Some("curl"));
         assert_eq!(spec.flags & dim::CREATOR_PROCESS, 0); // unresolved → omitted
         assert_eq!(spec.flags & dim::LANDING_FOLDER, 0);
+    }
+
+    #[test]
+    fn rule_value_with_metacharacters_round_trips_and_is_line_safe() {
+        // A path with `;`, `#`, newline, tab must not break the line format
+        // or inject a second rule (finding #4), and must decode back to the
+        // exact raw bytes so the FNV hash (and thus enforcement) is unchanged.
+        let raw = "/tmp/we;ird#na\nme\tx";
+        let r = RuleSpec::parse(&format!("target_filename={}", escape(raw))).unwrap();
+        assert_eq!(r.target_filename.as_deref(), Some(raw)); // stored raw
+
+        let line = r.to_line();
+        for bad in ['\n', '\t', '\r'] {
+            assert!(!line.contains(bad), "serialized line {line:?} contains {bad:?}");
+        }
+        // The semicolon/hash are escaped, so the parser sees one condition.
+        assert_eq!(line.matches(';').count(), 0);
+
+        let r2 = RuleSpec::parse(&line).unwrap();
+        assert_eq!(r2.target_filename.as_deref(), Some(raw));
+        assert_eq!(r.pack().target_filename_hash, fnv_hash(raw));
     }
 }

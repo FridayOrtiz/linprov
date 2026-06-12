@@ -12,6 +12,7 @@ mod allow;
 mod allowlist;
 mod config;
 mod control;
+mod escape;
 mod handler;
 mod hashdb;
 mod inode_storage;

@@ -18,6 +18,7 @@ use linprov_common::{fnv_hash, MAX_RULES};
 use crate::{
     allowlist::{RuleSpec, Rules},
     config::restrict_perms,
+    escape::escape,
 };
 
 /// Cap on remembered block tokens (LRU). Plenty for "see it in the log,
@@ -45,9 +46,14 @@ impl BlockEvent {
     /// tab-separated and assumed newline/tab-free (paths from `d_path`,
     /// a hex token, a short kind).
     pub fn to_wire(&self) -> String {
+        // target/creator are kernel-derived paths; escape them so an embedded
+        // tab or newline can't desync this tab-separated, newline-framed wire.
         format!(
             "BLOCK\t{}\t{}\t{}\t{}",
-            self.token, self.kind, self.target, self.creator
+            self.token,
+            self.kind,
+            escape(&self.target),
+            escape(&self.creator)
         )
     }
 }

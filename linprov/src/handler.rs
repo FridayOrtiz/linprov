@@ -30,6 +30,7 @@ use tokio::sync::broadcast;
 use crate::{
     allowlist::{rule_from_context, OriginContext, Soak, ALLOW_DIMS},
     control::{BlockEvent, BlocksTable},
+    escape::escape,
     hashdb::HashDb,
     inode_storage::InodeMarks,
     ModeArg,
@@ -167,17 +168,20 @@ fn on_file_marked(cfg: &Config, inode_marks: &mut InodeMarks, event: &Event, der
     // can't be raced). fsetxattr rejects O_PATH fds directly, hence the
     // proc path.
     let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
+    // Escape kernel-derived strings before they hit the log so a crafted
+    // filename can't forge log lines (finding #4).
+    let target_disp = escape(&landing_path);
+    let creator_disp = creator_path.as_deref().map(escape);
     match xattr::set(&fd_path, XATTR_NAME, &value) {
         Ok(()) => debug!(
-            "{kind} {} (pid={} comm={} creator_uid={} creator_path={} ts_boot_ns={})",
-            target.display(),
+            "{kind} {target_disp} (pid={} comm={} creator_uid={} creator_path={} ts_boot_ns={})",
             event.pid,
-            comm,
+            escape(&comm),
             augmented.creator_uid,
-            creator_path.as_deref().unwrap_or("<unknown>"),
+            creator_disp.as_deref().unwrap_or("<unknown>"),
             event.origin.ts_boot_ns
         ),
-        Err(e) => debug!("setxattr({}, {XATTR_NAME}) failed: {e}", target.display()),
+        Err(e) => debug!("setxattr({target_disp}, {XATTR_NAME}) failed: {e}"),
     }
 
     // Back-fill the in-kernel INODE_MARKS record with the augmented record so
@@ -296,11 +300,11 @@ fn on_execve_marked(
         );
         warn!(
             "BLOCKED-EXEC target={} landing_folder={} landing_file={} pid={} comm={} origin={} (LSM verdict {}) [allow: {token}]",
-            target_path,
+            escape(&target_path),
             resolved(&landing_folder, event.origin.landing_folder_hash),
             resolved(&landing_basename, event.origin.landing_basename_hash),
             event.pid,
-            exec_comm,
+            escape(&exec_comm),
             format_origin(&event.origin, &creator_comm, &creator_path),
             event.status,
         );
@@ -309,11 +313,11 @@ fn on_execve_marked(
 
     info!(
         "PROVENANCE-EXEC target={} landing_folder={} landing_file={} pid={} comm={} origin={}",
-        target_path,
+        escape(&target_path),
         resolved(&landing_folder, event.origin.landing_folder_hash),
         resolved(&landing_basename, event.origin.landing_basename_hash),
         event.pid,
-        exec_comm,
+        escape(&exec_comm),
         format_origin(&event.origin, &creator_comm, &creator_path),
     );
 
@@ -366,9 +370,9 @@ fn on_script_exec(
         );
         warn!(
             "BLOCKED-SCRIPT script={} name={} interp={} landing_folder={} landing_file={} pid={} origin={} (LSM verdict {}) [allow: {token}]",
-            script_path,
-            script_name,
-            interp_comm,
+            escape(&script_path),
+            escape(script_name),
+            escape(&interp_comm),
             resolved(&landing_folder, event.origin.landing_folder_hash),
             resolved(&landing_basename, event.origin.landing_basename_hash),
             event.pid,
@@ -380,9 +384,9 @@ fn on_script_exec(
 
     info!(
         "PROVENANCE-SCRIPT script={} name={} interp={} landing_folder={} landing_file={} pid={} origin={}",
-        script_path,
-        script_name,
-        interp_comm,
+        escape(&script_path),
+        escape(script_name),
+        escape(&interp_comm),
         resolved(&landing_folder, event.origin.landing_folder_hash),
         resolved(&landing_basename, event.origin.landing_basename_hash),
         event.pid,
@@ -497,7 +501,7 @@ fn get_uid_for_pid(pid: u32) -> Option<u32> {
 /// resolved (so logs stay actionable: `grep <hash> hashes.tsv`).
 fn resolved(s: &Option<String>, hash: u64) -> String {
     match s {
-        Some(v) => v.clone(),
+        Some(v) => escape(v), // db-resolved path → escape for safe logging
         None if hash == 0 => "<none>".to_string(),
         None => format!("<hash:{hash:016x}>"),
     }
@@ -510,7 +514,7 @@ fn format_origin(o: &OriginRecord, creator_comm: &str, creator_path: &Option<Str
         o.ts_boot_ns,
         o.pid,
         o.creator_uid,
-        creator_comm,
+        escape(creator_comm),
         resolved(creator_path, o.creator_path_hash),
     )
 }
