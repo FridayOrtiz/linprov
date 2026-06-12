@@ -354,8 +354,19 @@ fresh PAM login each session, which also sidesteps the group gotcha below.)
 
 Requires a StatusNotifierHost — on sway, enable waybar's `tray` module.
 Enforcement is synchronous, so the prompt is post-hoc: the blocked exec
-already failed; allowing it permits the **re-run**. Anyone in the `linprov`
-group can approve execs, so only add trusted users.
+already failed; allowing it permits the **re-run**.
+
+> **The `linprov` group is a trust boundary, not a least-privilege one.**
+> Exposing the control socket to the group (`notifications = "tray"`) lets any
+> member approve a blocked exec — and `allow <token>` **persists a new rule to
+> the allowlist** and reseeds the live policy, so group membership effectively
+> grants administrative control over what linprov will permit. Treat it like
+> `sudo` access: it's for the primary user(s) of a single-user desktop, not a
+> sandbox to hand to semi-trusted accounts. On multi-user or shared hosts
+> leave `notifications = "off"` (the default — the socket stays root-only) and
+> approve blocks with `sudo linprov allow`. (A member is still limited to
+> execs that actually blocked — tokens resolve only to recorded blocks, never
+> arbitrary rules — but that's a bound, not containment.)
 
 ## Allowlist format
 
