@@ -272,6 +272,10 @@ fn setup_tray_ui(args: &SetupArgs, binary: &Path, user: &install::InvokingUser) 
         info!("enabled tray notifications in {}", args.config.display());
     }
 
+    // Track whether *this run* added the user to the group: if so, the live
+    // `systemd --user` manager still has stale groups and the per-user service
+    // can't connect until a full re-login (warned about below).
+    let mut joined_group = false;
     if prompt_yes_no(
         &format!(
             "  → add `{}` to the `linprov` group (usermod -aG linprov {})?",
@@ -279,8 +283,13 @@ fn setup_tray_ui(args: &SetupArgs, binary: &Path, user: &install::InvokingUser) 
         ),
         true,
     )? {
-        add_user_to_group(&user.name)?;
-        println!("    added — takes effect on your next login (or `newgrp linprov`).");
+        if user_in_linprov_group(&user.name) {
+            println!("    `{}` is already in the `linprov` group.", user.name);
+        } else {
+            add_user_to_group(&user.name)?;
+            joined_group = true;
+            println!("    added — takes effect on your next login (or `newgrp linprov`).");
+        }
     }
 
     if prompt_yes_no(
@@ -289,7 +298,7 @@ fn setup_tray_ui(args: &SetupArgs, binary: &Path, user: &install::InvokingUser) 
     )? {
         let unit = write_user_notify_unit(user, binary)?;
         info!("wrote {}", unit.display());
-        enable_user_unit(user);
+        enable_user_unit(user, joined_group);
     }
 
     println!();
@@ -422,8 +431,11 @@ fn chown_to_user(path: &Path, user: &install::InvokingUser) {
 /// `systemctl --user daemon-reload` + `enable --now`, run *as the user*
 /// (we're root) by dropping uid/gid and pointing at their session bus.
 /// `--now` starts it immediately if the session is live; otherwise the
-/// `enable` persists for the next graphical login.
-fn enable_user_unit(user: &install::InvokingUser) {
+/// `enable` persists for the next graphical login. `joined_group` flags
+/// that we *just* added the user to `linprov` — in which case the running
+/// `systemd --user` manager still has stale groups and the service can't
+/// connect until a full re-login, so we say so.
+fn enable_user_unit(user: &install::InvokingUser, joined_group: bool) {
     let runtime = format!("/run/user/{}", user.uid);
     let bus = format!("unix:path={runtime}/bus");
     let run = |sub: &[&str]| -> std::io::Result<std::process::ExitStatus> {
@@ -439,7 +451,19 @@ fn enable_user_unit(user: &install::InvokingUser) {
     };
     let _ = run(&["daemon-reload"]);
     match run(&["enable", "--now", "linprov-notify.service"]) {
-        Ok(s) if s.success() => info!("enabled + started linprov-notify.service (systemd --user)"),
+        Ok(s) if s.success() => {
+            info!("enabled + started linprov-notify.service (systemd --user)");
+            if joined_group {
+                warn!(
+                    "…but you were just added to the `linprov` group, and the \
+                     running systemd --user manager still has your old groups — \
+                     so the service can't reach the control socket until you \
+                     fully log out and back in (or reboot). `systemctl --user \
+                     restart` won't refresh it; a full re-login will, and the \
+                     tray then connects automatically."
+                );
+            }
+        }
         _ => warn!(
             "couldn't enable/start the user service right now (no live session, \
              e.g. over SSH?); it'll start on your next graphical login. \
@@ -448,6 +472,19 @@ fn enable_user_unit(user: &install::InvokingUser) {
              activate it (most desktops do; bare sway may need it wired)."
         ),
     }
+}
+
+/// Does `user` already belong to the `linprov` group (per the group DB)?
+fn user_in_linprov_group(user: &str) -> bool {
+    Command::new("id")
+        .args(["-nG", user])
+        .output()
+        .map(|o| {
+            String::from_utf8_lossy(&o.stdout)
+                .split_whitespace()
+                .any(|g| g == "linprov")
+        })
+        .unwrap_or(false)
 }
 
 fn systemd_unit_active() -> bool {

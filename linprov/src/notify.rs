@@ -209,6 +209,24 @@ impl ksni::Tray for LinprovTray {
 pub fn run(args: NotifyArgs) -> Result<()> {
     let (tx, rx) = mpsc::channel::<Action>();
 
+    // One-shot preflight (before the tray even registers, so it fires even on
+    // a host with no tray yet): a frequent silent failure is the agent running
+    // without the `linprov` group even though the *user* is a member — the
+    // classic stale-launcher case (a `systemd --user` service inherits the
+    // user manager's groups, which only refresh on a full re-login). Call it
+    // out once so the empty tray has an explanation, not just the per-retry
+    // EPERM warnings (whose generic "are you in the group?" hint misleads).
+    if lacks_linprov_group() {
+        warn!(
+            "this process is NOT in the `linprov` group, so it can't reach the \
+             daemon's control socket — the tray will stay empty. If `id -nG` \
+             shows you in the group, your launcher has a stale group set: a \
+             `systemd --user` service inherits the user manager's groups, which \
+             only refresh after a FULL logout/login or reboot (not \
+             `systemctl --user restart`/`daemon-reexec`/`newgrp`)."
+        );
+    }
+
     // Register the tray, retrying with backoff. Launched from a session
     // startup hook (sway `exec linprov notify`), this can fire before the
     // StatusNotifierHost (waybar's tray) is up — exiting on that race is
@@ -245,6 +263,38 @@ pub fn run(args: NotifyArgs) -> Result<()> {
     // This thread owns the subscribe stream (reconnects forever).
     subscribe_loop(&args.socket, &handle);
     Ok(())
+}
+
+/// `true` if the `linprov` group exists but *this* process isn't in it —
+/// the condition behind a permission-denied on the control socket that the
+/// generic "are you in the group?" hint misreads (the user often *is* a
+/// member; it's the running process that isn't).
+fn lacks_linprov_group() -> bool {
+    let Some(gid) = linprov_gid() else {
+        return false; // no group at all — a different (handled) failure
+    };
+    let Ok(status) = std::fs::read_to_string("/proc/self/status") else {
+        return false;
+    };
+    for line in status.lines() {
+        if let Some(rest) = line.strip_prefix("Groups:") {
+            return !rest.split_whitespace().any(|g| g.parse::<u32>() == Ok(gid));
+        }
+    }
+    false
+}
+
+/// gid of the `linprov` group, or `None` if it doesn't exist.
+fn linprov_gid() -> Option<u32> {
+    let name = std::ffi::CString::new("linprov").ok()?;
+    // SAFETY: getgrnam returns a pointer into a static buffer; we read the
+    // gid before any further libc call, and the agent is single-threaded here.
+    let grp = unsafe { libc::getgrnam(name.as_ptr()) };
+    if grp.is_null() {
+        None
+    } else {
+        Some(unsafe { (*grp).gr_gid })
+    }
 }
 
 /// Connect, `subscribe`, and feed block events to the tray + notifications;

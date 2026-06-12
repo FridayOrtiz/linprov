@@ -336,6 +336,18 @@ need it wired (or just `exec linprov notify` in your sway config instead — the
 agent retries tray registration, so it survives launching before waybar's tray
 is up).
 
+> **First-time group gotcha.** A `systemd --user` service inherits its group
+> set from the `systemd --user` *manager*, which caches your groups at login.
+> So the very first time you join the `linprov` group, the service can't reach
+> the control socket — the tray icon shows but stays empty and never notifies —
+> until you **fully log out and back in (or reboot)**. `systemctl --user
+> restart`, `daemon-reexec`, and `newgrp` do **not** refresh the manager's
+> groups; only a full re-login does. (A sway `exec linprov notify` agent avoids
+> this — it's launched by a fresh PAM login each session — so it's the quicker
+> path if you don't want to relog.) The agent logs a clear warning at startup
+> when it detects this, and `linprov setup` flags it when it adds you to the
+> group.
+
 Requires a StatusNotifierHost — on sway, enable waybar's `tray` module.
 Enforcement is synchronous, so the prompt is post-hoc: the blocked exec
 already failed; allowing it permits the **re-run**. Anyone in the `linprov`
