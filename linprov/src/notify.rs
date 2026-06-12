@@ -126,6 +126,33 @@ impl ksni::Tray for LinprovTray {
     fn title(&self) -> String {
         "linprov".into()
     }
+    /// Left-click (`Activate`) can't open the context menu — that's
+    /// right-click (the DBusMenu), and ksni 0.3 doesn't let us set
+    /// `ItemIsMenu` to change that. So instead of a dead click, make it
+    /// informative: summarize pending decisions and point at the right-click
+    /// menu (which is otherwise undiscoverable).
+    fn activate(&mut self, _x: i32, _y: i32) {
+        let body = if self.recent.is_empty() {
+            "No pending blocks.".to_string()
+        } else {
+            let n = self.recent.len();
+            let s = if n == 1 { "" } else { "s" };
+            format!(
+                "{n} pending decision{s}. Right-click this icon for \
+                 Allow once / Allow always / dismiss."
+            )
+        };
+        let icon = if self.recent.is_empty() {
+            "security-high"
+        } else {
+            "security-low"
+        };
+        let _ = notify_rust::Notification::new()
+            .summary("linprov")
+            .body(&body)
+            .icon(icon)
+            .show();
+    }
     fn icon_name(&self) -> String {
         // Intentionally empty: a non-empty themed name (e.g. "security-high")
         // wins over `icon_pixmap` in most StatusNotifierHosts (waybar) and
@@ -166,7 +193,7 @@ impl ksni::Tray for LinprovTray {
         } else {
             let n = self.recent.len();
             let s = if n == 1 { "" } else { "s" };
-            format!("{n} pending decision{s} — click the icon to allow or dismiss")
+            format!("{n} pending decision{s} — right-click the icon to allow or dismiss")
         };
         ksni::ToolTip {
             title: "linprov".to_string(),
@@ -415,7 +442,7 @@ fn notify_block(b: &RecentBlock) {
     let _ = notify_rust::Notification::new()
         .summary("linprov blocked an exec")
         .body(&format!(
-            "{}\n{} · created by {}\nOpen the linprov tray to allow.",
+            "{}\n{} · created by {}\nRight-click the linprov tray icon to allow.",
             b.target, b.kind, b.creator
         ))
         .icon("security-low")

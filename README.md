@@ -287,9 +287,12 @@ with it down, edit `list.allow` and `SIGHUP` instead.
 ### Tray agent — `linprov notify` (sway/Wayland)
 
 For a graphical workflow, `linprov notify` is a user-session tray agent: it
-shows a StatusNotifierItem icon whose menu lists recent blocked execs, each
-with **Allow once / Allow always / Close**, and fires a passive desktop
-notification as an alert. Menu clicks drive the same control-socket verbs as
+shows a StatusNotifierItem icon whose **right-click** menu lists recent blocked
+execs, each with **Allow once / Allow always / Close**, and fires a passive
+desktop notification as an alert. The icon turns red and the item enters the
+SNI `NeedsAttention` state (waybar tags it `.needs-attention`) while decisions
+are pending; left-click pops a summary notification (the menu is right-click,
+which ksni can't remap). Menu clicks drive the same control-socket verbs as
 [`linprov allow`](#approving-a-blocked-exec--linprov-allow) — Allow once →
 `once <token>` (in-memory), Allow always → `allow <token>` (persisted).
 
