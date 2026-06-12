@@ -92,6 +92,10 @@ struct Action {
 struct LinprovTray {
     recent: Vec<RecentBlock>,
     tx: mpsc::Sender<Action>,
+    /// Whether the subscribe stream to the daemon is currently up. Surfaced
+    /// in the tooltip so an empty tray distinguishes "no pending blocks" from
+    /// "can't reach the daemon" (e.g. linprov.service not running).
+    connected: bool,
 }
 
 impl LinprovTray {
@@ -137,6 +141,38 @@ impl ksni::Tray for LinprovTray {
             ICON_ATTN_PNG
         };
         load_icon(png).into_iter().collect()
+    }
+    /// The SNI-standard "look at me" signal: hosts emphasize NeedsAttention
+    /// items (waybar tags them `.needs-attention` for styling), and may swap
+    /// in `attention_icon_pixmap`. This is what was missing — a bare pixmap
+    /// swap is too subtle and waybar doesn't reliably re-fetch it.
+    fn status(&self) -> ksni::Status {
+        if self.recent.is_empty() {
+            ksni::Status::Active
+        } else {
+            ksni::Status::NeedsAttention
+        }
+    }
+    fn attention_icon_pixmap(&self) -> Vec<ksni::Icon> {
+        load_icon(ICON_ATTN_PNG).into_iter().collect()
+    }
+    fn tool_tip(&self) -> ksni::ToolTip {
+        let description = if !self.connected {
+            "not connected to the linprov daemon (is linprov.service running \
+             with notifications = \"tray\"?)"
+                .to_string()
+        } else if self.recent.is_empty() {
+            "no pending blocks".to_string()
+        } else {
+            let n = self.recent.len();
+            let s = if n == 1 { "" } else { "s" };
+            format!("{n} pending decision{s} — click the icon to allow or dismiss")
+        };
+        ksni::ToolTip {
+            title: "linprov".to_string(),
+            description,
+            ..Default::default()
+        }
     }
     fn menu(&self) -> Vec<ksni::MenuItem<Self>> {
         use ksni::menu::*;
@@ -237,6 +273,7 @@ pub fn run(args: NotifyArgs) -> Result<()> {
         let tray = LinprovTray {
             recent: Vec::new(),
             tx: tx.clone(),
+            connected: false,
         };
         match tray.spawn() {
             Ok(h) => break h,
@@ -304,6 +341,9 @@ fn subscribe_loop(socket: &Path, handle: &ksni::blocking::Handle<LinprovTray>) {
         if let Err(e) = subscribe_once(socket, handle) {
             warn!("control socket: {e:#}");
         }
+        // subscribe_once only returns on disconnect/failure — reflect that in
+        // the tray (tooltip → "not connected") so a down daemon is visible.
+        handle.update(|t: &mut LinprovTray| t.connected = false);
         std::thread::sleep(Duration::from_secs(2));
     }
 }
@@ -314,6 +354,7 @@ fn subscribe_once(socket: &Path, handle: &ksni::blocking::Handle<LinprovTray>) -
     stream
         .write_all(b"subscribe\n")
         .context("sending subscribe")?;
+    handle.update(|t: &mut LinprovTray| t.connected = true);
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         let line = line.context("reading block stream")?;

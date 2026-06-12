@@ -389,8 +389,9 @@ fn add_user_to_group(user: &str) -> Result<()> {
 }
 
 /// Write `~/.config/systemd/user/linprov-notify.service` for `user`,
-/// owned by them (we run as root). `PartOf`/`WantedBy`
-/// graphical-session.target so it tracks the desktop session.
+/// owned by them (we run as root). `WantedBy=default.target` so it
+/// autostarts at login regardless of whether the compositor wires up
+/// graphical-session.target (bare sway doesn't).
 fn write_user_notify_unit(user: &install::InvokingUser, binary: &Path) -> Result<PathBuf> {
     let cfg = user.home.join(".config");
     let sd = cfg.join("systemd");
