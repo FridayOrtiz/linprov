@@ -312,19 +312,31 @@ fn pw_home(pw: *mut libc::passwd) -> Option<PathBuf> {
 }
 
 /// Refuse to install over a binary that's owned by the distro package
-/// manager (apt/dnf/pacman). Belt and suspenders — `/usr/local/bin`
+/// manager (dpkg/rpm/pacman). Belt and suspenders — `/usr/local/bin`
 /// is conventionally off-limits to distro packages, so the common case
 /// is the check passes trivially.
 pub fn refuse_distro_owned(dest: &Path) -> Result<()> {
     if !dest.exists() {
         return Ok(());
     }
-    // dpkg: `dpkg -S /path` exits 0 with the owning package name.
-    if let Ok(out) = Command::new("/usr/bin/dpkg").arg("-S").arg(dest).output() {
+    // (tool, query args, human name). Each exits 0 and prints the owning
+    // package when `dest` is package-managed: `dpkg -S`, `rpm -qf`,
+    // `pacman -Qo`. Whichever tool the host has runs; a missing one (spawn
+    // error) is simply skipped, so this works across Debian/Fedora/Arch.
+    let probes: &[(&str, &[&str], &str)] = &[
+        ("/usr/bin/dpkg", &["-S"], "dpkg"),
+        ("/usr/bin/rpm", &["-qf"], "rpm"),
+        ("/usr/bin/pacman", &["-Qo"], "pacman"),
+    ];
+    for (tool, args, name) in probes {
+        let out = match Command::new(tool).args(*args).arg(dest).output() {
+            Ok(o) => o,
+            Err(_) => continue, // tool not installed on this distro
+        };
         if out.status.success() {
             let pkg = String::from_utf8_lossy(&out.stdout).trim().to_string();
             return Err(anyhow!(
-                "{} is owned by a dpkg package ({pkg}); refusing to overwrite. \
+                "{} is owned by a {name} package ({pkg}); refusing to overwrite. \
                  Uninstall that package first.",
                 dest.display()
             ));

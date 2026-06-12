@@ -23,7 +23,7 @@ use log::{info, warn};
 
 use crate::{
     config::{
-        DEFAULT_ALLOWLIST_PATH, DEFAULT_CONFIG_PATH, DEFAULT_INSTALL_PATH,
+        restrict_perms, DEFAULT_ALLOWLIST_PATH, DEFAULT_CONFIG_PATH, DEFAULT_INSTALL_PATH,
         DEFAULT_SYSTEMD_UNIT_PATH,
     },
     install, privilege,
@@ -671,6 +671,7 @@ fn write_empty_allowlist(path: &Path, force: bool) -> Result<()> {
                 #   creator_uid=1000;creator_comm=curl\n\
                 #   execution_uid=1000;creator_comm=firefox;target_folder=/home/user/.local/bin\n";
     fs::write(path, body).with_context(|| format!("writing `{}`", path.display()))?;
+    restrict_perms(path); // not world-readable: it's the exec-gating policy
     info!("wrote empty allowlist: {}", path.display());
     Ok(())
 }

@@ -31,8 +31,8 @@ use tokio::{
 use crate::{
     allowlist::{Dim, RuleSpec, Rules, Soak},
     config::{
-        CliOverrides, EffectiveConfig, FileConfig, NotifyMode, DEFAULT_ALLOWLIST_PATH,
-        DEFAULT_CONFIG_PATH, DEFAULT_CONTROL_SOCKET_PATH,
+        restrict_perms, CliOverrides, EffectiveConfig, FileConfig, NotifyMode,
+        DEFAULT_ALLOWLIST_PATH, DEFAULT_CONFIG_PATH, DEFAULT_CONTROL_SOCKET_PATH,
     },
     control::{BlockEvent, Control},
     handler,
@@ -213,6 +213,16 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
     let hashdb = HashDb::open(&cfg.hash_db)
         .with_context(|| format!("opening hash db `{}`", cfg.hash_db.display()))?;
 
+    // Keep the sensitive on-disk files owner-readable only: the allowlist
+    // (the rules that gate execution) and the audit db (every path that's
+    // been marked) shouldn't be world-readable — that just hands a local
+    // attacker the exact strings to target. Best-effort, on every start, so
+    // a file created world-readable by an older build gets tightened too.
+    restrict_perms(&cfg.hash_db);
+    if let Some(path) = &cfg.allowlist {
+        restrict_perms(path);
+    }
+
     let handler_cfg = handler::Config {
         mode: cfg.mode,
         soak,
@@ -392,16 +402,32 @@ fn bind_control_socket(path: &Path, notify: NotifyMode) -> Result<UnixListener> 
 }
 
 /// gid of the `linprov` group, or `None` if it doesn't exist.
+///
+/// Uses the reentrant `getgrnam_r`, not `getgrnam`: the daemon runs on a
+/// multi-threaded tokio runtime, and the non-`_r` variant returns a pointer
+/// into a process-wide static buffer that a concurrent NSS call on another
+/// thread could clobber. `_r` writes into our own stack buffer instead.
 fn linprov_group_gid() -> Option<u32> {
-    // SAFETY: getgrnam returns a pointer into a static buffer; we read the
-    // gid before any further libc call could clobber it.
     let name = std::ffi::CString::new("linprov").ok()?;
-    let grp = unsafe { libc::getgrnam(name.as_ptr()) };
-    if grp.is_null() {
-        None
-    } else {
-        Some(unsafe { (*grp).gr_gid })
+    let mut grp: libc::group = unsafe { std::mem::zeroed() };
+    let mut buf = [0_i8; 16384];
+    let mut result: *mut libc::group = std::ptr::null_mut();
+    // SAFETY: `name` is a valid NUL-terminated C string; `grp`/`buf` are
+    // owned local storage of the sizes passed; `result` receives a pointer
+    // into `grp` (or stays null). getgrnam_r writes nothing on miss/error.
+    let ret = unsafe {
+        libc::getgrnam_r(
+            name.as_ptr(),
+            &mut grp,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if ret != 0 || result.is_null() {
+        return None; // not found, or buffer too small (ERANGE) for a huge group
     }
+    Some(grp.gr_gid)
 }
 
 /// Serve one control request. `allow`/`once <token>` apply a rule inline

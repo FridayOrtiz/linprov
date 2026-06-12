@@ -13,9 +13,12 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use linprov_common::fnv_hash;
+use linprov_common::{fnv_hash, MAX_RULES};
 
-use crate::allowlist::{RuleSpec, Rules};
+use crate::{
+    allowlist::{RuleSpec, Rules},
+    config::restrict_perms,
+};
 
 /// Cap on remembered block tokens (LRU). Plenty for "see it in the log,
 /// allow it" without unbounded growth on a noisy enforce box.
@@ -124,10 +127,21 @@ impl Control {
         RuleSpec::parse(&line).with_context(|| format!("re-parsing candidate rule `{line}`"))?;
 
         if once {
-            if !self.transient.iter().any(|r| r.to_line() == line) {
-                let spec = RuleSpec::parse(&line)?;
-                self.transient.push(spec);
+            if self.transient.iter().any(|r| r.to_line() == line) {
+                return Ok(line); // already active this session
             }
+            // Transient rules seed into the BPF map AFTER the file rules
+            // (see `combined`), so once file ∪ transient fills the map any
+            // new transient rule is silently truncated at seed time. Refuse
+            // loudly instead of replying OK for a rule that won't take effect.
+            if self.combined()?.len() >= MAX_RULES {
+                return Err(anyhow!(
+                    "allowlist is at capacity ({MAX_RULES} rules); `allow --once` can't \
+                     take effect — transient rules seed after the file rules and would \
+                     be dropped. Trim the allowlist (or restart) first."
+                ));
+            }
+            self.transient.push(RuleSpec::parse(&line)?);
         } else {
             self.append_persistent(&line)?;
         }
@@ -148,8 +162,39 @@ impl Control {
             .append(true)
             .open(path)
             .with_context(|| format!("opening `{}` to append", path.display()))?;
+        restrict_perms(path); // first `allow` may create it — keep it 0640
         writeln!(f, "{line}").with_context(|| format!("appending `{line}`"))?;
         f.sync_data().ok();
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn once_refused_when_allowlist_at_capacity() {
+        // A full allowlist file (MAX_RULES distinct rules) leaves no room for
+        // a transient rule — it would be silently truncated at seed time — so
+        // `allow --once` must error rather than reply OK (finding N5).
+        let mut f = tempfile::NamedTempFile::new().unwrap();
+        for i in 0..MAX_RULES {
+            writeln!(f, "creator_uid={i}").unwrap();
+        }
+        f.flush().unwrap();
+        let mut control = Control::new(Some(f.path().to_path_buf()));
+        let token = control.blocks.record("creator_uid=4294967295".to_string());
+        let err = control.apply(&token, true).unwrap_err();
+        assert!(format!("{err:#}").contains("at capacity"), "{err:#}");
+    }
+
+    #[test]
+    fn once_added_when_under_capacity() {
+        let mut control = Control::new(None); // no file → 0 rules
+        let token = control.blocks.record("creator_uid=1000".to_string());
+        let rule = control.apply(&token, true).unwrap();
+        assert_eq!(rule, "creator_uid=1000");
+        assert_eq!(control.combined().unwrap().len(), 1);
     }
 }

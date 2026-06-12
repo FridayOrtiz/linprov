@@ -67,6 +67,16 @@ pub const DEFAULT_HASHDB_PATH: &str = "/var/lib/linprov/hashes.tsv";
 /// manager.
 pub const DEFAULT_INSTALL_PATH: &str = "/usr/local/bin/linprov";
 
+/// Best-effort: tighten a sensitive linprov file (the allowlist, the audit
+/// db) to `0640` so its contents — the paths you've downloaded and the rules
+/// that gate execution — aren't world-readable. Called wherever the daemon
+/// creates or opens these files. Failures are ignored (an fs without Unix
+/// perms, or a deliberately differently-owned file).
+pub fn restrict_perms(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o640));
+}
+
 /// Shape of the on-disk TOML config. All fields are optional so users
 /// can opt into things piecewise.
 #[derive(Debug, Default, Deserialize)]
