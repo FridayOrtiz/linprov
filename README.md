@@ -317,24 +317,25 @@ mkdir -p ~/.config/systemd/user
 cat > ~/.config/systemd/user/linprov-notify.service <<'EOF'
 [Unit]
 Description=linprov desktop tray agent
-PartOf=graphical-session.target
 After=graphical-session.target
 [Service]
 ExecStart=/usr/local/bin/linprov notify
 Restart=on-failure
 RestartSec=2
 [Install]
-WantedBy=graphical-session.target
+WantedBy=default.target
 EOF
 systemctl --user daemon-reload
 systemctl --user enable --now linprov-notify.service
 ```
 
-The service tracks `graphical-session.target`, so it starts and stops with your
-desktop session — most desktops activate that target; a bare sway session may
-need it wired (or just `exec linprov notify` in your sway config instead — the
-agent retries tray registration, so it survives launching before waybar's tray
-is up).
+`WantedBy=default.target` (not `graphical-session.target`): the user manager
+always reaches `default.target` at login, whereas `graphical-session.target` is
+only activated by compositors that wire it up — **bare sway doesn't, so a
+graphical-session-bound unit silently never autostarts**. The agent retries
+tray registration, so starting a touch before waybar's tray is up is harmless.
+(Equivalently, just `exec linprov notify` in your sway config — launched by a
+fresh PAM login each session, which also sidesteps the group gotcha below.)
 
 > **First-time group gotcha.** A `systemd --user` service inherits its group
 > set from the `systemd --user` *manager*, which caches your groups at login.

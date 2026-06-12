@@ -397,11 +397,16 @@ fn write_user_notify_unit(user: &install::InvokingUser, binary: &Path) -> Result
     let dir = sd.join("user");
     fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let unit = dir.join("linprov-notify.service");
+    // WantedBy=default.target (not graphical-session.target): the user
+    // manager always reaches default.target at login, whereas
+    // graphical-session.target is only activated by compositors that wire it
+    // up — bare sway doesn't, so a graphical-session-bound unit silently never
+    // autostarts. The agent retries tray registration, so starting a touch
+    // early (before the tray host) is harmless.
     let body = format!(
         "[Unit]\n\
          Description=linprov desktop tray agent\n\
          Documentation=https://github.com/FridayOrtiz/linprov\n\
-         PartOf=graphical-session.target\n\
          After=graphical-session.target\n\
          \n\
          [Service]\n\
@@ -411,7 +416,7 @@ fn write_user_notify_unit(user: &install::InvokingUser, binary: &Path) -> Result
          RestartSec=2\n\
          \n\
          [Install]\n\
-         WantedBy=graphical-session.target\n",
+         WantedBy=default.target\n",
         binary.display(),
     );
     fs::write(&unit, body).with_context(|| format!("writing {}", unit.display()))?;
@@ -465,11 +470,9 @@ fn enable_user_unit(user: &install::InvokingUser, joined_group: bool) {
             }
         }
         _ => warn!(
-            "couldn't enable/start the user service right now (no live session, \
-             e.g. over SSH?); it'll start on your next graphical login. \
-             Check with `systemctl --user status linprov-notify`. Note: the \
-             service tracks graphical-session.target — your session must \
-             activate it (most desktops do; bare sway may need it wired)."
+            "couldn't enable/start the user service right now (no live user \
+             session, e.g. over SSH?); it's enabled and will start on your next \
+             login. Check with `systemctl --user status linprov-notify`."
         ),
     }
 }
