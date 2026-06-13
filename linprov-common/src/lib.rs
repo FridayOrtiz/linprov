@@ -30,6 +30,9 @@
 
 #![cfg_attr(not(feature = "user"), no_std)]
 
+mod siphash;
+pub use siphash::*;
+
 pub const COMM_LEN: usize = 16;
 
 /// Live exec/target path buffer size: the ringbuf [`Event`] filename
