@@ -42,7 +42,7 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use linprov_common::fnv_hash;
+use linprov_common::siphash;
 use log::{debug, warn};
 
 use crate::encoding::{b64, escape, unb64};
@@ -51,12 +51,18 @@ use crate::encoding::{b64, escape, unb64};
 pub struct HashDb {
     map: Mutex<HashMap<u64, String>>,
     writer: Mutex<File>,
+    /// The SipHash key (same one seeded into the BPF `KEY` map), so the audit
+    /// db's hashes match the record/allowlist hashes (finding #3).
+    k0: u64,
+    k1: u64,
 }
 
 impl HashDb {
     /// Load any existing entries from `path`, then open it for append.
-    /// Creates parent dirs and the file if missing.
-    pub fn open(path: &Path) -> Result<Self> {
+    /// Creates parent dirs and the file if missing. `(k0, k1)` is the keyed
+    /// hash key; entries persisted in a previous run were hashed under the
+    /// same (stable) key, so they stay valid.
+    pub fn open(path: &Path, k0: u64, k1: u64) -> Result<Self> {
         if let Some(parent) = path.parent() {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
@@ -114,6 +120,8 @@ impl HashDb {
         Ok(Self {
             map: Mutex::new(map),
             writer: Mutex::new(writer),
+            k0,
+            k1,
         })
     }
 
@@ -121,7 +129,7 @@ impl HashDb {
     /// of a given hash is appended to the file. Returns the hash so
     /// callers can store it in the record without re-hashing.
     pub fn record(&self, s: &str) -> u64 {
-        let hash = fnv_hash(s);
+        let hash = siphash(self.k0, self.k1, s.as_bytes());
         let mut map = self.map.lock().expect("hashdb map mutex poisoned");
         if map.contains_key(&hash) {
             return hash;
@@ -159,12 +167,16 @@ mod tests {
     use super::*;
     use tempfile::tempdir;
 
+    const K0: u64 = 0x1111_2222_3333_4444;
+    const K1: u64 = 0x5555_6666_7777_8888;
+
     #[test]
     fn record_resolve_roundtrip() {
         let dir = tempdir().unwrap();
         let path = dir.path().join("hashes.tsv");
-        let db = HashDb::open(&path).unwrap();
+        let db = HashDb::open(&path, K0, K1).unwrap();
         let h = db.record("/home/user/Downloads/");
+        assert_eq!(h, siphash(K0, K1, b"/home/user/Downloads/"));
         assert_eq!(db.resolve(h).as_deref(), Some("/home/user/Downloads/"));
         assert_eq!(db.resolve(0), None);
         assert_eq!(db.resolve(0xdead_beef), None);
@@ -175,7 +187,7 @@ mod tests {
         let dir = tempdir().unwrap();
         let path = dir.path().join("hashes.tsv");
         {
-            let db = HashDb::open(&path).unwrap();
+            let db = HashDb::open(&path, K0, K1).unwrap();
             db.record("/a/b/");
             db.record("/a/b/"); // dup, no second line
             db.record("foo.sh");
@@ -183,10 +195,10 @@ mod tests {
         // Exactly two distinct lines on disk.
         let body = std::fs::read_to_string(&path).unwrap();
         assert_eq!(body.lines().count(), 2, "body was:\n{body}");
-        // Reopen and confirm entries survive.
-        let db = HashDb::open(&path).unwrap();
-        assert_eq!(db.resolve(fnv_hash("/a/b/")).as_deref(), Some("/a/b/"));
-        assert_eq!(db.resolve(fnv_hash("foo.sh")).as_deref(), Some("foo.sh"));
+        // Reopen (same key) and confirm entries survive.
+        let db = HashDb::open(&path, K0, K1).unwrap();
+        assert_eq!(db.resolve(siphash(K0, K1, b"/a/b/")).as_deref(), Some("/a/b/"));
+        assert_eq!(db.resolve(siphash(K0, K1, b"foo.sh")).as_deref(), Some("foo.sh"));
     }
 
     #[test]
@@ -198,7 +210,7 @@ mod tests {
         let path = dir.path().join("hashes.tsv");
         let evil = "/tmp/a\tb\nDEADBEEFDEADBEEF\t/etc/shadow";
         let h = {
-            let db = HashDb::open(&path).unwrap();
+            let db = HashDb::open(&path, K0, K1).unwrap();
             db.record(evil)
         };
         let body = std::fs::read_to_string(&path).unwrap();
@@ -206,22 +218,24 @@ mod tests {
         // hash \t base64 \t human — exactly three columns.
         let cols: Vec<&str> = body.trim_end().split('\t').collect();
         assert_eq!(cols.len(), 3, "want 3 columns, got {cols:?}");
-        assert_eq!(h, fnv_hash(evil));
+        assert_eq!(h, siphash(K0, K1, evil.as_bytes()));
         // Reopen → decode base64 → exact raw path.
-        let db = HashDb::open(&path).unwrap();
+        let db = HashDb::open(&path, K0, K1).unwrap();
         assert_eq!(db.resolve(h).as_deref(), Some(evil));
     }
 
     #[test]
     fn legacy_two_column_rows_still_load() {
-        // A hashes.tsv written by an older linprov: <hash>\t<raw path>.
+        // A hashes.tsv written by an older linprov: <hash>\t<raw path>. The
+        // stored hash is opaque to us — resolve() just maps it back.
         let dir = tempdir().unwrap();
         let path = dir.path().join("hashes.tsv");
         let raw = "/home/u/Downloads/x";
+        let legacy_hash: u64 = 0x0123_4567_89ab_cdef;
         let mut f = File::create(&path).unwrap();
-        writeln!(f, "{:016x}\t{}", fnv_hash(raw), raw).unwrap();
+        writeln!(f, "{legacy_hash:016x}\t{raw}").unwrap();
         drop(f);
-        let db = HashDb::open(&path).unwrap();
-        assert_eq!(db.resolve(fnv_hash(raw)).as_deref(), Some(raw));
+        let db = HashDb::open(&path, K0, K1).unwrap();
+        assert_eq!(db.resolve(legacy_hash).as_deref(), Some(raw));
     }
 }

@@ -845,7 +845,7 @@ checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "linprov"
-version = "0.2.29"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "aya-friday",
@@ -864,7 +864,6 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
- "xattr",
 ]
 
 [[package]]
@@ -1950,16 +1949,6 @@ dependencies = [
  "serde_json",
  "unicode-xid",
  "wasmparser",
-]
-
-[[package]]
-name = "xattr"
-version = "1.6.1"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "32e45ad4206f6d2479085147f02bc2ef834ac85886624a23575ae137c8aa8156"
-dependencies = [
- "libc",
- "rustix",
 ]
 
 [[package]]

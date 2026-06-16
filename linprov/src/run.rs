@@ -32,12 +32,13 @@ use crate::{
     allowlist::{Dim, RuleSpec, Rules, Soak},
     config::{
         restrict_perms, CliOverrides, EffectiveConfig, FileConfig, NotifyMode,
-        DEFAULT_ALLOWLIST_PATH, DEFAULT_CONFIG_PATH, DEFAULT_CONTROL_SOCKET_PATH,
+        DEFAULT_ALLOWLIST_PATH, DEFAULT_CONFIG_PATH, DEFAULT_CONTROL_SOCKET_PATH, DEFAULT_KEY_PATH,
     },
     control::{BlockEvent, Control},
     handler,
     hashdb::HashDb,
     inode_storage::InodeMarks,
+    key::HashKey,
     mode::Mode,
 };
 
@@ -144,6 +145,12 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
 
     bump_memlock_rlimit()?;
 
+    // Per-install secret key for the keyed path hash (finding #3): generated
+    // once, persisted root-only, seeded into the KEY map below and reused by
+    // the userspace hashing (pack / hashdb) so both sides agree.
+    let key = HashKey::load_or_create(Path::new(DEFAULT_KEY_PATH))
+        .context("loading the path-hash key")?;
+
     let mut bpf = Ebpf::load(EBPF_OBJECT).context("loading eBPF object")?;
     let btf = Btf::from_sys_fs().context("loading kernel BTF from /sys/kernel/btf/vmlinux")?;
 
@@ -166,7 +173,7 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
     // the first MAX_RULES load and the rest are ignored. A long soak run can
     // grow the file past the ceiling; the daemon must still start (and keep
     // enforcing what fits) rather than crash-loop.
-    seed_rules(&mut bpf, &rules.rules)?;
+    seed_rules(&mut bpf, &rules.rules, key)?;
     seed_interpreters(&mut bpf, &cfg.interpreters)?;
 
     {
@@ -185,6 +192,15 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
         config_map
             .set(2, std::process::id(), 0)
             .context("setting CONFIG[2] = self_pid")?;
+    }
+
+    {
+        // Seed the keyed-hash key for the in-kernel path walk (finding #3).
+        let mut key_map: Array<_, u64> =
+            Array::try_from(bpf.map_mut("KEY").context("KEY map missing")?)
+                .context("opening KEY map")?;
+        key_map.set(0, key.k0, 0).context("setting KEY[0] = k0")?;
+        key_map.set(1, key.k1, 0).context("setting KEY[1] = k1")?;
     }
 
     let events_map = bpf
@@ -210,7 +226,7 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
         _ => None,
     };
 
-    let hashdb = HashDb::open(&cfg.hash_db)
+    let hashdb = HashDb::open(&cfg.hash_db, key.k0, key.k1)
         .with_context(|| format!("opening hash db `{}`", cfg.hash_db.display()))?;
 
     // Keep the sensitive on-disk files owner-readable only: the allowlist
@@ -299,7 +315,7 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
                 // the helper errors before writing the map, so the currently
                 // active rules keep enforcing. In-memory transient rules are
                 // preserved across the reload.
-                if let Err(e) = reseed_from_control(&mut bpf, &control) {
+                if let Err(e) = reseed_from_control(&mut bpf, &control, key) {
                     warn!("allowlist reload failed, keeping current rules: {e:#}");
                 }
             }
@@ -309,7 +325,7 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
             conn = accept_opt(listener.as_ref()) => {
                 match conn {
                     Ok((stream, _)) => {
-                        handle_control_conn(stream, &mut control, &mut bpf, &block_tx).await;
+                        handle_control_conn(stream, &mut control, &mut bpf, &block_tx, key).await;
                     }
                     Err(e) => warn!("control socket accept failed: {e}"),
                 }
@@ -441,6 +457,7 @@ async fn handle_control_conn(
     control: &mut Control,
     bpf: &mut Ebpf,
     block_tx: &broadcast::Sender<BlockEvent>,
+    key: HashKey,
 ) {
     let mut buf = vec![0u8; 4096];
     let read = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await;
@@ -463,7 +480,7 @@ async fn handle_control_conn(
         return;
     }
 
-    let reply = match process_control_request(&req, control, bpf) {
+    let reply = match process_control_request(&req, control, bpf, key) {
         Ok(rule) => format!("OK {rule}\n"),
         Err(e) => format!("ERR {e:#}\n"),
     };
@@ -496,7 +513,12 @@ async fn stream_blocks(
 /// Parse and apply one control request line. `allow <token>` persists to
 /// the allowlist file; `once <token>` adds an in-memory transient rule.
 /// Both reseed the BPF map from `control.combined()`.
-fn process_control_request(req: &str, control: &mut Control, bpf: &mut Ebpf) -> Result<String> {
+fn process_control_request(
+    req: &str,
+    control: &mut Control,
+    bpf: &mut Ebpf,
+    key: HashKey,
+) -> Result<String> {
     let mut parts = req.split_whitespace();
     let (verb, token) = (parts.next(), parts.next());
     let once = match verb {
@@ -510,7 +532,7 @@ fn process_control_request(req: &str, control: &mut Control, bpf: &mut Ebpf) -> 
     };
     let token = token.ok_or_else(|| anyhow!("missing token"))?;
     let rule = control.apply(token, once)?;
-    reseed_from_control(bpf, control)?;
+    reseed_from_control(bpf, control, key)?;
     info!(
         "allow{} applied (token {token}): {rule}",
         if once { " --once" } else { "" }
@@ -521,9 +543,9 @@ fn process_control_request(req: &str, control: &mut Control, bpf: &mut Ebpf) -> 
 /// Reseed the BPF rules map from `control.combined()` (file ∪ transient).
 /// Over-capacity warns and truncates (same as startup); a file read error
 /// propagates without touching the map.
-fn reseed_from_control(bpf: &mut Ebpf, control: &Control) -> Result<()> {
+fn reseed_from_control(bpf: &mut Ebpf, control: &Control, key: HashKey) -> Result<()> {
     let rules = control.combined()?;
-    seed_rules(bpf, &rules)
+    seed_rules(bpf, &rules, key)
 }
 
 fn init_logger(level: &str, log_file: Option<&Path>) -> Result<()> {
@@ -547,7 +569,7 @@ fn init_logger(level: &str, log_file: Option<&Path>) -> Result<()> {
 /// daemon never crash-loops on a too-big allowlist. The BPF side reads
 /// exactly `ALLOW_RULE_COUNT` slots, so a shrunk set leaves stale tail
 /// slots simply unread — no O(MAX_RULES) clear needed.
-fn seed_rules(bpf: &mut Ebpf, rules: &[RuleSpec]) -> Result<()> {
+fn seed_rules(bpf: &mut Ebpf, rules: &[RuleSpec], key: HashKey) -> Result<()> {
     let total = rules.len();
     let n = total.min(MAX_RULES);
     if total > MAX_RULES {
@@ -560,7 +582,7 @@ fn seed_rules(bpf: &mut Ebpf, rules: &[RuleSpec]) -> Result<()> {
         )
         .context("opening ALLOW_RULES")?;
         for (i, spec) in rules.iter().take(n).enumerate() {
-            let packed = AllowRuleWire(spec.pack());
+            let packed = AllowRuleWire(spec.pack(key.k0, key.k1));
             rule_map
                 .set(i as u32, packed, 0)
                 .with_context(|| format!("seeding rule[{i}] `{}`", spec.to_line()))?;

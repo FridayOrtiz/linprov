@@ -17,6 +17,7 @@ mod handler;
 mod hashdb;
 mod inode_storage;
 mod install;
+mod key;
 mod mode;
 mod notify;
 mod privilege;

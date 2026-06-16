@@ -60,6 +60,12 @@ pub const DEFAULT_CONTROL_SOCKET_PATH: &str = "/run/linprov/control.sock";
 /// conventional home for app state that should persist across reboots.
 pub const DEFAULT_HASHDB_PATH: &str = "/var/lib/linprov/hashes.tsv";
 
+/// Per-install secret key for the keyed path hash (SipHash, finding #3).
+/// Generated once on first daemon start, stored root-only (0600). Must stay
+/// stable across reboots — every mark (xattr) is hashed under it, so a new
+/// key silently invalidates all existing marks (they re-mark on next open).
+pub const DEFAULT_KEY_PATH: &str = "/var/lib/linprov/key";
+
 /// Where `setup` and `upgrade` copy the binary so it lands on root's
 /// `secure_path` (and `sudo linprov ...` works without a leading
 /// absolute path). `/usr/local/bin` is the conventional spot for

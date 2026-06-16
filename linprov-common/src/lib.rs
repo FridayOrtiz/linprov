@@ -195,14 +195,20 @@ pub const MODE_ENFORCE: u32 = 2;
 ///
 /// v4 made the record fully hash-based: the variable-length path fields
 /// (`creator_path`, the landing folder, the landing basename) became
-/// `u64` FNV hashes instead of fixed buffers. This lifts the path-length
+/// `u64` hashes instead of fixed buffers. This lifts the path-length
 /// ceiling (a hash is the same 8 bytes whether the path is 12 or 4096
 /// bytes) and shrinks the record to 64 bytes, well under the xattr
 /// block limit. Human-readable resolution of those hashes lives in the
 /// plaintext audit db (see the `hashdb` userspace module), not in the
-/// record. v3 records (which embedded path strings) are treated as
-/// unmarked and get re-marked on next open.
-pub const ORIGIN_VERSION: u32 = 4;
+/// record.
+///
+/// v5 changed the hash function from FNV-1a-64 to keyed SipHash-2-4
+/// (finding #3): FNV is invertible, so a local attacker could construct a
+/// path that collides with an allowlisted one. The record layout is
+/// unchanged — only the algorithm and this version differ. Records from an
+/// older version (different/no key, or FNV) are treated as unmarked and get
+/// re-marked on next open.
+pub const ORIGIN_VERSION: u32 = 5;
 
 /// Provenance record. Carried in the `security.bpf.linprov.origin` xattr
 /// and in the INODE_MARKS storage map. Fixed 64 bytes — every

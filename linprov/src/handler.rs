@@ -13,6 +13,7 @@
 //! the audit db.
 
 use std::{
+    ffi::CString,
     fs,
     os::fd::AsRawFd,
     path::{Path, PathBuf},
@@ -167,12 +168,11 @@ fn on_file_marked(cfg: &Config, inode_marks: &mut InodeMarks, event: &Event, der
     // inode the fd already names rather than re-resolving `target` (which
     // can't be raced). fsetxattr rejects O_PATH fds directly, hence the
     // proc path.
-    let fd_path = PathBuf::from(format!("/proc/self/fd/{}", file.as_raw_fd()));
     // Escape kernel-derived strings before they hit the log so a crafted
     // filename can't forge log lines (finding #4).
     let target_disp = escape(&landing_path);
     let creator_disp = creator_path.as_deref().map(escape);
-    match xattr::set(&fd_path, XATTR_NAME, &value) {
+    match set_origin_xattr(&file, &value) {
         Ok(()) => debug!(
             "{kind} {target_disp} (pid={} comm={} creator_uid={} creator_path={} ts_boot_ns={})",
             event.pid,
@@ -245,6 +245,37 @@ fn open_mark_target(target: &Path) -> Option<fs::File> {
             debug!("fstat of {} failed: {e}", target.display());
             None
         }
+    }
+}
+
+/// Write the `security.bpf.linprov.origin` xattr onto the inode behind
+/// `file` (a verified-regular `O_PATH` fd from [`open_mark_target`]).
+///
+/// We can't `fsetxattr` an `O_PATH` fd (EBADF), and the `xattr` crate's path
+/// `set` is *no-follow* — it would target the `/proc/self/fd/N` magic symlink
+/// itself, which procfs can't hold an xattr on (ENOTSUP). So call
+/// `libc::setxattr` directly on the proc path: it follows the magic symlink
+/// to the fd's real inode. That follow is of the kernel's own `/proc` link,
+/// not the attacker-controlled landing path, so it stays TOCTOU-safe.
+fn set_origin_xattr(file: &fs::File, value: &[u8]) -> std::io::Result<()> {
+    let proc_path = CString::new(format!("/proc/self/fd/{}", file.as_raw_fd()))
+        .expect("/proc/self/fd path has no interior NUL");
+    let name = CString::new(XATTR_NAME).expect("XATTR_NAME has no interior NUL");
+    // SAFETY: `proc_path`/`name` are valid NUL-terminated C strings live for
+    // the call; `value`/`value.len()` describe a valid byte buffer.
+    let ret = unsafe {
+        libc::setxattr(
+            proc_path.as_ptr(),
+            name.as_ptr(),
+            value.as_ptr() as *const libc::c_void,
+            value.len(),
+            0,
+        )
+    };
+    if ret == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
     }
 }
 

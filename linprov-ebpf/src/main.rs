@@ -44,9 +44,10 @@ use aya_ebpf::{
     programs::{LsmContext, TracePointContext},
 };
 use linprov_common::{
-    dim, AllowRule, Event, OriginRecord, COMM_LEN, EVENT_KIND_DERIVED_FILE_OPEN, EVENT_KIND_EXECVE,
-    EVENT_KIND_NETWORK_FILE_OPEN, EVENT_KIND_SCRIPT_EXEC, EXEC_PATH_LEN, FNV_OFFSET, FNV_PRIME,
-    MAX_FOLDER_ANCESTORS, MAX_RULES, MODE_ENFORCE, ORIGIN_VERSION, PATH_HASH_SCAN_LEN,
+    dim, sip_absorb, sip_finish, sip_init, AllowRule, Event, OriginRecord, SipState, COMM_LEN,
+    EVENT_KIND_DERIVED_FILE_OPEN, EVENT_KIND_EXECVE, EVENT_KIND_NETWORK_FILE_OPEN,
+    EVENT_KIND_SCRIPT_EXEC, EXEC_PATH_LEN, FNV_OFFSET, FNV_PRIME, MAX_FOLDER_ANCESTORS, MAX_RULES,
+    MODE_ENFORCE, ORIGIN_VERSION, PATH_HASH_SCAN_LEN,
 };
 
 // Kernel kfunc. Resolved at load time by the patched aya: the unresolved
@@ -253,6 +254,15 @@ struct PathAncestors([u64; MAX_FOLDER_ANCESTORS]);
 #[map]
 static TARGET_ANCESTORS: PerCpuArray<PathAncestors> = PerCpuArray::with_max_entries(1, 0);
 
+/// Per-CPU scratch the path walk ([`landing_step`]) accumulates ancestor
+/// prefix hashes into, then copies into the record / [`TARGET_ANCESTORS`].
+/// Off-stack so the `LandingCtx` bpf_loop frame stays small enough for the
+/// verifier's combined-stack limit (the SipHash state already pushed it up).
+/// One walk runs to completion without yielding, so a single per-CPU slot is
+/// exclusively the current walk's until it's copied out.
+#[map]
+static WALK_ANC: PerCpuArray<PathAncestors> = PerCpuArray::with_max_entries(1, 0);
+
 /// Runtime config set by userspace before attach.
 ///   Index 0: a value from the `MODE_*` constants in `linprov_common`.
 ///   Index 1: non-zero to mark PIDs that connect to a loopback address
@@ -267,6 +277,24 @@ static CONFIG: Array<u32> = Array::with_max_entries(3, 0);
 const CONFIG_MODE: u32 = 0;
 const CONFIG_MARK_LOCALHOST: u32 = 1;
 const CONFIG_SELF_PID: u32 = 2;
+
+/// The 128-bit keyed-hash key (SipHash, finding #3), seeded by userspace
+/// before attach: index 0 = k0, index 1 = k1. The in-kernel path walk hashes
+/// under this so an attacker can't construct a path that collides with an
+/// allowlisted one (FNV was invertible). Userspace shares the same key.
+#[map]
+static KEY: Array<u64> = Array::with_max_entries(2, 0);
+
+/// Read the seeded SipHash key as `(k0, k1)`; `(0, 0)` if unseeded (which
+/// only happens if userspace failed to set it — then nothing will match,
+/// failing closed in enforce).
+#[inline(always)]
+fn hash_key() -> (u64, u64) {
+    (
+        KEY.get(0).copied().unwrap_or(0),
+        KEY.get(1).copied().unwrap_or(0),
+    )
+}
 
 // ------ Allowlist rules. One slot per rule; each rule is an AND of
 // (dim, value) conditions. Rules OR together (first fully-matching rule
@@ -617,9 +645,12 @@ pub fn file_open(ctx: LsmContext) -> i32 {
         if is_pseudo_fs(buf as *const u8) {
             return 0;
         }
+        let (k0, k1) = hash_key();
         let (folder_hash, basename_hash) = landing_hashes(
             buf as *const u8,
             (*rec_ptr).landing_ancestor_hashes.as_mut_ptr(),
+            k0,
+            k1,
         );
         (*rec_ptr).landing_folder_hash = folder_hash;
         (*rec_ptr).landing_basename_hash = basename_hash;
@@ -918,23 +949,59 @@ unsafe extern "C" fn allow_step(i: u32, ctx: *mut c_void) -> i64 {
     1 // matched — break
 }
 
+/// Streaming SipHash state for the path walk (finding #3). Mirrors the
+/// `streaming_walk` reference pinned to the one-shot in
+/// `linprov_common::siphash` tests, so the hashes this emits at the full
+/// path / each `/`-prefix / the basename equal `siphash(key, …)` of those
+/// exact substrings — agreeing byte-for-byte with the userspace side.
+///
+/// By-value in the bpf_loop ctx (not a pointer into a map value) so the
+/// callback writes to its own stack frame, keeping pointer provenance simple.
 #[repr(C)]
 struct LandingCtx {
     src: *const u8,
-    /// Running FNV over the whole path so far.
-    full_hash: u64,
-    /// Running FNV over the current path component (reset after each `/`).
-    comp_hash: u64,
-    /// `full_hash` captured at the most recent `/` — the immediate parent.
+    k0: u64,
+    k1: u64,
+    /// Whole-path SipHash state; finalize a clone for the full / prefix hash.
+    v: SipState,
+    /// Current-component state (reset after each `/`) for the basename.
+    c: SipState,
+    /// Pending `< 8` whole-path bytes not yet absorbed into `v`.
+    full_tail: u64,
+    /// Pending `< 8` component bytes not yet absorbed into `c`.
+    comp_tail: u64,
+    /// Finalized whole-path hash at the most recent `/` — the immediate parent.
     folder_hash: u64,
-    /// Count of `/`-prefixes seen (drives the masked array index).
+    full_len: u32,
+    full_tn: u32,
+    comp_len: u32,
+    comp_tn: u32,
+    /// Count of `/`-prefixes seen (drives the masked array index). Ancestor
+    /// hashes go to the per-CPU [`WALK_ANC`] map (kept off this frame).
     count: u32,
     _pad: u32,
-    /// FNV of each `/`-terminated prefix, shallow → deep. By-value in the
-    /// ctx (not a pointer into a map value) so the bpf_loop callback
-    /// writes to its own stack frame — keeps the verifier's pointer
-    /// provenance simple. Copied into the record after the walk.
-    ancestors: [u64; MAX_FOLDER_ANCESTORS],
+}
+
+impl LandingCtx {
+    #[inline(always)]
+    fn new(src: *const u8, k0: u64, k1: u64) -> Self {
+        Self {
+            src,
+            k0,
+            k1,
+            v: sip_init(k0, k1),
+            c: sip_init(k0, k1),
+            full_tail: 0,
+            comp_tail: 0,
+            folder_hash: 0,
+            full_len: 0,
+            full_tn: 0,
+            comp_len: 0,
+            comp_tn: 0,
+            count: 0,
+            _pad: 0,
+        }
+    }
 }
 
 #[inline(never)]
@@ -945,87 +1012,118 @@ unsafe extern "C" fn landing_step(i: u32, ctx: *mut c_void) -> i64 {
     let ctx = &mut *(ctx as *mut LandingCtx);
     let b = *ctx.src.add(i as usize);
     if b == 0 {
-        return 1; // break
+        return 1; // break: end of path
     }
-    ctx.full_hash ^= b as u64;
-    ctx.full_hash = ctx.full_hash.wrapping_mul(FNV_PRIME);
+
+    // Absorb the byte into the whole-path state. The `& 7` masks the shift
+    // (the buffer index is always 0..7 — reset at 8 below — so this is a
+    // no-op at runtime, but it lets the verifier prove the shift is < 64).
+    ctx.full_tail |= (b as u64) << (8 * (ctx.full_tn & 7));
+    ctx.full_tn += 1;
+    ctx.full_len += 1;
+    if ctx.full_tn == 8 {
+        sip_absorb(&mut ctx.v, ctx.full_tail);
+        ctx.full_tail = 0;
+        ctx.full_tn = 0;
+    }
+
     if b == b'/' {
-        // Prefix up to & including this slash = an ancestor folder. The
-        // last one seen is the immediate parent.
-        ctx.folder_hash = ctx.full_hash;
-        // Masked index: provably in-bounds with no panic branch (N is a
-        // power of two). Real paths stay under N, so this never wraps.
+        // Prefix up to & including this `/` = an ancestor folder: finalize a
+        // CLONE of the whole-path state at this length (the running state is
+        // untouched). The last one seen is the immediate parent.
+        let h = sip_finish(ctx.v, ctx.full_len as usize, ctx.full_tail);
+        ctx.folder_hash = h;
+        // Masked index: provably in-bounds with no panic branch (N is a power
+        // of two). Real paths stay under N, so this never wraps. The ancestor
+        // hash goes to the per-CPU WALK_ANC scratch (off the bpf_loop frame);
+        // re-fetching the map pointer here keeps the write's bounds provable.
         let idx = (ctx.count as usize) & (MAX_FOLDER_ANCESTORS - 1);
-        ctx.ancestors[idx] = ctx.full_hash;
+        if let Some(a) = WALK_ANC.get_ptr_mut(0) {
+            (*a).0[idx] = h;
+        }
         ctx.count = ctx.count.wrapping_add(1);
-        // The basename is whatever follows the final slash, so restart
-        // the component hash from the offset basis here.
-        ctx.comp_hash = FNV_OFFSET;
+        // Basename is whatever follows the final slash → restart the component.
+        ctx.c = sip_init(ctx.k0, ctx.k1);
+        ctx.comp_tail = 0;
+        ctx.comp_tn = 0;
+        ctx.comp_len = 0;
     } else {
-        ctx.comp_hash ^= b as u64;
-        ctx.comp_hash = ctx.comp_hash.wrapping_mul(FNV_PRIME);
+        ctx.comp_tail |= (b as u64) << (8 * (ctx.comp_tn & 7));
+        ctx.comp_tn += 1;
+        ctx.comp_len += 1;
+        if ctx.comp_tn == 8 {
+            sip_absorb(&mut ctx.c, ctx.comp_tail);
+            ctx.comp_tail = 0;
+            ctx.comp_tn = 0;
+        }
     }
     0
 }
 
-/// One pass over a NUL-terminated path. Fills `out_ancestors` (a
-/// `[u64; MAX_FOLDER_ANCESTORS]` in the record) with each `/`-terminated
-/// prefix hash for nested `landing_folder` matching, and returns
-/// `(folder_hash, basename_hash)`:
-///   * `folder_hash` = FNV of the immediate parent directory **including
-///     its trailing `/`** (matches userspace `normalize_folder`), for
-///     exact matching and soak/log resolution.
-///   * `basename_hash` = FNV of the final path component (no slash).
+/// One pass over a NUL-terminated path under key `(k0, k1)`. Fills
+/// `out_ancestors` (a `[u64; MAX_FOLDER_ANCESTORS]` in the record) with each
+/// `/`-terminated prefix's keyed hash for nested `landing_folder` matching,
+/// and returns `(folder_hash, basename_hash)`:
+///   * `folder_hash` = SipHash of the immediate parent directory **including
+///     its trailing `/`** (matches userspace `normalize_folder`).
+///   * `basename_hash` = SipHash of the final path component (no slash).
 ///
-/// Not inlined: the by-value `ancestors` array makes this a ~290-byte
-/// frame, kept off `file_open`'s stack.
+/// Not inlined: the by-value `ancestors` array + SipHash state make this a
+/// ~390-byte frame, kept off `file_open`'s stack.
 #[inline(never)]
-unsafe fn landing_hashes(src: *const u8, out_ancestors: *mut u64) -> (u64, u64) {
-    let mut ctx = LandingCtx {
-        src,
-        full_hash: FNV_OFFSET,
-        comp_hash: FNV_OFFSET,
-        folder_hash: 0,
-        count: 0,
-        _pad: 0,
-        ancestors: [0u64; MAX_FOLDER_ANCESTORS],
-    };
+unsafe fn landing_hashes(src: *const u8, out_ancestors: *mut u64, k0: u64, k1: u64) -> (u64, u64) {
+    walk_anc_clear();
+    let mut ctx = LandingCtx::new(src, k0, k1);
     bpf_loop(
         PATH_HASH_SCAN_LEN as u32,
         landing_step,
         &mut ctx as *mut _ as *mut c_void,
         0,
     );
-    core::ptr::copy_nonoverlapping(ctx.ancestors.as_ptr(), out_ancestors, MAX_FOLDER_ANCESTORS);
-    (ctx.folder_hash, ctx.comp_hash)
+    walk_anc_copy_to(out_ancestors);
+    let basename = sip_finish(ctx.c, ctx.comp_len as usize, ctx.comp_tail);
+    (ctx.folder_hash, basename)
 }
 
 /// Like [`landing_hashes`] but for the live exec (target) path: fills
 /// `out_ancestors` with each `/`-terminated prefix hash and returns
-/// `(full_hash, parent_hash)` — the whole-path FNV (exact
-/// `target_filename`) and the immediate-parent FNV (exact `target_folder`).
-/// Precomputed once per `check_allowlist` so the per-rule loop is walk-free
-/// (see [`AllowCtx`]). Reuses the [`landing_step`] callback; not inlined
-/// for the same by-value-array stack reason as `landing_hashes`.
+/// `(full_hash, parent_hash)` — the whole-path SipHash (exact
+/// `target_filename`) and the immediate-parent SipHash (exact
+/// `target_folder`). Precomputed once per `check_allowlist` so the per-rule
+/// loop is walk-free (see [`AllowCtx`]). Reuses the [`landing_step`] callback.
 #[inline(never)]
-unsafe fn target_hashes(src: *const u8, out_ancestors: *mut u64) -> (u64, u64) {
-    let mut ctx = LandingCtx {
-        src,
-        full_hash: FNV_OFFSET,
-        comp_hash: FNV_OFFSET,
-        folder_hash: 0,
-        count: 0,
-        _pad: 0,
-        ancestors: [0u64; MAX_FOLDER_ANCESTORS],
-    };
+unsafe fn target_hashes(src: *const u8, out_ancestors: *mut u64, k0: u64, k1: u64) -> (u64, u64) {
+    walk_anc_clear();
+    let mut ctx = LandingCtx::new(src, k0, k1);
     bpf_loop(
         PATH_HASH_SCAN_LEN as u32,
         landing_step,
         &mut ctx as *mut _ as *mut c_void,
         0,
     );
-    core::ptr::copy_nonoverlapping(ctx.ancestors.as_ptr(), out_ancestors, MAX_FOLDER_ANCESTORS);
-    (ctx.full_hash, ctx.folder_hash)
+    walk_anc_copy_to(out_ancestors);
+    let full = sip_finish(ctx.v, ctx.full_len as usize, ctx.full_tail);
+    (full, ctx.folder_hash)
+}
+
+/// Zero the per-CPU [`WALK_ANC`] scratch before a walk, so stale ancestor
+/// hashes from a previous walk on this CPU don't leak into the unused tail
+/// (a non-zero stale entry could otherwise cause a false `landing_folder`
+/// match).
+#[inline(always)]
+unsafe fn walk_anc_clear() {
+    if let Some(a) = WALK_ANC.get_ptr_mut(0) {
+        core::ptr::write_bytes(a as *mut u8, 0, core::mem::size_of::<PathAncestors>());
+    }
+}
+
+/// Copy the walk's accumulated ancestor hashes out of [`WALK_ANC`] into the
+/// record / [`TARGET_ANCESTORS`] destination.
+#[inline(always)]
+unsafe fn walk_anc_copy_to(out: *mut u64) {
+    if let Some(a) = WALK_ANC.get_ptr(0) {
+        core::ptr::copy_nonoverlapping((*a).0.as_ptr(), out, MAX_FOLDER_ANCESTORS);
+    }
 }
 
 /// Returns true if any allowlist rule's conditions all match. Rules OR
@@ -1067,7 +1165,8 @@ unsafe fn check_allowlist(filename: &[u8; EXEC_PATH_LEN], origin: &OriginRecord)
         Some(p) => p,
         None => return false,
     };
-    let (full, parent) = target_hashes(filename.as_ptr(), (*anc).0.as_mut_ptr());
+    let (k0, k1) = hash_key();
+    let (full, parent) = target_hashes(filename.as_ptr(), (*anc).0.as_mut_ptr(), k0, k1);
 
     let mut ctx = AllowCtx {
         origin: origin as *const OriginRecord,

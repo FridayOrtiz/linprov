@@ -19,7 +19,7 @@ use std::{
 
 use anyhow::{anyhow, Context, Result};
 use clap::ValueEnum;
-use linprov_common::{dim, fnv_hash, AllowRule, COMM_LEN, MAX_RULES};
+use linprov_common::{dim, siphash, AllowRule, COMM_LEN, MAX_RULES};
 use serde::Deserialize;
 
 use crate::encoding::{decode_value, encode_value, escape};
@@ -244,26 +244,29 @@ impl RuleSpec {
         parts.join(";")
     }
 
-    /// Pack into the on-the-wire [`AllowRule`] shape. Strings are
-    /// hashed; userspace and BPF agree on FNV-1a-64.
-    pub fn pack(&self) -> AllowRule {
+    /// Pack into the on-the-wire [`AllowRule`] shape. Path-shaped strings are
+    /// hashed with keyed SipHash under `(k0, k1)`; userspace and the BPF side
+    /// share the key (seeded into the `KEY` map at startup) so the same input
+    /// yields the same hash on both sides (finding #3).
+    pub fn pack(&self, k0: u64, k1: u64) -> AllowRule {
         let mut creator_comm = [0u8; COMM_LEN];
         if let Some(c) = &self.creator_comm {
             let b = c.as_bytes();
             let n = b.len().min(COMM_LEN - 1);
             creator_comm[..n].copy_from_slice(&b[..n]);
         }
+        let h = |s: &str| siphash(k0, k1, s.as_bytes());
         AllowRule {
             flags: self.flags,
             creator_uid: self.creator_uid.unwrap_or(0),
             execution_uid: self.execution_uid.unwrap_or(0),
             _pad: 0,
             creator_comm,
-            target_filename_hash: self.target_filename.as_deref().map(fnv_hash).unwrap_or(0),
-            target_folder_hash: self.target_folder.as_deref().map(fnv_hash).unwrap_or(0),
-            landing_filename_hash: self.landing_filename.as_deref().map(fnv_hash).unwrap_or(0),
-            landing_folder_hash: self.landing_folder.as_deref().map(fnv_hash).unwrap_or(0),
-            creator_process_hash: self.creator_process.as_deref().map(fnv_hash).unwrap_or(0),
+            target_filename_hash: self.target_filename.as_deref().map(&h).unwrap_or(0),
+            target_folder_hash: self.target_folder.as_deref().map(&h).unwrap_or(0),
+            landing_filename_hash: self.landing_filename.as_deref().map(&h).unwrap_or(0),
+            landing_folder_hash: self.landing_folder.as_deref().map(&h).unwrap_or(0),
+            creator_process_hash: self.creator_process.as_deref().map(&h).unwrap_or(0),
         }
     }
 }
@@ -619,7 +622,7 @@ mod tests {
     #[test]
     fn pack_sets_only_required_hashes() {
         let r = RuleSpec::parse("creator_uid=1000").unwrap();
-        let packed = r.pack();
+        let packed = r.pack(1, 2);
         assert_eq!(packed.flags, dim::CREATOR_UID);
         assert_eq!(packed.creator_uid, 1000);
         // Cleared dims still have a default-valued field — the BPF side
@@ -629,11 +632,12 @@ mod tests {
     }
 
     #[test]
-    fn pack_creator_process_hashes_match_fnv() {
+    fn pack_creator_process_hashes_match_siphash() {
+        let (k0, k1) = (0xa, 0xb);
         let r = RuleSpec::parse("creator_process=/usr/bin/curl").unwrap();
-        let packed = r.pack();
+        let packed = r.pack(k0, k1);
         assert_eq!(packed.flags, dim::CREATOR_PROCESS);
-        assert_eq!(packed.creator_process_hash, fnv_hash("/usr/bin/curl"));
+        assert_eq!(packed.creator_process_hash, siphash(k0, k1, b"/usr/bin/curl"));
     }
 
     #[test]
@@ -695,7 +699,11 @@ mod tests {
         // Re-parse → exact raw bytes back → same hash → enforcement intact.
         let r2 = RuleSpec::parse(&line).unwrap();
         assert_eq!(r2.target_filename.as_deref(), Some(raw));
-        assert_eq!(spec.pack().target_filename_hash, fnv_hash(raw));
+        let (k0, k1) = (5, 7);
+        assert_eq!(
+            spec.pack(k0, k1).target_filename_hash,
+            siphash(k0, k1, raw.as_bytes())
+        );
     }
 
     #[test]
