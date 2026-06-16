@@ -134,6 +134,10 @@ const AF_INET: i32 = 2;
 const AF_INET6: i32 = 10;
 
 const FMODE_WRITE: u32 = 0x2;
+/// `FMODE_EXEC` — set when the kernel opens a file to *execute* it (vs a
+/// data read). Lets the read branch tell an interpreter *running* from a
+/// process *copying* one (N1: `cp /bin/bash …`).
+const FMODE_EXEC: u32 = 0x20;
 
 #[repr(C)]
 struct KernelPath {
@@ -206,6 +210,33 @@ static APPROVED_INTERP: LruHashMap<u32, u8> = LruHashMap::with_max_entries(8192,
 /// map handles the same boot.
 #[btf_map]
 static INODE_MARKS: InodeStorage<OriginRecord> = InodeStorage::new();
+
+// ------ N1: interpreter-derived taint. Catches a *copy* of an on-box
+// interpreter being used to run a marked script (`cp /bin/bash /tmp/b;
+// /tmp/b evil.sh`), which name/comm-based detection misses. "Interpreter-ness"
+// propagates through copies exactly like provenance propagates through `cp`.
+
+/// Per-inode "this inode is an interpreter binary" flag. Seeded by userspace
+/// with the configured interpreters' inodes; extended in-kernel when a
+/// process that read interpreter bytes (`INTERP_COPY_PIDS`) writes a file —
+/// so a copy of an interpreter is itself flagged. Same-boot (inode storage);
+/// a re-copy after reboot is re-detected, so there's no reboot escape.
+#[btf_map]
+static INTERP_INODE: InodeStorage<u8> = InodeStorage::new();
+
+/// PIDs that did a non-exec read of an interpreter inode — i.e. are copying
+/// interpreter bytes. Files they write get flagged in `INTERP_INODE`. Reaped
+/// on task exit.
+#[map]
+static INTERP_COPY_PIDS: LruHashMap<u32, u8> = LruHashMap::with_max_entries(8192, 0);
+
+/// PIDs flagged at `bprm_check_security` as running an interpreter — either
+/// the exec'd inode is in `INTERP_INODE` (original or derived copy) or its
+/// `comm` is in `INTERPRETERS`. The `file_open` read branch gates marked
+/// reads on this (set at exec time, so a later `prctl(PR_SET_NAME)` can't
+/// dodge it). Reaped on task exit.
+#[map]
+static INTERP_PIDS: LruHashMap<u32, u8> = LruHashMap::with_max_entries(8192, 0);
 
 #[map]
 static EVENTS: RingBuf = RingBuf::with_byte_size(1 << 20, 0);
@@ -491,6 +522,15 @@ pub fn file_open(ctx: LsmContext) -> i32 {
             return 0;
         }
 
+        // N1: a *non-exec* read of an interpreter binary means the reader is
+        // copying interpreter bytes (`cp /bin/bash …`). Taint it so files it
+        // writes inherit interpreter-ness (the write branch flags them in
+        // INTERP_INODE). Exec-loads (FMODE_EXEC) are the interpreter
+        // *running*, not a copy — skip those.
+        if f_mode & FMODE_EXEC == 0 && unsafe { INTERP_INODE.get_ptr(inode_ptr) }.is_some() {
+            let _ = INTERP_COPY_PIDS.insert(pid, 1u8, 0);
+        }
+
         // Obtain the mark for this inode into the per-CPU scratch record.
         // Fast path is INODE_MARKS (one cheap lookup, same boot). On a
         // miss, fall back to the on-disk xattr and PROMOTE it into
@@ -541,8 +581,12 @@ pub fn file_open(ctx: LsmContext) -> i32 {
         // freely. So the allowlist check (and the SCRIPT event) fire only
         // on the first marked read per interpreter invocation — the script
         // itself — not on every data file it subsequently touches.
-        let comm_hash = fnv_comm(&current_comm());
-        if unsafe { INTERPRETERS.get(comm_hash) }.is_some()
+        // Interpreter detection lives at `bprm_check_security` now
+        // (`INTERP_PIDS`), keyed on the exec'd inode — original, or a derived
+        // copy (N1) — or its comm, and captured at exec time so a later
+        // `prctl(PR_SET_NAME)` can't dodge it. The read branch just consults
+        // that per-PID flag.
+        if unsafe { INTERP_PIDS.get(pid) }.is_some()
             && unsafe { APPROVED_INTERP.get(pid) }.is_none()
         {
             let path_ptr = unsafe { &(*file_ptr).f_path } as *const KernelPath as *mut bpf_path;
@@ -587,6 +631,26 @@ pub fn file_open(ctx: LsmContext) -> i32 {
     }
 
     // --- Write branch: mark the output if the writer is a mark source. ---
+
+    // N1: if the writer is copying an interpreter (it read interpreter
+    // bytes), flag the written inode as an interpreter too, so executing the
+    // copy is caught at bprm (`cp /bin/bash /tmp/b; /tmp/b evil.sh`). This is
+    // independent of origin marking — a copied interpreter need not be
+    // web-origin. Skip pseudo-fs so a copy to /dev/null can't poison it.
+    if !inode_ptr.is_null() && unsafe { INTERP_COPY_PIDS.get(pid) }.is_some() {
+        if let Some(pb) = PATH_SCRATCH.get_ptr_mut(0) {
+            unsafe {
+                let b = (*pb).0.as_mut_ptr() as *mut c_char;
+                let pp = &(*file_ptr).f_path as *const KernelPath as *mut bpf_path;
+                let _ = bpf_d_path(pp, b, EXEC_PATH_LEN as u32);
+                if !is_pseudo_fs(b as *const u8) {
+                    let mut flag: u8 = 1;
+                    let _ = INTERP_INODE.get_or_insert_ptr(inode_ptr, &mut flag);
+                }
+            }
+        }
+    }
+
     let rec_ptr = match SCRATCH.get_ptr_mut(SCRATCH_FILE_OPEN) {
         Some(p) => p,
         None => return 0,
@@ -687,6 +751,21 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     let file_ptr = unsafe { (*bprm_ptr).file };
     if file_ptr.is_null() {
         return 0;
+    }
+
+    // N1: flag this PID as an interpreter if the exec'd binary is one — by
+    // inode (INTERP_INODE: a configured interpreter or a derived copy, so a
+    // renamed/copied interpreter still counts) or by comm. The file_open read
+    // branch gates marked reads on this. Captured here at exec time so a later
+    // prctl(PR_SET_NAME) can't dodge detection.
+    {
+        let exec_inode = unsafe { (*file_ptr).f_inode };
+        let is_interp = (!exec_inode.is_null()
+            && unsafe { INTERP_INODE.get_ptr(exec_inode) }.is_some())
+            || unsafe { INTERPRETERS.get(fnv_comm(&current_comm())) }.is_some();
+        if is_interp {
+            let _ = INTERP_PIDS.insert(current_pid(), 1u8, 0);
+        }
     }
 
     let buf = match SCRATCH.get_ptr_mut(SCRATCH_BPRM) {
@@ -1221,6 +1300,8 @@ pub fn sched_process_exit(_ctx: TracePointContext) -> u32 {
     let _ = NET_PIDS.remove(pid);
     let _ = PROP_PIDS.remove(pid);
     let _ = APPROVED_INTERP.remove(pid);
+    let _ = INTERP_COPY_PIDS.remove(pid);
+    let _ = INTERP_PIDS.remove(pid);
     0
 }
 

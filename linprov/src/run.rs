@@ -12,7 +12,7 @@ use std::{
 use anyhow::{anyhow, Context, Result};
 use aya::{
     include_bytes_aligned,
-    maps::{Array, HashMap, RingBuf},
+    maps::{Array, HashMap, InodeStorage, RingBuf},
     programs::{Lsm, TracePoint},
     Btf, Ebpf,
 };
@@ -175,6 +175,7 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
     // enforcing what fits) rather than crash-loop.
     seed_rules(&mut bpf, &rules.rules, key)?;
     seed_interpreters(&mut bpf, &cfg.interpreters)?;
+    seed_interpreter_inodes(&mut bpf, &cfg.interpreters);
 
     {
         let mut config_map: Array<_, u32> =
@@ -638,6 +639,64 @@ fn seed_interpreters(bpf: &mut Ebpf, interpreters: &[String]) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// Seed `INTERP_INODE` with the on-disk inodes of the configured
+/// interpreters, so the eBPF side can recognize an interpreter binary by
+/// inode — and, via taint propagation, recognize *copies* of one (N1: closes
+/// `cp /bin/bash /tmp/b; /tmp/b evil.sh`, which comm-based detection misses).
+///
+/// Each name is resolved against the standard bin dirs and opened `O_PATH`
+/// (no `security_file_open`, just the inode as the storage key). Best-effort:
+/// a missing/odd interpreter is skipped. The comm-based `INTERPRETERS` map
+/// remains the fallback for normally-invoked interpreters (and for any whose
+/// inode-storage entry is evicted), so this only ever *adds* coverage.
+fn seed_interpreter_inodes(bpf: &mut Ebpf, interpreters: &[String]) {
+    use std::os::unix::fs::OpenOptionsExt;
+
+    const DIRS: &[&str] = &["/usr/bin", "/bin", "/usr/local/bin", "/usr/sbin", "/sbin"];
+
+    let mut map: InodeStorage<_, u8> = match bpf
+        .map_mut("INTERP_INODE")
+        .ok_or_else(|| anyhow!("INTERP_INODE map missing"))
+        .and_then(|m| InodeStorage::try_from(m).map_err(Into::into))
+    {
+        Ok(m) => m,
+        Err(e) => {
+            warn!("interpreter-inode detection disabled: {e:#}");
+            return;
+        }
+    };
+
+    let mut n = 0u32;
+    for name in interpreters {
+        let name = name.trim();
+        if name.is_empty() {
+            continue;
+        }
+        for dir in DIRS {
+            let path = Path::new(dir).join(name);
+            // O_PATH: don't fire the read hook; the fd is only the inode
+            // storage key. Follow a final symlink on purpose — `python` ->
+            // `python3.11` means execve resolves to the target inode, which is
+            // what bprm sees and what a `cp` reads, so that's the inode to flag.
+            let f = match fs::OpenOptions::new()
+                .read(true)
+                .custom_flags(libc::O_PATH | libc::O_CLOEXEC)
+                .open(&path)
+            {
+                Ok(f) => f,
+                Err(_) => continue, // not present in this dir
+            };
+            if !f.metadata().map(|m| m.is_file()).unwrap_or(false) {
+                continue;
+            }
+            if map.insert(&f, 1u8, 0).is_ok() {
+                n += 1;
+            }
+        }
+    }
+    info!("seeded {n} interpreter inode(s) for copy-aware detection");
 }
 
 /// Newtype so we can implement `AsRawFd` for the `AsyncFd` wrapper.
