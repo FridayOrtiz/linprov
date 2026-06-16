@@ -868,14 +868,14 @@ dependencies = [
 
 [[package]]
 name = "linprov-common"
-version = "0.1.7"
+version = "0.2.0"
 dependencies = [
  "bytemuck",
 ]
 
 [[package]]
 name = "linprov-ebpf"
-version = "0.2.8"
+version = "0.2.9"
 dependencies = [
  "aya-friday-ebpf",
  "linprov-common",
