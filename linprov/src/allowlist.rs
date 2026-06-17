@@ -172,6 +172,12 @@ impl RuleSpec {
                 self.creator_process = Some(value.to_string());
             }
             Dim::CreatorComm => {
+                if value.is_empty() {
+                    // An empty value packs to an all-zero comm buffer, which can
+                    // never match a real (always non-empty) process comm — so it
+                    // would silently be an always-false dim. Reject it instead.
+                    return Err(anyhow!("creator_comm must not be empty"));
+                }
                 if value.len() >= COMM_LEN {
                     return Err(anyhow!(
                         "creator_comm `{value}` is too long ({} bytes; max {})",
