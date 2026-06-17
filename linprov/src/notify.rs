@@ -351,14 +351,29 @@ fn lacks_linprov_group() -> bool {
 /// gid of the `linprov` group, or `None` if it doesn't exist.
 fn linprov_gid() -> Option<u32> {
     let name = std::ffi::CString::new("linprov").ok()?;
-    // SAFETY: getgrnam returns a pointer into a static buffer; we read the
-    // gid before any further libc call, and the agent is single-threaded here.
-    let grp = unsafe { libc::getgrnam(name.as_ptr()) };
-    if grp.is_null() {
-        None
-    } else {
-        Some(unsafe { (*grp).gr_gid })
+    // Reentrant `getgrnam_r`, not `getgrnam`: the tray runs ksni + a tokio
+    // runtime (multiple threads), and the non-`_r` variant returns a pointer
+    // into a process-wide static buffer a concurrent NSS call on another thread
+    // could clobber. `_r` writes into our own stack buffer instead.
+    let mut grp: libc::group = unsafe { std::mem::zeroed() };
+    let mut buf = [0_i8; 16384];
+    let mut result: *mut libc::group = std::ptr::null_mut();
+    // SAFETY: `name` is a valid NUL-terminated C string; `grp`/`buf` are owned
+    // local storage of the sizes passed; `result` receives a pointer into
+    // `grp` (or stays null). getgrnam_r writes nothing on miss/error.
+    let ret = unsafe {
+        libc::getgrnam_r(
+            name.as_ptr(),
+            &mut grp,
+            buf.as_mut_ptr(),
+            buf.len(),
+            &mut result,
+        )
+    };
+    if ret != 0 || result.is_null() {
+        return None;
     }
+    Some(grp.gr_gid)
 }
 
 /// Connect, `subscribe`, and feed block events to the tray + notifications;
