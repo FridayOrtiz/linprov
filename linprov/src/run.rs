@@ -249,7 +249,7 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
     // Rule-mutation state: the in-memory transient (`allow --once`) rules
     // and the recent-blocks token table. The BPF map is reseeded from
     // `control.combined()` = file rules ∪ transient on every live change.
-    let mut control = Control::new(cfg.allowlist.clone());
+    let mut control = Control::new(cfg.allowlist.clone(), key.k0, key.k1);
 
     // Block events fan out to control-socket `subscribe`rs (the tray
     // agent). A bounded channel; if a slow subscriber lags it loses old

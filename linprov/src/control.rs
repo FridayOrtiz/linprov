@@ -13,7 +13,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context, Result};
-use linprov_common::{fnv_hash, MAX_RULES};
+use linprov_common::{siphash, MAX_RULES};
 
 use crate::{
     allowlist::{RuleSpec, Rules},
@@ -59,18 +59,36 @@ impl BlockEvent {
 }
 
 /// Bounded `token → candidate-rule-line` table of recent blocked execs.
-#[derive(Default)]
 pub struct BlocksTable {
     map: HashMap<String, String>,
     order: VecDeque<String>,
+    /// The per-install keyed-hash key (the `(k0, k1)` seeded into the BPF
+    /// `KEY` map). Block tokens are SipHash of the rule line under this key,
+    /// so they can't be guessed or forged by someone who doesn't hold it
+    /// (the old token was an invertible 32-bit FNV of the rule line).
+    k0: u64,
+    k1: u64,
 }
 
 impl BlocksTable {
+    fn new(k0: u64, k1: u64) -> Self {
+        Self {
+            map: HashMap::new(),
+            order: VecDeque::new(),
+            k0,
+            k1,
+        }
+    }
+
     /// Record the candidate rule for a blocked exec and return its stable
-    /// token (short FNV of the rule line — identical blocks reuse it, so
+    /// token (keyed SipHash of the rule line — identical blocks reuse it, so
     /// the token an operator copies from the log keeps resolving).
     pub fn record(&mut self, rule_line: String) -> String {
-        let token = format!("{:08x}", fnv_hash(&rule_line) as u32);
+        // Keyed (not the old invertible FNV) so a control-socket client can't
+        // forge or guess a token for a block it didn't witness — but kept at
+        // the historical 8-hex width (low 32 bits of the keyed hash) so the
+        // `[allow: <token>]` log contract and anything parsing it are unchanged.
+        let token = format!("{:08x}", siphash(self.k0, self.k1, rule_line.as_bytes()) as u32);
         if !self.map.contains_key(&token) {
             if self.order.len() >= MAX_BLOCKS {
                 if let Some(old) = self.order.pop_front() {
@@ -97,11 +115,11 @@ pub struct Control {
 }
 
 impl Control {
-    pub fn new(allowlist_path: Option<PathBuf>) -> Self {
+    pub fn new(allowlist_path: Option<PathBuf>, k0: u64, k1: u64) -> Self {
         Self {
             allowlist_path,
             transient: Vec::new(),
-            blocks: BlocksTable::default(),
+            blocks: BlocksTable::new(k0, k1),
         }
     }
 
@@ -189,7 +207,7 @@ mod tests {
             writeln!(f, "creator_uid={i}").unwrap();
         }
         f.flush().unwrap();
-        let mut control = Control::new(Some(f.path().to_path_buf()));
+        let mut control = Control::new(Some(f.path().to_path_buf()), 1, 2);
         let token = control.blocks.record("creator_uid=4294967295".to_string());
         let err = control.apply(&token, true).unwrap_err();
         assert!(format!("{err:#}").contains("at capacity"), "{err:#}");
@@ -197,7 +215,7 @@ mod tests {
 
     #[test]
     fn once_added_when_under_capacity() {
-        let mut control = Control::new(None); // no file → 0 rules
+        let mut control = Control::new(None, 1, 2); // no file → 0 rules
         let token = control.blocks.record("creator_uid=1000".to_string());
         let rule = control.apply(&token, true).unwrap();
         assert_eq!(rule, "creator_uid=1000");
