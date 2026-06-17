@@ -145,9 +145,11 @@ pub const MAX_RULES: usize = 8192;
 /// corresponding fields below are then compared against the record /
 /// execve context at enforce time. Cleared bits → field ignored.
 ///
-/// Strings are stored as FNV-1a-64 hashes (computed identically in
-/// userspace and BPF). Collision probability for distinct strings under
-/// FNV-64 is negligible at any realistic allowlist size.
+/// Strings are stored as keyed SipHash-2-4 hashes, computed identically in
+/// userspace (`AllowRule::pack`) and BPF, both under the per-install
+/// `(k0, k1)` key seeded into the `KEY` map. Keying makes the hashes
+/// collision-*resistant* against an attacker crafting a path to collide with
+/// an allowlisted dim — an unkeyed hash (e.g. FNV) would not.
 #[repr(C)]
 #[derive(Copy, Clone)]
 #[cfg_attr(feature = "user", derive(bytemuck::Pod, bytemuck::Zeroable))]
@@ -242,18 +244,18 @@ pub struct OriginRecord {
     pub comm: [u8; COMM_LEN],
     pub creator_uid: u32,
     pub _pad: u32,
-    /// FNV-1a-64 of the creator's full exe path (`/proc/$pid/exe`).
+    /// Keyed SipHash-2-4 of the creator's full exe path (`/proc/$pid/exe`).
     /// 0 until userspace augments the record.
     pub creator_path_hash: u64,
-    /// FNV-1a-64 of the landing file's immediate parent directory,
+    /// Keyed SipHash-2-4 of the landing file's immediate parent directory,
     /// including the trailing `/` (matches `normalize_folder`). Always
     /// the immediate parent regardless of depth — used for exact
     /// `landing_folder` matching and for soak/log resolution.
     pub landing_folder_hash: u64,
-    /// FNV-1a-64 of the landing file's basename (final path component,
+    /// Keyed SipHash-2-4 of the landing file's basename (final path component,
     /// no slash).
     pub landing_basename_hash: u64,
-    /// FNV-1a-64 of each `/`-terminated ancestor of the landing path
+    /// Keyed SipHash-2-4 of each `/`-terminated ancestor of the landing path
     /// (shallow → deep), up to [`MAX_FOLDER_ANCESTORS`]. Enables nested
     /// `landing_folder` matching: a rule whose folder hash equals any
     /// entry matches. Unused slots are 0.
