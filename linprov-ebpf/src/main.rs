@@ -1296,12 +1296,25 @@ fn emit_event(
 
 #[tracepoint]
 pub fn sched_process_exit(_ctx: TracePointContext) -> u32 {
-    let pid = current_pid();
-    let _ = NET_PIDS.remove(pid);
-    let _ = PROP_PIDS.remove(pid);
-    let _ = APPROVED_INTERP.remove(pid);
-    let _ = INTERP_COPY_PIDS.remove(pid);
-    let _ = INTERP_PIDS.remove(pid);
+    // `sched_process_exit` fires in `do_exit()` for **every** thread, but the
+    // taint maps are all keyed on the TGID (the whole process). Reaping on a
+    // non-leader thread's exit would clear a still-running process's
+    // network/derived taint — files it writes afterward would never be marked,
+    // an unprivileged tracking bypass (connect, exit one throwaway thread, then
+    // write the payload). Only reap when the thread-group leader exits, i.e.
+    // tid (low 32) == tgid (high 32). If a leader ever exits before its workers
+    // the taint simply lingers until LRU eviction — fail-safe over-marking.
+    let pid_tgid = bpf_get_current_pid_tgid();
+    let tid = pid_tgid as u32;
+    let tgid = (pid_tgid >> 32) as u32;
+    if tid != tgid {
+        return 0;
+    }
+    let _ = NET_PIDS.remove(tgid);
+    let _ = PROP_PIDS.remove(tgid);
+    let _ = APPROVED_INTERP.remove(tgid);
+    let _ = INTERP_COPY_PIDS.remove(tgid);
+    let _ = INTERP_PIDS.remove(tgid);
     0
 }
 
