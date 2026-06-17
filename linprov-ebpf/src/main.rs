@@ -816,7 +816,21 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     // wrote a smaller layout; without the gate we'd interpret comm bytes
     // as creator_uid, etc.
     if unsafe { (*buf).version } != ORIGIN_VERSION {
-        return 0;
+        // A *partial* storage record (creator_path_hash == 0) sent us to the
+        // xattr above, and an older-schema xattr left over from a daemon
+        // upgrade then overwrote `buf` with a stale-version layout. Don't treat
+        // that as "unmarked" and fail open: fall back to the valid current-
+        // version storage record we already had. creator_path_hash stays 0 (so
+        // a creator_process rule won't match), but landing/target enforcement
+        // is preserved — fail closed, not open.
+        if have_storage && !inode_ptr.is_null() {
+            if let Some(stored) = unsafe { INODE_MARKS.get_ptr(inode_ptr) } {
+                unsafe { core::ptr::copy_nonoverlapping(stored, buf, 1) };
+            }
+        }
+        if unsafe { (*buf).version } != ORIGIN_VERSION {
+            return 0;
+        }
     }
 
     // Resolve the path into a freshly-reserved ringbuf entry. We avoid any
