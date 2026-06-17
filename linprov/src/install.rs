@@ -9,7 +9,7 @@ use std::{
     env,
     ffi::{CStr, CString},
     fs,
-    os::unix::fs::{MetadataExt, PermissionsExt},
+    os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt},
     path::{Path, PathBuf},
     process::Command,
 };
@@ -42,11 +42,29 @@ pub fn install_to(src: &Path, dest: &Path) -> Result<Outcome> {
     // Write to a sibling tmp file, chmod, then rename. atomic on the
     // same filesystem; safe to do even if the old `dest` is mapped by
     // a running process.
-    let tmp = dest.with_extension("linprov-new");
-    fs::copy(&src, &tmp)
+    // Sibling tmp with a pid-suffixed name, created O_EXCL|O_NOFOLLOW so a
+    // pre-staged symlink or file in the (possibly non-default, group-writable)
+    // install dir can't redirect the copy or be silently clobbered; perms are
+    // set via the fd (fchmod), not the path. Best-effort unlink first clears a
+    // stale tmp left by a crashed prior run with the same pid.
+    let tmp = dest.with_file_name(format!(".linprov-new.{}", std::process::id()));
+    let _ = fs::remove_file(&tmp);
+    let mut tmp_f = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .mode(0o755)
+        .open(&tmp)
+        .with_context(|| format!("creating `{}`", tmp.display()))?;
+    let mut src_f =
+        fs::File::open(&src).with_context(|| format!("opening `{}`", src.display()))?;
+    std::io::copy(&mut src_f, &mut tmp_f)
         .with_context(|| format!("copying `{}` -> `{}`", src.display(), tmp.display()))?;
-    fs::set_permissions(&tmp, fs::Permissions::from_mode(0o755))
+    // fchmod via the fd (umask may have masked the create mode).
+    tmp_f
+        .set_permissions(fs::Permissions::from_mode(0o755))
         .with_context(|| format!("chmod 0755 `{}`", tmp.display()))?;
+    drop(tmp_f);
     fs::rename(&tmp, dest)
         .with_context(|| format!("renaming `{}` -> `{}`", tmp.display(), dest.display()))?;
     info!("installed {} -> {}", src.display(), dest.display());
