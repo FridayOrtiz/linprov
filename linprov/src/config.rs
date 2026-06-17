@@ -66,6 +66,12 @@ pub const DEFAULT_HASHDB_PATH: &str = "/var/lib/linprov/hashes.tsv";
 /// key silently invalidates all existing marks (they re-mark on next open).
 pub const DEFAULT_KEY_PATH: &str = "/var/lib/linprov/key";
 
+/// Default quarantine store root. The `quarantine` control verb moves a
+/// blocked file under `<dir>/store/` (root-only, 0700) with a restore
+/// manifest; `linprov quarantine list`/`restore` read it back. Shares
+/// `/var/lib/linprov` with the audit db and the key.
+pub const DEFAULT_QUARANTINE_DIR: &str = "/var/lib/linprov/quarantine";
+
 /// Where `setup` and `upgrade` copy the binary so it lands on root's
 /// `secure_path` (and `sudo linprov ...` works without a leading
 /// absolute path). `/usr/local/bin` is the conventional spot for
@@ -94,6 +100,9 @@ pub struct FileConfig {
     pub mark_localhost: Option<bool>,
     pub soak: Option<Vec<Dim>>,
     pub hash_db: Option<PathBuf>,
+    /// Root of the quarantine store the `quarantine` control verb moves
+    /// blocked files into. Defaults to [`DEFAULT_QUARANTINE_DIR`].
+    pub quarantine_dir: Option<PathBuf>,
     /// Expose the control socket to a local desktop agent — see
     /// [`NotifyMode`]. Defaults to `off`.
     pub notifications: Option<NotifyMode>,
@@ -141,6 +150,7 @@ pub struct EffectiveConfig {
     pub mark_localhost: bool,
     pub soak: Vec<Dim>,
     pub hash_db: PathBuf,
+    pub quarantine_dir: PathBuf,
     pub interpreters: Vec<String>,
     pub notifications: NotifyMode,
 }
@@ -166,6 +176,10 @@ impl EffectiveConfig {
                 .hash_db
                 .or(file.hash_db)
                 .unwrap_or_else(|| PathBuf::from(DEFAULT_HASHDB_PATH)),
+            quarantine_dir: cli
+                .quarantine_dir
+                .or(file.quarantine_dir)
+                .unwrap_or_else(|| PathBuf::from(DEFAULT_QUARANTINE_DIR)),
             interpreters: cli
                 .interpreters
                 .or(file.interpreters)
@@ -186,6 +200,7 @@ pub struct CliOverrides {
     pub mark_localhost: Option<bool>,
     pub soak: Option<Vec<Dim>>,
     pub hash_db: Option<PathBuf>,
+    pub quarantine_dir: Option<PathBuf>,
     pub interpreters: Option<Vec<String>>,
     pub notifications: Option<NotifyMode>,
 }

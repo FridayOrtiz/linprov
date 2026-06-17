@@ -21,6 +21,8 @@ mod key;
 mod mode;
 mod notify;
 mod privilege;
+mod quarantine;
+mod review;
 mod run;
 mod setup;
 mod upgrade;
@@ -56,9 +58,19 @@ enum Cmd {
     /// socket; `--once` applies it in memory only (not persisted).
     Allow(allow::AllowArgs),
     /// User-session tray agent: subscribe to blocks over the control
-    /// socket and surface Allow once / Allow always / Close in a tray
-    /// menu. Run from your graphical session (e.g. sway `exec`).
+    /// socket and surface Allow / Quarantine / Dismiss in a tray menu;
+    /// left-click opens the multi-select review window. Run from your
+    /// graphical session (e.g. sway `exec`).
     Notify(notify::NotifyArgs),
+    /// Quarantine a blocked file instead of allowing it: `apply <token>`
+    /// asks the daemon to move it into a root-only store and neutralize it;
+    /// `list` / `restore <id>` manage the store directly.
+    Quarantine(quarantine::QuarantineArgs),
+    /// Open the desktop review window: a checkbox list of pending blocked
+    /// execs with bulk Allow once / Allow always / Quarantine / Dismiss and
+    /// per-component (dimension) selection. Launched by left-clicking the
+    /// tray icon, or run directly. Needs the `review-ui` build feature.
+    Review(review::ReviewArgs),
 }
 
 fn main() -> Result<()> {
@@ -75,5 +87,7 @@ fn main() -> Result<()> {
         Cmd::Upgrade(args) => upgrade::run(args),
         Cmd::Allow(args) => allow::run(args),
         Cmd::Notify(args) => notify::run(args),
+        Cmd::Quarantine(args) => quarantine::run(args),
+        Cmd::Review(args) => review::run(args),
     }
 }

@@ -16,6 +16,7 @@ use std::{
     ffi::CString,
     fs,
     os::fd::AsRawFd,
+    os::unix::fs::MetadataExt,
     path::{Path, PathBuf},
 };
 
@@ -30,7 +31,7 @@ use tokio::sync::broadcast;
 
 use crate::{
     allowlist::{rule_from_context, OriginContext, Soak, ALLOW_DIMS},
-    control::{BlockEvent, BlocksTable},
+    control::{BlockEvent, BlocksTable, ControlEvent},
     encoding::escape,
     hashdb::HashDb,
     inode_storage::InodeMarks,
@@ -47,7 +48,7 @@ pub fn handle_event(
     cfg: &Config,
     inode_marks: &mut InodeMarks,
     blocks: &mut BlocksTable,
-    block_tx: &broadcast::Sender<BlockEvent>,
+    block_tx: &broadcast::Sender<ControlEvent>,
     raw: &[u8],
 ) {
     if raw.len() < std::mem::size_of::<Event>() {
@@ -303,7 +304,7 @@ fn is_pseudo_fs(target: &std::path::Path) -> bool {
 fn on_execve_marked(
     cfg: &Config,
     blocks: &mut BlocksTable,
-    block_tx: &broadcast::Sender<BlockEvent>,
+    block_tx: &broadcast::Sender<ControlEvent>,
     event: &Event,
 ) {
     let target_path = c_str_to_string(&event.filename);
@@ -375,7 +376,7 @@ fn on_execve_marked(
 fn on_script_exec(
     cfg: &Config,
     blocks: &mut BlocksTable,
-    block_tx: &broadcast::Sender<BlockEvent>,
+    block_tx: &broadcast::Sender<ControlEvent>,
     event: &Event,
 ) {
     let script_path = c_str_to_string(&event.filename);
@@ -442,7 +443,7 @@ fn on_script_exec(
 #[allow(clippy::too_many_arguments)]
 fn record_block_token(
     blocks: &mut BlocksTable,
-    block_tx: &broadcast::Sender<BlockEvent>,
+    block_tx: &broadcast::Sender<ControlEvent>,
     kind: &'static str,
     event: &Event,
     target: &str,
@@ -461,21 +462,31 @@ fn record_block_token(
         creator_uid: event.origin.creator_uid,
         execution_uid: exec_uid,
     };
-    let token = blocks.record(rule_from_context(&ctx, ALLOW_DIMS).to_line());
+    let rule_line = rule_from_context(&ctx, ALLOW_DIMS).to_line();
 
-    // Fan out to any control-socket subscribers (the tray agent). A
-    // non-blocking send; `Err(NoReceivers)` is the common case (no agent
-    // connected) and is ignored.
+    // Capture the file's identity now, for a possible `quarantine` of this
+    // token: quarantine re-stats the path and refuses on a dev/ino mismatch
+    // (the file swapped since the block). A stat failure leaves (0, 0) —
+    // quarantine then declines; the file was just exec'd, so this is rare.
+    let (dev, ino) = fs::metadata(target)
+        .map(|m| (m.dev(), m.ino()))
+        .unwrap_or((0, 0));
+
     let creator = creator_path
         .clone()
         .filter(|s| !s.is_empty())
         .unwrap_or_else(|| creator_comm.to_string());
-    let _ = block_tx.send(BlockEvent {
+    let token = blocks.record(kind, rule_line, target.to_string(), creator.clone(), dev, ino);
+
+    // Fan out to any control-socket subscribers (the tray agent). A
+    // non-blocking send; `Err(NoReceivers)` is the common case (no agent
+    // connected) and is ignored.
+    let _ = block_tx.send(ControlEvent::Block(BlockEvent {
         kind,
         token: token.clone(),
         target: target.to_string(),
         creator,
-    });
+    }));
     token
 }
 

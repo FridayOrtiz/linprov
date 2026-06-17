@@ -5,12 +5,17 @@
 //! It connects to the daemon's control socket (group `linprov`, exposed by
 //! `notifications = "tray"`), `subscribe`s to block events, and presents a
 //! StatusNotifierItem tray icon (via `ksni`) whose context menu lists
-//! recent blocked execs — each with **Allow once / Allow always / Close**.
-//! A buttonless desktop notification also fires per block as an alert.
+//! recent blocked execs — each with **Allow once / Allow always / Quarantine
+//! / Dismiss**. Left-clicking the icon opens the `linprov review` window: a
+//! multi-select checkbox list with the same four bulk actions and
+//! per-component (dimension) selection. A buttonless desktop notification
+//! also fires per block as an alert.
 //!
-//! Menu clicks drive the same control-socket verbs `linprov allow` uses
-//! (`allow` / `once <token>`). Run it from your sway config
-//! (`exec linprov notify`); needs a StatusNotifierHost (e.g. waybar's tray).
+//! Menu clicks drive the control-socket verbs (`allow` / `once` /
+//! `quarantine` / `dismiss <token>`); a `RESOLVED` broadcast keeps the menu
+//! in sync when another client (the window, `linprov allow`) actions a block.
+//! Run it from your sway config (`exec linprov notify`); needs a
+//! StatusNotifierHost (e.g. waybar's tray).
 
 use std::{
     io::{BufRead, BufReader, Read, Write},
@@ -27,6 +32,7 @@ use ksni::blocking::TrayMethods;
 use log::{info, warn};
 
 use crate::config::DEFAULT_CONTROL_SOCKET_PATH;
+use crate::quarantine::TAMPER_MARKER;
 
 #[derive(Parser, Debug)]
 pub struct NotifyArgs {
@@ -78,6 +84,8 @@ struct RecentBlock {
 enum ActionKind {
     Once,
     Always,
+    Quarantine,
+    Dismiss,
 }
 
 /// A menu click, handed from the tray thread to the action worker.
@@ -92,6 +100,9 @@ struct Action {
 struct LinprovTray {
     recent: Vec<RecentBlock>,
     tx: mpsc::Sender<Action>,
+    /// Control socket path, passed to the `linprov review` window launched on
+    /// left-click.
+    socket: PathBuf,
     /// Whether the subscribe stream to the daemon is currently up. Surfaced
     /// in the tooltip so an empty tray distinguishes "no pending blocks" from
     /// "can't reach the daemon" (e.g. linprov.service not running).
@@ -117,6 +128,20 @@ impl LinprovTray {
         }
         self.recent.retain(|x| x.token != token);
     }
+
+    /// Spawn the `linprov review` window as a separate process (its egui event
+    /// loop can't share this thread with ksni). Best-effort; the caller falls
+    /// back to a notification if it can't launch.
+    fn launch_review(&self) -> Result<()> {
+        let exe = std::env::current_exe().context("locating the linprov binary")?;
+        std::process::Command::new(exe)
+            .arg("review")
+            .arg("--socket")
+            .arg(&self.socket)
+            .spawn()
+            .context("launching `linprov review`")?;
+        Ok(())
+    }
 }
 
 impl ksni::Tray for LinprovTray {
@@ -126,32 +151,36 @@ impl ksni::Tray for LinprovTray {
     fn title(&self) -> String {
         "linprov".into()
     }
-    /// Left-click (`Activate`) can't open the context menu — that's
-    /// right-click (the DBusMenu), and ksni 0.3 doesn't let us set
-    /// `ItemIsMenu` to change that. So instead of a dead click, make it
-    /// informative: summarize pending decisions and point at the right-click
-    /// menu (which is otherwise undiscoverable).
+    /// Left-click (`Activate`) opens the multi-select review window — a
+    /// checkbox list of pending blocks with bulk Allow once / Allow always /
+    /// Quarantine / Dismiss and per-component selection. It runs as its own
+    /// process (its egui loop can't share this ksni thread). If it can't
+    /// launch (built without the `review-ui` feature, or no `current_exe`),
+    /// fall back to the old informational notification pointing at the
+    /// right-click menu (which is otherwise undiscoverable).
     fn activate(&mut self, _x: i32, _y: i32) {
-        let body = if self.recent.is_empty() {
-            "No pending blocks.".to_string()
-        } else {
-            let n = self.recent.len();
-            let s = if n == 1 { "" } else { "s" };
-            format!(
-                "{n} pending decision{s}. Right-click this icon for \
-                 Allow once / Allow always / dismiss."
-            )
-        };
-        let icon = if self.recent.is_empty() {
-            "security-high"
-        } else {
-            "security-low"
-        };
-        let _ = notify_rust::Notification::new()
-            .summary("linprov")
-            .body(&body)
-            .icon(icon)
-            .show();
+        if let Err(e) = self.launch_review() {
+            let body = if self.recent.is_empty() {
+                "No pending blocks.".to_string()
+            } else {
+                let n = self.recent.len();
+                let s = if n == 1 { "" } else { "s" };
+                format!(
+                    "{n} pending decision{s}. Right-click this icon for \
+                     Allow / Quarantine / Dismiss.\n(review window unavailable: {e})"
+                )
+            };
+            let icon = if self.recent.is_empty() {
+                "security-high"
+            } else {
+                "security-low"
+            };
+            let _ = notify_rust::Notification::new()
+                .summary("linprov")
+                .body(&body)
+                .icon(icon)
+                .show();
+        }
     }
     fn icon_name(&self) -> String {
         // Intentionally empty: a non-empty themed name (e.g. "security-high")
@@ -217,8 +246,12 @@ impl ksni::Tray for LinprovTray {
         } else {
             for b in &self.recent {
                 let label = format!("{} · {}", basename(&b.target), b.creator);
-                let (t_once, t_always, t_close) =
-                    (b.token.clone(), b.token.clone(), b.token.clone());
+                let (t_once, t_always, t_quar, t_dismiss) = (
+                    b.token.clone(),
+                    b.token.clone(),
+                    b.token.clone(),
+                    b.token.clone(),
+                );
                 items.push(
                     SubMenu {
                         label,
@@ -240,9 +273,17 @@ impl ksni::Tray for LinprovTray {
                             }
                             .into(),
                             StandardItem {
-                                label: "Close".into(),
+                                label: "Quarantine".into(),
                                 activate: Box::new(move |t: &mut Self| {
-                                    t.recent.retain(|x| x.token != t_close)
+                                    t.dispatch(ActionKind::Quarantine, &t_quar)
+                                }),
+                                ..Default::default()
+                            }
+                            .into(),
+                            StandardItem {
+                                label: "Dismiss".into(),
+                                activate: Box::new(move |t: &mut Self| {
+                                    t.dispatch(ActionKind::Dismiss, &t_dismiss)
                                 }),
                                 ..Default::default()
                             }
@@ -300,6 +341,7 @@ pub fn run(args: NotifyArgs) -> Result<()> {
         let tray = LinprovTray {
             recent: Vec::new(),
             tx: tx.clone(),
+            socket: args.socket.clone(),
             connected: false,
         };
         match tray.spawn() {
@@ -397,16 +439,65 @@ fn subscribe_once(socket: &Path, handle: &ksni::blocking::Handle<LinprovTray>) -
         .write_all(b"subscribe\n")
         .context("sending subscribe")?;
     handle.update(|t: &mut LinprovTray| t.connected = true);
+
+    // Backfill the current pending set: the subscribe stream only carries
+    // *future* events, so without this a freshly-(re)started tray shows an
+    // empty menu even when blocks are pending. `push`'s de-dup absorbs any
+    // overlap with events buffered on the stream meanwhile.
+    if let Ok(blocks) = list_pending(socket) {
+        for b in blocks {
+            handle.update(move |t: &mut LinprovTray| t.push(b));
+        }
+    }
+
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         let line = line.context("reading block stream")?;
-        if let Some(b) = parse_block(&line) {
+        // `RESOLVED\t<token>` — the block was allowed/quarantined/dismissed by
+        // some client (this tray, the review window, or `linprov allow`); drop
+        // it so every view stays in sync.
+        if let Some(token) = line.strip_prefix("RESOLVED\t") {
+            let token = token.to_string();
+            handle.update(move |t: &mut LinprovTray| t.recent.retain(|x| x.token != token));
+        } else if let Some(b) = parse_block(&line) {
             notify_block(&b);
             let b2 = b.clone();
             handle.update(move |t: &mut LinprovTray| t.push(b2));
         }
     }
     Err(anyhow!("subscribe stream closed"))
+}
+
+/// One-shot `list` of the daemon's pending blocks, for backfilling the tray
+/// menu on (re)connect. Parses the `ENTRY` snapshot lines (ignoring the
+/// trailing rule-line field, which only the review window needs).
+fn list_pending(socket: &Path) -> Result<Vec<RecentBlock>> {
+    let mut stream = UnixStream::connect(socket).context("connecting to list pending blocks")?;
+    stream.write_all(b"list\n").context("sending list")?;
+    stream.shutdown(Shutdown::Write).ok();
+    let reader = BufReader::new(stream);
+    let mut out = Vec::new();
+    for line in reader.lines() {
+        let line = line.context("reading list reply")?;
+        if line == "END" {
+            break;
+        }
+        let mut f = line.splitn(6, '\t');
+        if f.next() != Some("ENTRY") {
+            continue;
+        }
+        if let (Some(token), Some(kind), Some(target), Some(creator)) =
+            (f.next(), f.next(), f.next(), f.next())
+        {
+            out.push(RecentBlock {
+                token: token.to_string(),
+                kind: kind.to_string(),
+                target: target.to_string(),
+                creator: creator.to_string(),
+            });
+        }
+    }
+    Ok(out)
 }
 
 /// Parse a `BLOCK\t<token>\t<kind>\t<target>\t<creator>` line; `None` for
@@ -429,15 +520,22 @@ fn action_worker(rx: mpsc::Receiver<Action>, socket: PathBuf) {
         let verb = match action.kind {
             ActionKind::Once => "once",
             ActionKind::Always => "allow",
+            ActionKind::Quarantine => "quarantine",
+            ActionKind::Dismiss => "dismiss",
         };
         match send_command(&socket, verb, &action.token) {
             Ok(reply) => {
                 info!("{verb} {} -> {reply}", action.token);
-                notify_result(&action.target, reply.strip_prefix("OK ").is_some(), &reply);
+                notify_result(
+                    action.kind,
+                    &action.target,
+                    reply.strip_prefix("OK ").is_some(),
+                    &reply,
+                );
             }
             Err(e) => {
                 warn!("{verb} {} failed: {e:#}", action.token);
-                notify_result(&action.target, false, &format!("{e:#}"));
+                notify_result(action.kind, &action.target, false, &format!("{e:#}"));
             }
         }
     }
@@ -464,16 +562,29 @@ fn notify_block(b: &RecentBlock) {
         .show();
 }
 
-fn notify_result(target: &str, ok: bool, detail: &str) {
-    let summary = if ok {
-        "linprov: allowed"
-    } else {
-        "linprov: allow failed"
+fn notify_result(kind: ActionKind, target: &str, ok: bool, detail: &str) {
+    // A quarantine that failed because the file was swapped/redirected since
+    // the block is a suspected race against the tool — surface it as a
+    // critical, non-expiring alert rather than a notification that auto-fades.
+    let tamper = !ok && matches!(kind, ActionKind::Quarantine) && detail.contains(TAMPER_MARKER);
+    let summary = match (kind, ok) {
+        (ActionKind::Quarantine, true) => "linprov: quarantined",
+        (ActionKind::Quarantine, false) if tamper => {
+            "⚠ linprov: POSSIBLE TAMPER — quarantine failed"
+        }
+        (ActionKind::Quarantine, false) => "linprov: quarantine failed",
+        (ActionKind::Dismiss, _) => "linprov: dismissed",
+        (_, true) => "linprov: allowed",
+        (_, false) => "linprov: allow failed",
     };
-    let _ = notify_rust::Notification::new()
-        .summary(summary)
-        .body(&format!("{target}\n{detail}"))
-        .show();
+    let mut n = notify_rust::Notification::new();
+    n.summary(summary).body(&format!("{target}\n{detail}"));
+    if tamper {
+        n.urgency(notify_rust::Urgency::Critical)
+            .timeout(notify_rust::Timeout::Never)
+            .icon("dialog-warning");
+    }
+    let _ = n.show();
 }
 
 fn basename(path: &str) -> &str {

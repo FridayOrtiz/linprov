@@ -64,7 +64,10 @@ impl Dim {
         }
     }
 
-    fn parse(s: &str) -> Option<Self> {
+    /// Parse a dimension name (e.g. `creator_process`). Public so the
+    /// control-socket `allow <token> dims=...` parser (the review window's
+    /// per-component selection) can map names back to dims.
+    pub fn from_key(s: &str) -> Option<Self> {
         Some(match s {
             "target_filename" => Dim::TargetFilename,
             "target_folder" => Dim::TargetFolder,
@@ -115,7 +118,7 @@ impl RuleSpec {
             // `to_line`). The error context keeps the on-disk `v` so it can't
             // smuggle control bytes into a log line.
             let raw = decode_value(v);
-            let dim = Dim::parse(k).ok_or_else(|| anyhow!("unknown dimension `{k}`"))?;
+            let dim = Dim::from_key(k).ok_or_else(|| anyhow!("unknown dimension `{k}`"))?;
             spec.set(dim, &raw)
                 .with_context(|| format!("condition `{k}={v}`"))?;
         }
@@ -274,6 +277,76 @@ impl RuleSpec {
             landing_folder_hash: self.landing_folder.as_deref().map(&h).unwrap_or(0),
             creator_process_hash: self.creator_process.as_deref().map(&h).unwrap_or(0),
         }
+    }
+
+    /// Project this rule onto `dims`: keep only the listed dimensions that
+    /// are actually present (flag set). Used by the review window's
+    /// per-component allow — the user unchecks the noisy dims and keeps, say,
+    /// just `creator_process`, and the daemon re-serializes the narrowed
+    /// rule. A folder dim carries its recursive (`*`) modifier along.
+    pub fn project(&self, dims: &[Dim]) -> RuleSpec {
+        let mut out = RuleSpec::default();
+        for &d in dims {
+            let bit = dim_bit(d);
+            if self.flags & bit == 0 {
+                continue; // not recorded for this block — skip
+            }
+            out.flags |= bit;
+            match d {
+                Dim::TargetFilename => out.target_filename = self.target_filename.clone(),
+                Dim::TargetFolder => {
+                    out.target_folder = self.target_folder.clone();
+                    out.flags |= self.flags & dim::TARGET_FOLDER_RECURSIVE;
+                }
+                Dim::LandingFilename => out.landing_filename = self.landing_filename.clone(),
+                Dim::LandingFolder => {
+                    out.landing_folder = self.landing_folder.clone();
+                    out.flags |= self.flags & dim::LANDING_FOLDER_RECURSIVE;
+                }
+                Dim::CreatorProcess => out.creator_process = self.creator_process.clone(),
+                Dim::CreatorComm => out.creator_comm = self.creator_comm.clone(),
+                Dim::CreatorUid => out.creator_uid = self.creator_uid,
+                Dim::ExecutionUid => out.execution_uid = self.execution_uid,
+            }
+        }
+        out
+    }
+
+    /// The present dimensions of this rule as `(dim, display value)` pairs,
+    /// in canonical [`DIM_ORDER`]. Drives the review window's per-component
+    /// checkboxes; folder dims include their recursive `*` modifier.
+    #[cfg_attr(not(feature = "review-ui"), allow(dead_code))]
+    pub fn components(&self) -> Vec<(Dim, String)> {
+        let mut out = Vec::new();
+        for &d in DIM_ORDER {
+            if self.flags & dim_bit(d) == 0 {
+                continue;
+            }
+            let v = match d {
+                Dim::TargetFilename => self.target_filename.clone().unwrap_or_default(),
+                Dim::TargetFolder => {
+                    let mut s = self.target_folder.clone().unwrap_or_default();
+                    if self.flags & dim::TARGET_FOLDER_RECURSIVE != 0 {
+                        s.push('*');
+                    }
+                    s
+                }
+                Dim::LandingFilename => self.landing_filename.clone().unwrap_or_default(),
+                Dim::LandingFolder => {
+                    let mut s = self.landing_folder.clone().unwrap_or_default();
+                    if self.flags & dim::LANDING_FOLDER_RECURSIVE != 0 {
+                        s.push('*');
+                    }
+                    s
+                }
+                Dim::CreatorProcess => self.creator_process.clone().unwrap_or_default(),
+                Dim::CreatorComm => self.creator_comm.clone().unwrap_or_default(),
+                Dim::CreatorUid => self.creator_uid.map(|u| u.to_string()).unwrap_or_default(),
+                Dim::ExecutionUid => self.execution_uid.map(|u| u.to_string()).unwrap_or_default(),
+            };
+            out.push((d, v));
+        }
+        out
     }
 }
 

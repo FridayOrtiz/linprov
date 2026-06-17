@@ -1,9 +1,17 @@
-//! Daemon-side rule control behind the `linprov allow` control socket:
-//! the recent-blocks token table and the in-memory transient (`--once`)
-//! rules. The BPF rules map is always (re)seeded from `combined()` =
-//! persistent file rules ∪ transient rules, so an `allow --once` survives
-//! SIGHUP file-reloads but is gone on daemon restart (never written to
-//! disk), while a plain `allow` is appended to the allowlist file.
+//! Daemon-side rule control behind the `linprov allow` / `quarantine`
+//! control socket: the pending-blocks token table and the in-memory
+//! transient (`--once`) rules. The BPF rules map is always (re)seeded from
+//! `combined()` = persistent file rules ∪ transient rules, so an `allow
+//! --once` survives SIGHUP file-reloads but is gone on daemon restart
+//! (never written to disk), while a plain `allow` is appended to the
+//! allowlist file.
+//!
+//! The pending-blocks table ([`BlocksTable`]) is the source of truth for
+//! "what's awaiting a decision": a block adds an entry, and `allow` / `once`
+//! / `quarantine` / `dismiss` remove it (a recurrence re-adds it). The
+//! `list` control verb snapshots it for the review window, and every
+//! resolution broadcasts a [`ControlEvent::Resolved`] so the live tray drops
+//! the entry too — no matter which client actioned it.
 
 use std::{
     collections::{HashMap, VecDeque},
@@ -16,7 +24,7 @@ use anyhow::{anyhow, Context, Result};
 use linprov_common::{siphash, MAX_RULES};
 
 use crate::{
-    allowlist::{RuleSpec, Rules},
+    allowlist::{Dim, RuleSpec, Rules},
     config::restrict_perms,
     encoding::escape,
 };
@@ -32,7 +40,7 @@ const MAX_BLOCKS: usize = 512;
 pub struct BlockEvent {
     /// `"exec"` (ELF/shebang, bprm) or `"script"` (interpreter-loaded).
     pub kind: &'static str,
-    /// The `[allow: <token>]` handle — feeds `allow`/`once`.
+    /// The `[allow: <token>]` handle — feeds `allow`/`once`/`quarantine`.
     pub token: String,
     /// The blocked path (exec target / script).
     pub target: String,
@@ -58,9 +66,55 @@ impl BlockEvent {
     }
 }
 
-/// Bounded `token → candidate-rule-line` table of recent blocked execs.
+/// An event on the control broadcast channel that `subscribe`rs follow: a
+/// new block, or a token that left the pending set (allowed, quarantined, or
+/// dismissed — by *any* client) so every view can drop it and stay in sync.
+#[derive(Clone, Debug)]
+pub enum ControlEvent {
+    Block(BlockEvent),
+    /// A token that's no longer pending. Wire: `RESOLVED\t<token>`.
+    Resolved(String),
+}
+
+impl ControlEvent {
+    pub fn to_wire(&self) -> String {
+        match self {
+            ControlEvent::Block(b) => b.to_wire(),
+            ControlEvent::Resolved(token) => format!("RESOLVED\t{token}"),
+        }
+    }
+}
+
+/// What a block token resolves to: the candidate allow rule (for
+/// `allow`/`once`, optionally projected onto a chosen dim subset), the
+/// display strings, and the live target path + its `dev`/`ino` captured at
+/// block time (for `quarantine`, which moves the file and re-verifies the
+/// identity to refuse one swapped since the block).
+#[derive(Clone, Debug)]
+pub struct BlockRecord {
+    /// Stable token (keyed SipHash of `rule_line`).
+    pub token: String,
+    /// `"exec"` or `"script"`.
+    pub kind: String,
+    /// Canonical candidate allow rule line (all dims captured for this
+    /// block); `allow`/`once` apply this (or a projection of it).
+    pub rule_line: String,
+    /// Blocked path, for display + as the file `quarantine` moves.
+    pub target: String,
+    /// Creator exe path (or `comm` fallback), for display.
+    pub creator: String,
+    /// `dev`/`ino` of `target` at block time; `quarantine` re-stats and
+    /// refuses on a mismatch. `(0, 0)` if the file was already gone.
+    pub dev: u64,
+    pub ino: u64,
+}
+
+/// Bounded `token → BlockRecord` table of *pending* blocked execs. An entry
+/// is dropped once it's actioned (`allow`/`once`/`quarantine`/`dismiss`); a
+/// later recurrence of the same block re-adds it (refreshing the file
+/// identity, which may have changed between occurrences).
 pub struct BlocksTable {
-    map: HashMap<String, String>,
+    map: HashMap<String, BlockRecord>,
     order: VecDeque<String>,
     /// The per-install keyed-hash key (the `(k0, k1)` seeded into the BPF
     /// `KEY` map). Block tokens are SipHash of the rule line under this key,
@@ -80,29 +134,79 @@ impl BlocksTable {
         }
     }
 
-    /// Record the candidate rule for a blocked exec and return its stable
-    /// token (keyed SipHash of the rule line — identical blocks reuse it, so
-    /// the token an operator copies from the log keeps resolving).
-    pub fn record(&mut self, rule_line: String) -> String {
+    /// Record a pending blocked exec (its candidate rule + display strings +
+    /// file identity) and return its stable token (keyed SipHash of the rule
+    /// line — identical blocks reuse it, so the token an operator copies from
+    /// the log keeps resolving). A repeat refreshes the target/identity.
+    pub fn record(
+        &mut self,
+        kind: &str,
+        rule_line: String,
+        target: String,
+        creator: String,
+        dev: u64,
+        ino: u64,
+    ) -> String {
         // Keyed (not the old invertible FNV) so a control-socket client can't
         // forge or guess a token for a block it didn't witness — but kept at
         // the historical 8-hex width (low 32 bits of the keyed hash) so the
         // `[allow: <token>]` log contract and anything parsing it are unchanged.
         let token = format!("{:08x}", siphash(self.k0, self.k1, rule_line.as_bytes()) as u32);
-        if !self.map.contains_key(&token) {
+        if let Some(rec) = self.map.get_mut(&token) {
+            // Same rule line recurred: refresh the volatile bits (the file may
+            // have been replaced between blocks), keep its place in the order.
+            rec.target = target;
+            rec.creator = creator;
+            rec.dev = dev;
+            rec.ino = ino;
+        } else {
             if self.order.len() >= MAX_BLOCKS {
                 if let Some(old) = self.order.pop_front() {
                     self.map.remove(&old);
                 }
             }
             self.order.push_back(token.clone());
-            self.map.insert(token.clone(), rule_line);
+            self.map.insert(
+                token.clone(),
+                BlockRecord {
+                    token: token.clone(),
+                    kind: kind.to_string(),
+                    rule_line,
+                    target,
+                    creator,
+                    dev,
+                    ino,
+                },
+            );
         }
         token
     }
 
     fn rule_for(&self, token: &str) -> Option<&str> {
-        self.map.get(token).map(String::as_str)
+        self.map.get(token).map(|r| r.rule_line.as_str())
+    }
+
+    /// The full record for `token` (path + identity), for `quarantine`.
+    pub fn record_for(&self, token: &str) -> Option<BlockRecord> {
+        self.map.get(token).cloned()
+    }
+
+    /// Snapshot of the pending blocks, oldest-first, for the `list` verb.
+    pub fn list(&self) -> Vec<BlockRecord> {
+        self.order
+            .iter()
+            .filter_map(|t| self.map.get(t).cloned())
+            .collect()
+    }
+
+    /// Drop a token once it's been actioned. Returns whether it was present.
+    pub fn remove(&mut self, token: &str) -> bool {
+        if self.map.remove(token).is_some() {
+            self.order.retain(|t| t != token);
+            true
+        } else {
+            false
+        }
     }
 }
 
@@ -135,20 +239,48 @@ impl Control {
         Ok(rules)
     }
 
-    /// Apply the rule for `token`. `once` → add to the in-memory transient
-    /// set (active until daemon restart, never written to the file).
-    /// Otherwise append it to the allowlist file (deduped against disk).
-    /// Returns the applied rule line; the caller reseeds from `combined()`.
-    pub fn apply(&mut self, token: &str, once: bool) -> Result<String> {
-        let line = self
+    /// Apply the rule for `token`, optionally projected onto `dims` (the
+    /// review window's per-component selection — e.g. keep only
+    /// `creator_process` and drop the noisy `target_filename`). `None` →
+    /// the full candidate rule (the default exact-match dims captured at
+    /// block time).
+    ///
+    /// `once` → add to the in-memory transient set (active until daemon
+    /// restart, never written to the file). Otherwise append it to the
+    /// allowlist file (deduped against disk). Returns the applied rule line;
+    /// the caller reseeds from `combined()` and drops the token from the
+    /// pending table.
+    pub fn apply_with_dims(
+        &mut self,
+        token: &str,
+        once: bool,
+        dims: Option<&[Dim]>,
+    ) -> Result<String> {
+        let candidate = self
             .blocks
             .rule_for(token)
             .ok_or_else(|| {
                 anyhow!("unknown token `{token}` (expired, or nothing blocked this daemon session)")
             })?
             .to_string();
-        // Validate it still parses (and normalize it through the parser).
-        RuleSpec::parse(&line).with_context(|| format!("re-parsing candidate rule `{line}`"))?;
+        // Parse the candidate (and normalize it through the parser).
+        let spec = RuleSpec::parse(&candidate)
+            .with_context(|| format!("re-parsing candidate rule `{candidate}`"))?;
+        let line = match dims {
+            Some(ds) => {
+                let projected = spec.project(ds);
+                if projected.flags == 0 {
+                    return Err(anyhow!(
+                        "none of the selected dimensions are recorded for this block"
+                    ));
+                }
+                projected.to_line()
+            }
+            None => spec.to_line(),
+        };
+        // The projection may have dropped to a less-specific rule; re-validate.
+        let parsed =
+            RuleSpec::parse(&line).with_context(|| format!("re-parsing projected rule `{line}`"))?;
 
         if once {
             if self.transient.iter().any(|r| r.to_line() == line) {
@@ -165,7 +297,7 @@ impl Control {
                      be dropped. Trim the allowlist (or restart) first."
                 ));
             }
-            self.transient.push(RuleSpec::parse(&line)?);
+            self.transient.push(parsed);
         } else {
             self.append_persistent(&line)?;
         }
@@ -197,6 +329,13 @@ impl Control {
 mod tests {
     use super::*;
 
+    /// Record a minimal pending block for tests (no real file behind it).
+    fn record(control: &mut Control, rule_line: &str) -> String {
+        control
+            .blocks
+            .record("exec", rule_line.to_string(), "/t".to_string(), "c".to_string(), 0, 0)
+    }
+
     #[test]
     fn once_refused_when_allowlist_at_capacity() {
         // A full allowlist file (MAX_RULES distinct rules) leaves no room for
@@ -208,17 +347,54 @@ mod tests {
         }
         f.flush().unwrap();
         let mut control = Control::new(Some(f.path().to_path_buf()), 1, 2);
-        let token = control.blocks.record("creator_uid=4294967295".to_string());
-        let err = control.apply(&token, true).unwrap_err();
+        let token = record(&mut control, "creator_uid=4294967295");
+        let err = control.apply_with_dims(&token, true, None).unwrap_err();
         assert!(format!("{err:#}").contains("at capacity"), "{err:#}");
     }
 
     #[test]
     fn once_added_when_under_capacity() {
         let mut control = Control::new(None, 1, 2); // no file → 0 rules
-        let token = control.blocks.record("creator_uid=1000".to_string());
-        let rule = control.apply(&token, true).unwrap();
+        let token = record(&mut control, "creator_uid=1000");
+        let rule = control.apply_with_dims(&token, true, None).unwrap();
         assert_eq!(rule, "creator_uid=1000");
         assert_eq!(control.combined().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn apply_with_dims_projects_to_subset() {
+        // The review window's per-component allow: keep only creator_process
+        // from a rich candidate, dropping the noisy target/landing dims.
+        let mut control = Control::new(None, 1, 2);
+        let token = record(
+            &mut control,
+            "target_filename=/var/x;landing_filename=x.tmp;creator_process=/usr/lib/apt/methods/http;creator_comm=http",
+        );
+        let rule = control
+            .apply_with_dims(&token, true, Some(&[Dim::CreatorProcess]))
+            .unwrap();
+        assert_eq!(rule, "creator_process=/usr/lib/apt/methods/http");
+    }
+
+    #[test]
+    fn apply_with_dims_rejects_absent_dims() {
+        // Selecting a dim the block never recorded yields an empty rule —
+        // refuse rather than write a no-op (match-nothing) line.
+        let mut control = Control::new(None, 1, 2);
+        let token = record(&mut control, "creator_comm=curl");
+        let err = control
+            .apply_with_dims(&token, true, Some(&[Dim::TargetFolder]))
+            .unwrap_err();
+        assert!(format!("{err:#}").contains("none of the selected"), "{err:#}");
+    }
+
+    #[test]
+    fn remove_drops_pending_entry() {
+        let mut control = Control::new(None, 1, 2);
+        let token = record(&mut control, "creator_uid=1000");
+        assert_eq!(control.blocks.list().len(), 1);
+        assert!(control.blocks.remove(&token));
+        assert!(control.blocks.list().is_empty());
+        assert!(!control.blocks.remove(&token)); // second remove is a no-op
     }
 }

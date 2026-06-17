@@ -19,7 +19,7 @@ use aya::{
 use clap::Parser;
 use env_logger::Target;
 use linprov_common::{fnv_hash_bytes, AllowRule, COMM_LEN, MAX_RULES};
-use log::{info, warn};
+use log::{error, info, warn};
 use tokio::{
     io::{unix::AsyncFd, AsyncReadExt, AsyncWriteExt},
     net::UnixListener,
@@ -34,12 +34,14 @@ use crate::{
         restrict_perms, CliOverrides, EffectiveConfig, FileConfig, NotifyMode,
         DEFAULT_ALLOWLIST_PATH, DEFAULT_CONFIG_PATH, DEFAULT_CONTROL_SOCKET_PATH, DEFAULT_KEY_PATH,
     },
-    control::{BlockEvent, Control},
+    control::{Control, ControlEvent},
+    encoding::escape,
     handler,
     hashdb::HashDb,
     inode_storage::InodeMarks,
     key::HashKey,
     mode::Mode,
+    quarantine,
 };
 
 /// Newtype wrapper for `AllowRule` so we can `impl aya::Pod` locally
@@ -98,6 +100,12 @@ pub struct RunArgs {
     #[arg(long)]
     hash_db: Option<PathBuf>,
 
+    /// Root of the quarantine store the `quarantine` control verb moves
+    /// blocked files into (with a restore manifest). Defaults to
+    /// `/var/lib/linprov/quarantine`.
+    #[arg(long)]
+    quarantine_dir: Option<PathBuf>,
+
     /// Script interpreters (by `comm`) whose reads of a marked file are
     /// enforced like an execve, so `bash foo.sh` / `python foo.py` /
     /// `. foo.sh` honor the same policy as `./foo.sh`. Comma-separated;
@@ -124,6 +132,7 @@ pub fn execute(args: RunArgs) -> Result<()> {
         mark_localhost: args.mark_localhost,
         soak: args.soak,
         hash_db: args.hash_db,
+        quarantine_dir: args.quarantine_dir,
         interpreters: args.interpreters,
         notifications: args.notifications,
     };
@@ -254,7 +263,7 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
     // Block events fan out to control-socket `subscribe`rs (the tray
     // agent). A bounded channel; if a slow subscriber lags it loses old
     // events (RecvError::Lagged) rather than back-pressuring the daemon.
-    let (block_tx, _) = broadcast::channel::<BlockEvent>(256);
+    let (block_tx, _) = broadcast::channel::<ControlEvent>(256);
 
     // SIGHUP → reload the allowlist file and re-seed the BPF rules map,
     // without restarting the daemon or re-attaching the LSM hooks. Lets an
@@ -326,7 +335,15 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
             conn = accept_opt(listener.as_ref()) => {
                 match conn {
                     Ok((stream, _)) => {
-                        handle_control_conn(stream, &mut control, &mut bpf, &block_tx, key).await;
+                        handle_control_conn(
+                            stream,
+                            &mut control,
+                            &mut bpf,
+                            &block_tx,
+                            key,
+                            &cfg.quarantine_dir,
+                        )
+                        .await;
                     }
                     Err(e) => warn!("control socket accept failed: {e}"),
                 }
@@ -482,8 +499,9 @@ async fn handle_control_conn(
     mut stream: tokio::net::UnixStream,
     control: &mut Control,
     bpf: &mut Ebpf,
-    block_tx: &broadcast::Sender<BlockEvent>,
+    block_tx: &broadcast::Sender<ControlEvent>,
     key: HashKey,
+    quarantine_dir: &Path,
 ) {
     let mut buf = vec![0u8; 4096];
     let read = tokio::time::timeout(std::time::Duration::from_secs(5), stream.read(&mut buf)).await;
@@ -500,13 +518,35 @@ async fn handle_control_conn(
     };
     let req = String::from_utf8_lossy(&buf[..n]).trim().to_string();
 
+    // `subscribe` upgrades the connection to a long-lived block-event stream.
     if req == "subscribe" {
         let rx = block_tx.subscribe();
         tokio::spawn(stream_blocks(stream, rx));
         return;
     }
 
-    let reply = match process_control_request(&req, control, bpf, key) {
+    // `list` snapshots the pending-blocks table for the review window: one
+    // `ENTRY` line per block (token, kind, escaped target/creator, and the
+    // canonical candidate rule line — which `to_line` keeps tab- and
+    // newline-free), terminated by `END`.
+    if req == "list" {
+        let mut out = String::new();
+        for r in control.blocks.list() {
+            out.push_str(&format!(
+                "ENTRY\t{}\t{}\t{}\t{}\t{}\n",
+                r.token,
+                r.kind,
+                escape(&r.target),
+                escape(&r.creator),
+                r.rule_line,
+            ));
+        }
+        out.push_str("END\n");
+        let _ = stream.write_all(out.as_bytes()).await;
+        return;
+    }
+
+    let reply = match process_control_request(&req, control, bpf, block_tx, key, quarantine_dir) {
         Ok(rule) => format!("OK {rule}\n"),
         Err(e) => format!("ERR {e:#}\n"),
     };
@@ -519,7 +559,7 @@ async fn handle_control_conn(
 /// going; `Closed` (daemon shutting down) ends it.
 async fn stream_blocks(
     mut stream: tokio::net::UnixStream,
-    mut rx: broadcast::Receiver<BlockEvent>,
+    mut rx: broadcast::Receiver<ControlEvent>,
 ) {
     let _ = stream.write_all(b"OK subscribed\n").await;
     loop {
@@ -536,34 +576,112 @@ async fn stream_blocks(
     }
 }
 
-/// Parse and apply one control request line. `allow <token>` persists to
-/// the allowlist file; `once <token>` adds an in-memory transient rule.
-/// Both reseed the BPF map from `control.combined()`.
+/// Parse and apply one control request line.
+///
+///   * `allow <token> [dims=a,b,...]` — append a rule to the allowlist file.
+///   * `once  <token> [dims=a,b,...]` — add an in-memory transient rule.
+///   * `quarantine <token>`          — move the blocked file into the store.
+///   * `dismiss <token>`             — drop the block from the pending set.
+///
+/// `allow`/`once` reseed the BPF map from `control.combined()`. The optional
+/// `dims=` selects which dimensions of the captured candidate rule to keep
+/// (the review window's per-component allow); absent → the full candidate.
+/// Every resolution drops the token from the pending table and broadcasts a
+/// `Resolved` event so the live tray (and any other view) drops it too.
 fn process_control_request(
     req: &str,
     control: &mut Control,
     bpf: &mut Ebpf,
+    block_tx: &broadcast::Sender<ControlEvent>,
     key: HashKey,
+    quarantine_dir: &Path,
 ) -> Result<String> {
     let mut parts = req.split_whitespace();
-    let (verb, token) = (parts.next(), parts.next());
-    let once = match verb {
-        Some("once") => true,
-        Some("allow") => false,
-        _ => {
-            return Err(anyhow!(
-                "bad request `{req}` (expected `allow|once <token>`)"
-            ))
+    let verb = parts.next();
+    let token = parts.next();
+
+    match verb {
+        Some(v @ ("allow" | "once")) => {
+            let once = v == "once";
+            let token = token.ok_or_else(|| anyhow!("missing token"))?;
+            let dims = parse_dims(parts.next())?;
+            let rule = control.apply_with_dims(token, once, dims.as_deref())?;
+            reseed_from_control(bpf, control, key)?;
+            control.blocks.remove(token);
+            let _ = block_tx.send(ControlEvent::Resolved(token.to_string()));
+            info!(
+                "allow{} applied (token {token}): {rule}",
+                if once { " --once" } else { "" }
+            );
+            Ok(rule)
         }
+        Some("dismiss") => {
+            let token = token.ok_or_else(|| anyhow!("missing token"))?;
+            if control.blocks.remove(token) {
+                let _ = block_tx.send(ControlEvent::Resolved(token.to_string()));
+                info!("dismissed block token {token}");
+                Ok(format!("dismissed {token}"))
+            } else {
+                Err(anyhow!("unknown token `{token}`"))
+            }
+        }
+        Some("quarantine") => {
+            let token = token.ok_or_else(|| anyhow!("missing token"))?;
+            let rec = control.blocks.record_for(token).ok_or_else(|| {
+                anyhow!("unknown token `{token}` (expired, or nothing blocked this daemon session)")
+            })?;
+            match quarantine::stash(token, &rec.target, rec.dev, rec.ino, quarantine_dir) {
+                Ok(stashed) => {
+                    control.blocks.remove(token);
+                    let _ = block_tx.send(ControlEvent::Resolved(token.to_string()));
+                    info!(
+                        "quarantined (token {token}): {} -> {}",
+                        stashed.original_path, stashed.id
+                    );
+                    Ok(format!(
+                        "quarantined {} (restore id {})",
+                        stashed.original_path, stashed.id
+                    ))
+                }
+                // A tamper-suspected failure is a security event: log it loud
+                // (greppable for an operator/SIEM) and tag the reply so the
+                // tray raises an urgent, persistent alert. The token stays
+                // pending so it can be retried or allowed.
+                Err(e) if e.tamper => {
+                    error!(
+                        "SECURITY: quarantine FAILED for `{}` (token {token}) — possible \
+                         race/tamper to evade quarantine: {:#}",
+                        rec.target, e.source
+                    );
+                    Err(anyhow!("{} {:#}", quarantine::TAMPER_MARKER, e.source))
+                }
+                Err(e) => {
+                    warn!(
+                        "quarantine failed for `{}` (token {token}): {:#}",
+                        rec.target, e.source
+                    );
+                    Err(e.source)
+                }
+            }
+        }
+        _ => Err(anyhow!(
+            "bad request `{req}` (expected `allow|once|quarantine|dismiss <token>`)"
+        )),
+    }
+}
+
+/// Parse an optional `dims=a,b,c` request argument into a dim list. `None`
+/// (the arg absent) → `None` = use the full candidate rule. An unknown dim
+/// name is an error.
+fn parse_dims(arg: Option<&str>) -> Result<Option<Vec<Dim>>> {
+    let Some(rest) = arg.and_then(|a| a.strip_prefix("dims=")) else {
+        return Ok(None);
     };
-    let token = token.ok_or_else(|| anyhow!("missing token"))?;
-    let rule = control.apply(token, once)?;
-    reseed_from_control(bpf, control, key)?;
-    info!(
-        "allow{} applied (token {token}): {rule}",
-        if once { " --once" } else { "" }
-    );
-    Ok(rule)
+    let mut dims = Vec::new();
+    for name in rest.split(',').filter(|s| !s.is_empty()) {
+        dims.push(Dim::from_key(name).ok_or_else(|| anyhow!("unknown dimension `{name}`"))?);
+    }
+    Ok(Some(dims))
 }
 
 /// Reseed the BPF rules map from `control.combined()` (file ∪ transient).
