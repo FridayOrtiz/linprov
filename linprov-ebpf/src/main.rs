@@ -353,6 +353,15 @@ fn current_comm() -> [u8; 16] {
 /// NUL-terminated within 16 bytes). Identical to userspace
 /// `fnv_hash`/`fnv_hash_bytes` over the comm string, so the
 /// [`INTERPRETERS`] lookup matches what userspace seeded.
+///
+/// Intentionally NOT keyed (unlike the path hashes): this is a best-effort
+/// detection heuristic, not an allowlist match. A `comm` is attacker-chosen,
+/// but the only way that helps an attacker is to pick an *unknown* name that
+/// misses the set — which keying cannot prevent. Engineering a collision
+/// *into* the set would merely subject the attacker's own process to script
+/// enforcement (the opposite of a bypass). Renamed or copied known
+/// interpreters are caught by the inode-based interpreter path regardless of
+/// `comm`, which is the real backstop here.
 #[inline(always)]
 fn fnv_comm(comm: &[u8; COMM_LEN]) -> u64 {
     let mut h = FNV_OFFSET;
