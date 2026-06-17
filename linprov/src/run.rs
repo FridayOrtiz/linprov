@@ -335,16 +335,41 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
             res = poll.readable_mut() => {
                 let mut guard = res.context("polling ring buffer")?;
                 let ring = &mut guard.get_inner_mut().0;
-                while let Some(item) = ring.next() {
-                    handler::handle_event(
-                        &handler_cfg,
-                        &mut inode_marks,
-                        &mut control.blocks,
-                        &block_tx,
-                        item.as_ref(),
-                    );
+                // Bound work per readiness wake. This is the biased-lowest arm,
+                // so an unprivileged process spraying marks (download+write in a
+                // loop) could otherwise drain the ring unbounded here — each
+                // event does blocking syscalls (readlink /proc/$pid/exe, open,
+                // setxattr) — and starve the higher arms (ctrl_c / SIGHUP /
+                // control socket). After the budget we yield to select!; we did
+                // NOT clear readiness, so this arm re-fires next iteration once
+                // the higher arms have had their turn.
+                const DRAIN_BUDGET: usize = 256;
+                let mut n = 0;
+                let mut drained = false;
+                loop {
+                    match ring.next() {
+                        Some(item) => {
+                            handler::handle_event(
+                                &handler_cfg,
+                                &mut inode_marks,
+                                &mut control.blocks,
+                                &block_tx,
+                                item.as_ref(),
+                            );
+                            n += 1;
+                            if n >= DRAIN_BUDGET {
+                                break;
+                            }
+                        }
+                        None => {
+                            drained = true;
+                            break;
+                        }
+                    }
                 }
-                guard.clear_ready();
+                if drained {
+                    guard.clear_ready();
+                }
             }
         }
     }
