@@ -61,7 +61,7 @@ tokio = { version = "1", features = [
 # cargo downloads its source into the registry cache, where
 # linprov's build.rs picks it up via `linprov_ebpf::SOURCE_DIR`.
 linprov-common = { path = "linprov-common", version = "0.2.0" }
-linprov-ebpf = { path = "linprov-ebpf", version = "0.2.9" }
+linprov-ebpf = { path = "linprov-ebpf", version = "0.2.10" }
 
 # BPF objects need: panic="abort" (no unwinding in kernel), no
 # overflow checks / debug-assertions (the compiler emits `loop {}`
