@@ -37,6 +37,7 @@ use std::{
     collections::HashMap,
     fs::{File, OpenOptions},
     io::{BufRead, BufReader, Write},
+    os::unix::fs::{OpenOptionsExt, PermissionsExt},
     path::Path,
     sync::Mutex,
 };
@@ -67,6 +68,11 @@ impl HashDb {
             if !parent.as_os_str().is_empty() {
                 std::fs::create_dir_all(parent)
                     .with_context(|| format!("creating `{}`", parent.display()))?;
+                // Keep the state dir non-world-traversable so the audit db
+                // (every marked path on the box) isn't reachable by other
+                // local users. Best-effort; tightens an older 0755 dir too.
+                let _ =
+                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o750));
             }
         }
 
@@ -114,6 +120,10 @@ impl HashDb {
         let writer = OpenOptions::new()
             .create(true)
             .append(true)
+            // Born 0640 (owner rw, group r) rather than the umask default, so
+            // there's no world-readable window before `restrict_perms` runs.
+            // Only affects creation; an existing file keeps its perms.
+            .mode(0o640)
             .open(path)
             .with_context(|| format!("opening `{}` for append", path.display()))?;
 
