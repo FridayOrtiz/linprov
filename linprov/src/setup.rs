@@ -396,7 +396,6 @@ fn write_user_notify_unit(user: &install::InvokingUser, binary: &Path) -> Result
     let cfg = user.home.join(".config");
     let sd = cfg.join("systemd");
     let dir = sd.join("user");
-    fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
     let unit = dir.join("linprov-notify.service");
     // WantedBy=default.target (not graphical-session.target): the user
     // manager always reaches default.target at login, whereas
@@ -420,18 +419,95 @@ fn write_user_notify_unit(user: &install::InvokingUser, binary: &Path) -> Result
          WantedBy=default.target\n",
         binary.display(),
     );
-    fs::write(&unit, body).with_context(|| format!("writing {}", unit.display()))?;
-    // Hand ownership of anything we just created back to the user. Each
-    // chown is node-level (not recursive); re-chowning an already
-    // user-owned dir to the same user is a harmless no-op.
-    for p in [unit.as_path(), dir.as_path(), sd.as_path(), cfg.as_path()] {
-        chown_to_user(p, user);
-    }
+    // Create ~/.config/systemd/user and write the unit **as the invoking
+    // user** (we're root). Doing the filesystem work after dropping to their
+    // uid/gid means the kernel enforces *their* permissions, so a symlink the
+    // user pre-staged anywhere under their own ~/.config can't redirect our
+    // mkdir/write/chown onto a root-owned target (CWE-59 link-following) — and
+    // the files land user-owned with no root `chown` to follow a symlink.
+    write_user_tree_as_user(user, &dir, &unit, &body)
+        .with_context(|| format!("writing {} as {}", unit.display(), user.name))?;
     Ok(unit)
 }
 
-fn chown_to_user(path: &Path, user: &install::InvokingUser) {
-    let _ = std::os::unix::fs::chown(path, Some(user.uid), Some(user.gid));
+/// Create `dir` (and parents) and write `unit` with `body`, all **as the
+/// invoking user** rather than as root. We fork; the child drops its
+/// supplementary groups, gid, and uid to the user, sets a private umask, then
+/// does the filesystem work, so the kernel applies the user's own permissions
+/// — a pre-staged symlink under their `~/.config` can't trick root into
+/// creating/writing a file outside it (CWE-59). The parent waits and maps the
+/// child's exit code to a `Result`.
+fn write_user_tree_as_user(
+    user: &install::InvokingUser,
+    dir: &Path,
+    unit: &Path,
+    body: &str,
+) -> Result<()> {
+    // SAFETY: `fork()` in a single-threaded process — `setup` runs
+    // synchronously from `main`, before any async runtime or extra threads
+    // exist. The child only drops privilege and performs a small,
+    // self-contained set of filesystem operations, then `_exit`s; it never
+    // returns into Rust that could touch state shared with the parent.
+    match unsafe { libc::fork() } {
+        -1 => Err(anyhow!("fork: {}", std::io::Error::last_os_error())),
+        0 => {
+            let code = drop_to_user_and_write(user, dir, unit, body);
+            unsafe { libc::_exit(code) }
+        }
+        pid => {
+            let mut status: libc::c_int = 0;
+            if unsafe { libc::waitpid(pid, &mut status, 0) } < 0 {
+                return Err(anyhow!("waitpid: {}", std::io::Error::last_os_error()));
+            }
+            let code = if libc::WIFEXITED(status) {
+                libc::WEXITSTATUS(status)
+            } else {
+                -1
+            };
+            if code != 0 {
+                return Err(anyhow!("privilege-dropped helper exited {code}"));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Child half of [`write_user_tree_as_user`]: drop to `user` (groups → gid →
+/// uid — the only safe order), verify the drop actually took, then create the
+/// dir and write the file under a private umask. Returns a process exit code
+/// (0 = success); distinct non-zero codes ease debugging which step failed.
+fn drop_to_user_and_write(
+    user: &install::InvokingUser,
+    dir: &Path,
+    unit: &Path,
+    body: &str,
+) -> i32 {
+    let Ok(name) = std::ffi::CString::new(user.name.as_str()) else {
+        return 11;
+    };
+    // initgroups + setgid before setuid (they need privilege); setuid last so
+    // it can't be undone. Bail on any failure rather than fall through as root.
+    if unsafe { libc::initgroups(name.as_ptr(), user.gid as libc::gid_t) } != 0 {
+        return 12;
+    }
+    if unsafe { libc::setgid(user.gid as libc::gid_t) } != 0 {
+        return 13;
+    }
+    if unsafe { libc::setuid(user.uid as libc::uid_t) } != 0 {
+        return 14;
+    }
+    // Defense in depth: confirm we are no longer root before any FS write.
+    if unsafe { libc::getuid() } != user.uid || unsafe { libc::geteuid() } != user.uid {
+        return 15;
+    }
+    unsafe { libc::umask(0o077) };
+    if fs::create_dir_all(dir).is_err() {
+        return 16;
+    }
+    if fs::write(unit, body).is_err() {
+        return 17;
+    }
+    0
 }
 
 /// `systemctl --user daemon-reload` + `enable --now`, run *as the user*
