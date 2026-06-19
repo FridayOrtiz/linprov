@@ -133,6 +133,23 @@ impl LinprovTray {
     /// loop can't share this thread with ksni). Best-effort; the caller falls
     /// back to a notification if it can't launch.
     fn launch_review(&self) -> Result<()> {
+        // The child inherits *our* environment. A `systemd --user` tray snapshots
+        // the user manager's env at spawn time; if the compositor imported
+        // WAYLAND_DISPLAY *after* this agent started, neither WAYLAND_DISPLAY nor
+        // DISPLAY is set here, and the spawned `linprov review` aborts in winit
+        // ("neither WAYLAND_DISPLAY nor WAYLAND_SOCKET nor DISPLAY is set") before
+        // any window appears. `spawn()` succeeds regardless (the child starts,
+        // then dies), so without this check the failure is completely silent.
+        // Detect it up front so the caller shows the fallback notification.
+        if std::env::var_os("WAYLAND_DISPLAY").is_none() && std::env::var_os("DISPLAY").is_none() {
+            return Err(anyhow!(
+                "no WAYLAND_DISPLAY/DISPLAY in the tray agent's environment, so the \
+                 review window can't open. Import it into the systemd user manager \
+                 and restart the agent: `systemctl --user import-environment \
+                 WAYLAND_DISPLAY DISPLAY && systemctl --user restart \
+                 linprov-notify.service`."
+            ));
+        }
         let exe = std::env::current_exe().context("locating the linprov binary")?;
         std::process::Command::new(exe)
             .arg("review")
