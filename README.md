@@ -13,7 +13,7 @@ Needs a Linux **6.5+** kernel with BPF LSM enabled and vmlinux BTF — see
 ```sh
 cat /sys/kernel/security/lsm     # 1. check deps — must contain `bpf`
 
-cargo install bpf-linker         # 2. install (build dep + the daemon;
+cargo binstall bpf-linker        # 2. install (build dep + the daemon;
 cargo install linprov            #    pulls the aya-friday-* fork automatically)
 sudo $(which linprov) setup      # 3. setup — interactive; installs to /usr/local/bin
 
@@ -86,10 +86,15 @@ doesn't care which fired.
 ## Install
 
 ```
-cargo install bpf-linker
+cargo binstall bpf-linker
 cargo install linprov
 sudo $(which linprov) setup
 ```
+
+Install bpf-linker prebuilt, with
+[cargo-binstall](https://github.com/cargo-bins/cargo-binstall) or a release
+tarball (see [its README](https://github.com/aya-rs/bpf-linker#installation)):
+since 0.13.0, `cargo install bpf-linker` needs a matching system LLVM.
 
 `cargo install` drops the binary in `~/.cargo/bin/`, which isn't on
 root's `secure_path` — that's why the first invocation needs the

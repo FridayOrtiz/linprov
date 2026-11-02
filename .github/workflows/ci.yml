@@ -30,8 +30,14 @@ jobs:
         with:
           cache-on-failure: true
 
+      # Prebuilt release, as bpf-linker's README recommends: since 0.13.0,
+      # `cargo install bpf-linker` needs a system LLVM (`llvm-config`).
       - name: Install bpf-linker
-        run: cargo install --locked bpf-linker
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
+            https://github.com/aya-rs/bpf-linker/releases/latest/download/bpf-linker-x86_64-unknown-linux-musl.tar.zst
+          tar -xpf "$RUNNER_TEMP/bpf-linker.tar.zst" -C "$HOME/.cargo/bin"
+          bpf-linker --version
 
       # linprov-ebpf's build.rs compiles src/shim.c (the CO-RE field
       # accessors) with clang.
@@ -79,8 +85,14 @@ jobs:
           cache-on-failure: true
           key: build-daemon
 
+      # Prebuilt release, as bpf-linker's README recommends: since 0.13.0,
+      # `cargo install bpf-linker` needs a system LLVM (`llvm-config`).
       - name: Install bpf-linker
-        run: cargo install --locked bpf-linker
+        run: |
+          curl -sSfL -o "$RUNNER_TEMP/bpf-linker.tar.zst" \
+            https://github.com/aya-rs/bpf-linker/releases/latest/download/bpf-linker-x86_64-unknown-linux-musl.tar.zst
+          tar -xpf "$RUNNER_TEMP/bpf-linker.tar.zst" -C "$HOME/.cargo/bin"
+          bpf-linker --version
 
       # linprov-ebpf's build.rs compiles src/shim.c (the CO-RE field
       # accessors) with clang.
