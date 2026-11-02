@@ -264,11 +264,12 @@ static INTERP_INODE: InodeStorage<u8> = InodeStorage::new();
 #[map]
 static INTERP_COPY_PIDS: LruHashMap<u32, u8> = LruHashMap::with_max_entries(8192, 0);
 
-/// PIDs flagged at `bprm_check_security` as running an interpreter — either
-/// the exec'd inode is in `INTERP_INODE` (original or derived copy) or its
-/// `comm` is in `INTERPRETERS`. The `file_open` read branch gates marked
-/// reads on this (set at exec time, so a later `prctl(PR_SET_NAME)` can't
-/// dodge it). Reaped on task exit.
+/// PIDs whose current program is an interpreter — the exec'd inode is in
+/// `INTERP_INODE` (original or derived copy) or its `comm` is in
+/// `INTERPRETERS`. Set or cleared at `bprm_committed_creds` on every exec.
+/// The `file_open` read branch gates marked reads on this (set before the new
+/// program runs, so a later `prctl(PR_SET_NAME)` can't dodge it). Reaped on
+/// task exit.
 #[map]
 static INTERP_PIDS: LruHashMap<u32, u8> = LruHashMap::with_max_entries(8192, 0);
 
@@ -624,7 +625,7 @@ pub fn file_open(ctx: LsmContext) -> i32 {
         // freely. So the allowlist check (and the SCRIPT event) fire only
         // on the first marked read per interpreter invocation — the script
         // itself — not on every data file it subsequently touches.
-        // Interpreter detection lives at `bprm_check_security` now
+        // Interpreter detection lives at `bprm_committed_creds`
         // (`INTERP_PIDS`), keyed on the exec'd inode — original, or a derived
         // copy (N1) — or its comm, and captured at exec time so a later
         // `prctl(PR_SET_NAME)` can't dodge it. The read branch just consults
@@ -793,21 +794,6 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     let file_ptr = unsafe { binprm_file(bprm_ptr) };
     if file_ptr.is_null() {
         return 0;
-    }
-
-    // N1: flag this PID as an interpreter if the exec'd binary is one — by
-    // inode (INTERP_INODE: a configured interpreter or a derived copy, so a
-    // renamed/copied interpreter still counts) or by comm. The file_open read
-    // branch gates marked reads on this. Captured here at exec time so a later
-    // prctl(PR_SET_NAME) can't dodge detection.
-    {
-        let exec_inode = unsafe { file_inode(file_ptr) };
-        let is_interp = (!exec_inode.is_null()
-            && unsafe { INTERP_INODE.get_ptr(exec_inode) }.is_some())
-            || unsafe { INTERPRETERS.get(fnv_comm(&current_comm())) }.is_some();
-        if is_interp {
-            let _ = INTERP_PIDS.insert(current_pid(), 1u8, 0);
-        }
     }
 
     let buf = match SCRATCH.get_ptr_mut(SCRATCH_BPRM) {
@@ -1372,6 +1358,41 @@ fn emit_event(
         );
     }
     entry.submit(0);
+}
+
+/// security_bprm_committed_creds(const struct linux_binprm *bprm).
+///
+/// N1: flag this PID as an interpreter if the program it just exec'd is one
+/// — by inode (INTERP_INODE: a configured interpreter or a derived copy, so a
+/// renamed/copied interpreter still counts) or by comm — and clear the flag
+/// if it isn't. The file_open read branch gates marked reads on this.
+///
+/// This runs once per successful exec, after the kernel has set the new comm
+/// (in begin_new_exec) and `bprm->file` is the final binary (the interpreter,
+/// for a `#!` script). bprm_check_security is too early: `comm` there is
+/// still the pre-exec name, so a command forked from bash looked like bash.
+/// Clearing matters for in-place execs (`exec cat`, `sh -c 'cmd'`), where the
+/// PID would otherwise keep the shell's flag. Runs before the new program
+/// does, so a later prctl(PR_SET_NAME) can't dodge detection.
+#[lsm(hook = "bprm_committed_creds", sleepable)]
+pub fn bprm_committed_creds(ctx: LsmContext) -> i32 {
+    let bprm_ptr: *const KernelLinuxBinprm = ctx.arg(0);
+    if bprm_ptr.is_null() {
+        return 0;
+    }
+    let file_ptr = unsafe { binprm_file(bprm_ptr) };
+    let by_inode = !file_ptr.is_null() && {
+        let inode = unsafe { file_inode(file_ptr) };
+        !inode.is_null() && unsafe { INTERP_INODE.get_ptr(inode) }.is_some()
+    };
+    let is_interp = by_inode || unsafe { INTERPRETERS.get(fnv_comm(&current_comm())) }.is_some();
+    let pid = current_pid();
+    if is_interp {
+        let _ = INTERP_PIDS.insert(pid, 1u8, 0);
+    } else {
+        let _ = INTERP_PIDS.remove(pid);
+    }
+    0
 }
 
 #[tracepoint]

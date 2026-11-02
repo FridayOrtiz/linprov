@@ -166,6 +166,7 @@ async fn daemon(cfg: EffectiveConfig) -> Result<()> {
     attach_lsm(&mut bpf, &btf, "socket_connect")?;
     attach_lsm(&mut bpf, &btf, "file_open")?;
     attach_lsm(&mut bpf, &btf, "bprm_check_security")?;
+    attach_lsm(&mut bpf, &btf, "bprm_committed_creds")?;
     attach_tracepoint(
         &mut bpf,
         "sched_process_exit",

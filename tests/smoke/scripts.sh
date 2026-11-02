@@ -57,6 +57,14 @@ grep -qE 'BLOCKED-(SCRIPT|EXEC)' /tmp/linprov-smoke/daemon.log \
     && echo "  OK   shebang/interpreter blocks logged" \
     || { echo "  FAIL no block lines"; FAILED=1; }
 
+echo "=== ENFORCE, empty allowlist — non-interpreters read marked files freely ==="
+# Only interpreters are gated. A `cat` forked from bash has bash's comm
+# until its exec completes, and `exec cat` reuses bash's PID; neither may
+# make cat count as an interpreter. (This script's own comm is
+# `scripts.sh`, so a plain `cat` here wouldn't exercise either.)
+run_case "bash -c 'cat /tmp/hello.sh && true'" pass bash -c 'cat /tmp/hello.sh && true'
+run_case "bash -c 'exec cat /tmp/hello.sh'"   pass bash -c 'exec cat /tmp/hello.sh'
+
 echo "=== ENFORCE, target_filename — permits interpreter AND shebang alike ==="
 sudo bash -c 'echo "target_filename=/tmp/hello.sh" > /tmp/linprov-smoke/allow'
 start_daemon enforce /tmp/linprov-smoke/allow /tmp/linprov-smoke/daemon.log || exit 1
