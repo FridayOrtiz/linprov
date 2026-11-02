@@ -719,14 +719,13 @@ pub fn file_open(ctx: LsmContext) -> i32 {
             return 0;
         }
         let (k0, k1) = hash_key();
-        let (folder_hash, basename_hash) = landing_hashes(
+        (*rec_ptr).landing_folder_hash = landing_hashes(
             buf as *const u8,
             (*rec_ptr).landing_ancestor_hashes.as_mut_ptr(),
             k0,
             k1,
+            &mut (*rec_ptr).landing_basename_hash,
         );
-        (*rec_ptr).landing_folder_hash = folder_hash;
-        (*rec_ptr).landing_basename_hash = basename_hash;
     }
 
     // In-kernel mark: write the OriginRecord into inode storage right now.
@@ -1165,15 +1164,24 @@ unsafe extern "C" fn landing_step(i: u32, ctx: *mut c_void) -> i64 {
 /// One pass over a NUL-terminated path under key `(k0, k1)`. Fills
 /// `out_ancestors` (a `[u64; MAX_FOLDER_ANCESTORS]` in the record) with each
 /// `/`-terminated prefix's keyed hash for nested `landing_folder` matching,
-/// and returns `(folder_hash, basename_hash)`:
+/// returns `folder_hash` and stores `basename_hash` through `out_basename`:
 ///   * `folder_hash` = SipHash of the immediate parent directory **including
 ///     its trailing `/`** (matches userspace `normalize_folder`).
 ///   * `basename_hash` = SipHash of the final path component (no slash).
 ///
 /// Not inlined: the by-value `ancestors` array + SipHash state make this a
-/// ~390-byte frame, kept off `file_open`'s stack.
+/// ~390-byte frame, kept off `file_open`'s stack. Being a real BPF call, it
+/// can't return `(u64, u64)`: BPF returns only in r0, and LLVM 23 lowers a
+/// two-word return into r0 + r2, which the verifier rejects in the caller
+/// (`R2 !read_ok`). Hence the out-pointer.
 #[inline(never)]
-unsafe fn landing_hashes(src: *const u8, out_ancestors: *mut u64, k0: u64, k1: u64) -> (u64, u64) {
+unsafe fn landing_hashes(
+    src: *const u8,
+    out_ancestors: *mut u64,
+    k0: u64,
+    k1: u64,
+    out_basename: *mut u64,
+) -> u64 {
     walk_anc_clear();
     let mut ctx = LandingCtx::new(src, k0, k1);
     bpf_loop(
@@ -1183,18 +1191,26 @@ unsafe fn landing_hashes(src: *const u8, out_ancestors: *mut u64, k0: u64, k1: u
         0,
     );
     walk_anc_copy_to(out_ancestors);
-    let basename = sip_finish(ctx.c, ctx.comp_len as usize, ctx.comp_tail);
-    (ctx.folder_hash, basename)
+    *out_basename = sip_finish(ctx.c, ctx.comp_len as usize, ctx.comp_tail);
+    ctx.folder_hash
 }
 
 /// Like [`landing_hashes`] but for the live exec (target) path: fills
-/// `out_ancestors` with each `/`-terminated prefix hash and returns
-/// `(full_hash, parent_hash)` — the whole-path SipHash (exact
-/// `target_filename`) and the immediate-parent SipHash (exact
-/// `target_folder`). Precomputed once per `check_allowlist` so the per-rule
-/// loop is walk-free (see [`AllowCtx`]). Reuses the [`landing_step`] callback.
+/// `out_ancestors` with each `/`-terminated prefix hash, returns
+/// `full_hash` and stores `parent_hash` through `out_parent` — the
+/// whole-path SipHash (exact `target_filename`) and the immediate-parent
+/// SipHash (exact `target_folder`). Precomputed once per `check_allowlist`
+/// so the per-rule loop is walk-free (see [`AllowCtx`]). Reuses the
+/// [`landing_step`] callback. Out-pointer for the same reason as
+/// [`landing_hashes`].
 #[inline(never)]
-unsafe fn target_hashes(src: *const u8, out_ancestors: *mut u64, k0: u64, k1: u64) -> (u64, u64) {
+unsafe fn target_hashes(
+    src: *const u8,
+    out_ancestors: *mut u64,
+    k0: u64,
+    k1: u64,
+    out_parent: *mut u64,
+) -> u64 {
     walk_anc_clear();
     let mut ctx = LandingCtx::new(src, k0, k1);
     bpf_loop(
@@ -1204,8 +1220,8 @@ unsafe fn target_hashes(src: *const u8, out_ancestors: *mut u64, k0: u64, k1: u6
         0,
     );
     walk_anc_copy_to(out_ancestors);
-    let full = sip_finish(ctx.v, ctx.full_len as usize, ctx.full_tail);
-    (full, ctx.folder_hash)
+    *out_parent = ctx.folder_hash;
+    sip_finish(ctx.v, ctx.full_len as usize, ctx.full_tail)
 }
 
 /// Zero the per-CPU [`WALK_ANC`] scratch before a walk, so stale ancestor
@@ -1268,7 +1284,14 @@ unsafe fn check_allowlist(filename: &[u8; EXEC_PATH_LEN], origin: &OriginRecord)
         None => return false,
     };
     let (k0, k1) = hash_key();
-    let (full, parent) = target_hashes(filename.as_ptr(), (*anc).0.as_mut_ptr(), k0, k1);
+    let mut parent = 0u64;
+    let full = target_hashes(
+        filename.as_ptr(),
+        (*anc).0.as_mut_ptr(),
+        k0,
+        k1,
+        &mut parent,
+    );
 
     let mut ctx = AllowCtx {
         origin: origin as *const OriginRecord,
