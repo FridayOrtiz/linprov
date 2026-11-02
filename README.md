@@ -74,8 +74,12 @@ doesn't care which fired.
   sudo kernelstub -a "lsm=$(cat /sys/kernel/security/lsm),bpf"
   # then reboot
   ```
-- vmlinux BTF (`/sys/kernel/btf/vmlinux`) — needed for LSM hook resolution.
+- vmlinux BTF (`/sys/kernel/btf/vmlinux`) — needed for LSM hook resolution
+  and for the CO-RE relocations of the kernel struct fields the BPF program
+  reads, so a kernel upgrade doesn't need a rebuild.
 - Rust nightly (pinned via `rust-toolchain.toml`).
+- clang with the BPF target, to build the CO-RE field accessors
+  (`linprov-ebpf/src/shim.c`).
 - The userspace daemon runs as **root** (BPF program load + LSM attach +
   `security.bpf.*` xattr writes all need it).
 

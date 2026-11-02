@@ -23,7 +23,8 @@
 //! `call -1` placeholder that aya patches to `BPF_PSEUDO_KFUNC_CALL`
 //! against the kernel's BTF at load time.
 //!
-//! Struct layouts are pinned to kernel 6.18 / x86_64.
+//! Kernel struct fields are read through CO-RE accessors (`src/shim.c`), so
+//! their offsets are patched against the running kernel's BTF at load.
 
 #![no_std]
 #![no_main]
@@ -139,26 +140,59 @@ const FMODE_WRITE: u32 = 0x2;
 /// process *copying* one (N1: `cp /bin/bash …`).
 const FMODE_EXEC: u32 = 0x20;
 
-#[repr(C)]
-struct KernelPath {
-    _mnt: *const c_void,
-    dentry: *mut c_void, // struct dentry *
-}
+// Kernel struct fields are read through CO-RE accessors in `src/shim.c`
+// (compiled by clang and linked in by bpf-linker; see build.rs), because
+// rustc can't emit BTF relocations yet. aya patches each field offset
+// against the running kernel's BTF at load, so layout changes like 7.2's
+// (`old_mm`/`user_ns` added to `struct linux_binprm`, moving `file` from
+// offset 64 to 80) don't need a rebuild. The accessors inline into direct
+// loads, so the verifier types them from kernel BTF as before:
+// `bprm->file` stays `trusted_ptr_file` and `file->f_inode` stays
+// `trusted_ptr_inode` (both on its BTF_TYPE_SAFE_TRUSTED list).
 
+/// Opaque kernel `struct file`. Never dereferenced as a Rust struct: its
+/// fields are read through the CO-RE accessors below.
 #[repr(C)]
 struct KernelFile {
-    _f_lock: [u8; 4],          // 0..4    spinlock_t f_lock
-    f_mode: u32,               // 4..8    fmode_t f_mode
-    _pad_pre_inode: [u8; 24],  // 8..32   f_op, f_mapping, private_data
-    f_inode: *mut c_void,      // 32..40  struct inode *f_inode
-    _pad_post_inode: [u8; 24], // 40..64  f_flags, f_iocb_flags, f_cred, f_owner
-    f_path: KernelPath,        // 64..80  const struct path f_path
+    _opaque: [u8; 0],
 }
 
+/// Opaque kernel `struct linux_binprm`; see [`KernelFile`].
 #[repr(C)]
 struct KernelLinuxBinprm {
-    _pad: [u8; 64],
-    file: *const KernelFile,
+    _opaque: [u8; 0],
+}
+
+// Defined in `src/shim.c`.
+extern "C" {
+    fn linprov_binprm_file(bprm: *const KernelLinuxBinprm) -> *const KernelFile;
+    fn linprov_file_mode(file: *const KernelFile) -> u32;
+    fn linprov_file_inode(file: *const KernelFile) -> *mut c_void;
+    fn linprov_file_path(file: *const KernelFile) -> *mut bpf_path;
+}
+
+/// `bprm->file`
+#[inline(always)]
+unsafe fn binprm_file(bprm: *const KernelLinuxBinprm) -> *const KernelFile {
+    linprov_binprm_file(bprm)
+}
+
+/// `file->f_mode`
+#[inline(always)]
+unsafe fn file_mode(file: *const KernelFile) -> u32 {
+    linprov_file_mode(file)
+}
+
+/// `file->f_inode`
+#[inline(always)]
+unsafe fn file_inode(file: *const KernelFile) -> *mut c_void {
+    linprov_file_inode(file)
+}
+
+/// `&file->f_path`, for `bpf_d_path`.
+#[inline(always)]
+fn file_path(file: *const KernelFile) -> *mut bpf_path {
+    unsafe { linprov_file_path(file) }
 }
 
 #[map]
@@ -516,8 +550,8 @@ pub fn file_open(ctx: LsmContext) -> i32 {
     if file_ptr.is_null() {
         return 0;
     }
-    let inode_ptr = unsafe { (*file_ptr).f_inode };
-    let f_mode = unsafe { (*file_ptr).f_mode };
+    let inode_ptr = unsafe { file_inode(file_ptr) };
+    let f_mode = unsafe { file_mode(file_ptr) };
 
     // --- Read branch: taint the reader, and enforce on interpreters. ---
     //
@@ -598,7 +632,7 @@ pub fn file_open(ctx: LsmContext) -> i32 {
         if unsafe { INTERP_PIDS.get(pid) }.is_some()
             && unsafe { APPROVED_INTERP.get(pid) }.is_none()
         {
-            let path_ptr = unsafe { &(*file_ptr).f_path } as *const KernelPath as *mut bpf_path;
+            let path_ptr = file_path(file_ptr);
             let mode = CONFIG.get(CONFIG_MODE).copied().unwrap_or(0);
             let permit = if mode == MODE_ENFORCE {
                 // Resolve the script path and match exactly like execve.
@@ -650,7 +684,7 @@ pub fn file_open(ctx: LsmContext) -> i32 {
         if let Some(pb) = PATH_SCRATCH.get_ptr_mut(0) {
             unsafe {
                 let b = (*pb).0.as_mut_ptr() as *mut c_char;
-                let pp = &(*file_ptr).f_path as *const KernelPath as *mut bpf_path;
+                let pp = file_path(file_ptr);
                 let _ = bpf_d_path(pp, b, EXEC_PATH_LEN as u32);
                 if !is_pseudo_fs(b as *const u8) {
                     let mut flag: u8 = 1;
@@ -698,7 +732,7 @@ pub fn file_open(ctx: LsmContext) -> i32 {
         Some(p) => p,
         None => return 0,
     };
-    let path_ptr = unsafe { &(*file_ptr).f_path } as *const KernelPath as *mut bpf_path;
+    let path_ptr = file_path(file_ptr);
     unsafe {
         // Landing path = where the file is being written right now (distinct
         // from the eventual exec-time path; the file may be renamed before
@@ -756,7 +790,7 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
         return 0;
     }
 
-    let file_ptr = unsafe { (*bprm_ptr).file };
+    let file_ptr = unsafe { binprm_file(bprm_ptr) };
     if file_ptr.is_null() {
         return 0;
     }
@@ -767,7 +801,7 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     // branch gates marked reads on this. Captured here at exec time so a later
     // prctl(PR_SET_NAME) can't dodge detection.
     {
-        let exec_inode = unsafe { (*file_ptr).f_inode };
+        let exec_inode = unsafe { file_inode(file_ptr) };
         let is_interp = (!exec_inode.is_null()
             && unsafe { INTERP_INODE.get_ptr(exec_inode) }.is_some())
             || unsafe { INTERPRETERS.get(fnv_comm(&current_comm())) }.is_some();
@@ -794,7 +828,7 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     //   2. security.bpf.linprov.origin xattr — durable across reboots and
     //      inode eviction. Always written with the augmented record
     //      (creator_path filled) by userspace.
-    let inode_ptr = unsafe { (*file_ptr).f_inode };
+    let inode_ptr = unsafe { file_inode(file_ptr) };
     let mut have_storage = false;
     if !inode_ptr.is_null() {
         if let Some(stored) = unsafe { INODE_MARKS.get_ptr(inode_ptr) } {
@@ -845,7 +879,7 @@ pub fn bprm_check_security(ctx: LsmContext) -> i32 {
     // local-by-value copy of the OriginRecord — at 296 bytes it blows the
     // BPF stack — by always going via map pointers (`buf`) or the ringbuf
     // entry pointer (`p`).
-    let path_ptr = unsafe { &(*file_ptr).f_path } as *const KernelPath as *mut bpf_path;
+    let path_ptr = file_path(file_ptr);
     let mut entry = match EVENTS.reserve::<Event>(0) {
         Some(e) => e,
         None => return 0,
